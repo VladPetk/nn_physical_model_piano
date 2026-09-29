@@ -94,20 +94,27 @@ audio
 
 ## Usage
 
+Training is GPU-first. Install a CUDA build of PyTorch (the default `pip install torch`
+gives the CPU wheel), then the package:
+
 ```bash
+python -m venv .venv && .venv/Scripts/activate      # or: source .venv/bin/activate
+pip install torch --index-url https://download.pytorch.org/whl/cu124  # CUDA build first
 pip install -e .[dev]
 pytest
 
 # 1. prepare MAESTRO v3 (about 100 GB download; writes mono FLAC at 24 kHz plus cached MIDI)
 python scripts/prepare_maestro.py /path/to/maestro-v3.0.0 data/maestro24k
 
-# 2. train (add --adv-start N to switch on the GAN loss after N steps)
+# 2. train (picks CUDA automatically; --adv-start N switches on the GAN loss after N steps)
 python -m pianonn.train --data data/maestro24k --out runs/v0
+#   --amp autocasts the forward pass to bfloat16 (GPU only, off by default: the delicate
+#   physics stays fp32, so the speedup is modest -- see the flag's help)
 
 # sanity check without data: fit a randomly perturbed copy of the model
 python -m pianonn.train --synthetic --out runs/synthetic
 
-# 3. render (without --ckpt you hear the untrained physics prior)
+# 3. render (without --ckpt you hear the untrained physics prior; --device cuda to render on GPU)
 python -m pianonn.render some.mid out.wav --ckpt runs/v0/last.pt --year 2018
 
 # check a model against the literature targets in docs/physical_parameters.md

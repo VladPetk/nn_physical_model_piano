@@ -10,28 +10,30 @@ from .data import _perf_from_notes, load_midi
 from .synth import NeuralPhysicalPiano
 
 
-def load_model(ckpt=None, **overrides):
+def load_model(ckpt=None, device="cpu", **overrides):
     if ckpt:
-        state = torch.load(ckpt, map_location="cpu")
+        state = torch.load(ckpt, map_location=device)
         model = NeuralPhysicalPiano(PianoConfig(**{**state["cfg"], **overrides}))
         model.load_state_dict(state["model"])
     else:
         model = NeuralPhysicalPiano(PianoConfig(**overrides))
-    return model.eval()
+    return model.to(device).eval()
 
 
 @torch.no_grad()
 def render_notes(model, notes, pedals, condition=0, tail=3.0, block_seconds=2.0, seed=0):
     """``notes[N, 4]`` = (pitch, onset, offset, velocity) in seconds; returns float32 audio."""
     cfg = model.cfg
+    device = next(model.parameters()).device
     duration = float(notes[:, 2].max()) + tail if len(notes) else tail
     n_samples = int(duration * cfg.sample_rate)
     perf = _perf_from_notes(notes, pedals, 0.0, duration, 0.0, model.n_frames(n_samples), cfg)
-    perf = {k: v[None] for k, v in perf.items()}
+    perf = {k: v[None].to(device) for k, v in perf.items()}
     perf["mask"] = torch.ones_like(perf["pitch"], dtype=torch.bool)
-    perf["condition"] = torch.tensor([condition])
-    gen = torch.Generator().manual_seed(seed)
-    return model(perf, n_samples, block_seconds=block_seconds, generator=gen)["audio"][0].numpy()
+    perf["condition"] = torch.tensor([condition], device=device)
+    # the noise generator must live on the model's device (a CPU generator with CUDA tensors raises)
+    gen = torch.Generator(device=device).manual_seed(seed)
+    return model(perf, n_samples, block_seconds=block_seconds, generator=gen)["audio"][0].cpu().numpy()
 
 
 def main(argv=None):
@@ -44,9 +46,10 @@ def main(argv=None):
     ap.add_argument("--year", type=int, default=2018, help="MAESTRO year = piano/hall/mic condition")
     ap.add_argument("--sr", type=int, help="override sample rate (untrained model only)")
     ap.add_argument("--normalize", action="store_true", help="scale the output to a -1 dBFS peak")
+    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args(argv)
 
-    model = load_model(args.ckpt, **({"sample_rate": args.sr} if args.sr else {}))
+    model = load_model(args.ckpt, device=args.device, **({"sample_rate": args.sr} if args.sr else {}))
     notes, pedals = load_midi(args.midi)
     audio = render_notes(model, notes, pedals, year_to_condition(args.year))
     peak = np.abs(audio).max()

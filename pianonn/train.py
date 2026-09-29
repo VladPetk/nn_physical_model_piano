@@ -31,8 +31,8 @@ def param_groups(model, lr, fir_lr_scale=0.03):
     return [{"params": rest, "lr": lr}, {"params": [model.room.body], "lr": lr * fir_lr_scale}]
 
 
-def to_device(batch, device):
-    return {k: v.to(device) for k, v in batch.items()}
+def to_device(batch, device, non_blocking=False):
+    return {k: v.to(device, non_blocking=non_blocking) for k, v in batch.items()}
 
 
 def main(argv=None):
@@ -52,12 +52,20 @@ def main(argv=None):
     ap.add_argument("--adv-weight", type=float, default=0.1)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--amp", action="store_true",
+                    help="autocast the forward pass to bfloat16 (GPU only). Off by default: the physics is "
+                         "exp/log/sqrt/sin of wide-range quantities and sub-Hz beating, and matmuls are a small "
+                         "share of the compute, so the speedup is modest and the precision risk is real. "
+                         "bfloat16 (not float16) keeps the exponent range, so no GradScaler is needed.")
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--save-every", type=int, default=2000)
     args = ap.parse_args(argv)
 
     cfg = PianoConfig(sample_rate=args.sr)
     device = torch.device(args.device)
+    use_amp = args.amp and device.type == "cuda"
+    if args.amp and not use_amp:
+        print("warning: --amp ignored (autocast is only enabled for CUDA)", flush=True)
     model = NeuralPhysicalPiano(cfg).to(device)
     teacher = None
     if args.synthetic:
@@ -68,7 +76,7 @@ def main(argv=None):
         dataset = MaestroSegments(args.data, "train", cfg, args.segment, args.warmup, args.lookback,
                                   length=args.steps * args.batch)
     loader = DataLoader(dataset, batch_size=args.batch, collate_fn=collate, num_workers=args.workers,
-                        persistent_workers=args.workers > 0)
+                        persistent_workers=args.workers > 0, pin_memory=device.type == "cuda")
 
     recon = MultiResolutionSTFTLoss()
     opt = torch.optim.Adam(param_groups(model, args.lr))
@@ -81,18 +89,21 @@ def main(argv=None):
     with open(os.path.join(args.out, "config.json"), "w") as f:
         json.dump({"model": cfg.to_dict(), "args": vars(args)}, f, indent=2)
 
+    amp_ctx = lambda: torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp)
+
     t_start = time.time()
     for step, batch in enumerate(itertools.islice(loader, args.steps), 1):
-        batch = to_device(batch, device)
+        batch = to_device(batch, device, non_blocking=device.type == "cuda")
         if teacher is not None:
             n = int(round((args.warmup + args.segment) * cfg.sample_rate))
-            with torch.no_grad():
+            with torch.no_grad(), amp_ctx():
                 target = teacher(batch, n)["audio"]
             s = int(args.warmup * cfg.sample_rate)
         else:
             target, n, s = batch["audio"], batch["audio"].shape[-1], int(batch["loss_start"][0])
-        pred = model(batch, n)["audio"]
-        pred, target = pred[:, s:], target[:, s:]
+        with amp_ctx():
+            pred = model(batch, n)["audio"]
+        pred, target = pred[:, s:].float(), target[:, s:].float()
 
         logs = {"recon": recon(pred, target), "reg": model.physics.regularizer()}
         loss = logs["recon"] + args.reg * logs["reg"]
