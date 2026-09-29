@@ -172,7 +172,7 @@ class NoiseBank(nn.Module):
     """
 
     MARGIN = 4096  # overlap-save context; longer than the lowest band filter's ringing
-    EVENT_WINDOW = 0.5  # s after an event during which its noise is rendered (> 7 x the longest bounded tau)
+    EVENT_WINDOW = 1.0  # s after an event during which its noise is rendered (> 9 x the longest bounded tau, 0.11 s)
 
     def __init__(self, cfg: PianoConfig):
         super().__init__()
@@ -219,12 +219,17 @@ class NoiseBank(nn.Module):
         return self._masks[n]
 
     def band_split(self, x, start, length):
-        """Band-split ``x[..., T]`` into ``[..., bands, length]`` for samples ``[start, start+length)``."""
-        lo, hi = max(0, start - self.MARGIN), min(x.shape[-1], start + length + self.MARGIN)
-        seg = x[..., lo:hi]
+        """Band-split ``x[..., T]`` into ``[..., bands, length]`` for samples ``[start, start+length)``.
+
+        The segment always has MARGIN samples of context on both sides (zeros beyond the signal's ends), so
+        the zero-phase band filters act as a linear convolution: no wrap-around of the window's start into
+        its end, and a single block gives the same result as many."""
+        M = self.MARGIN
+        lo, hi = max(0, start - M), min(x.shape[-1], start + length + M)
+        seg = torch.nn.functional.pad(x[..., lo:hi], (M - (start - lo), M - (hi - start - length)))
         n = seg.shape[-1]
         bands = torch.fft.irfft(torch.fft.rfft(seg, n)[..., None, :] * self.band_masks(n), n)
-        return bands[..., start - lo: start - lo + length]
+        return bands[..., M: M + length]
 
     def _env(self, t, t_event, tau):
         """Power envelope ``[B,N,L]`` of exponentially decaying events at ``t_event``."""
@@ -330,7 +335,7 @@ class NeuralPhysicalPiano(nn.Module):
         return held * (on & (last >= 0))[:, None, :].float()
 
     @staticmethod
-    def next_strikes(ki, onset, mask, R=2):
+    def next_strikes(ki, onset, mask, R=8):
         """Delays ``[B,N,R]`` (s) from each note to the next ``R`` strikes of the same key (inf if none)."""
         B, N = ki.shape
         same = (ki[:, :, None] == ki[:, None, :]) & mask[:, :, None] & mask[:, None, :]
@@ -541,6 +546,7 @@ class NeuralPhysicalPiano(nn.Module):
                                            block, generator, residual)
             out["noise"] = noise
             dry = dry + noise[:, None]
+            out["dry_phys"] = dry  # before the residual: what the budget measures the residual against
             if res is not None:
                 out["noise_res"] = res
                 dry = dry + res[:, None]

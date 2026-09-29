@@ -112,7 +112,7 @@ def residual_budget(model, out, mask):
     if "noise_res" in out:
         M = model.noise.band_masks(512)
         e_res = band_energies(out["noise_res"], M)
-        e_dry = band_energies(out["dry"].mean(1), M).detach()
+        e_dry = band_energies(out.get("dry_phys", out["dry"]).mean(1), M).detach()
         terms["additive"] = (e_res / (e_res + e_dry + 1e-12)).mean()
     return terms
 
@@ -172,7 +172,8 @@ def main(argv=None):
     ap.add_argument("--resume", help="checkpoint to continue from (model, optimiser, step, stage)")
     ap.add_argument("--sr", type=int, default=24000)
     ap.add_argument("--steps", type=int, default=200_000)
-    ap.add_argument("--minutes", type=float, help="stop after this much wall-clock training time")
+    ap.add_argument("--minutes", type=float, help="stop after this much wall-clock time in the training loop "
+                                                   "(validation and dumps included; the initialisation is not)")
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--segment", type=float, default=2.0)
@@ -249,13 +250,14 @@ def main(argv=None):
         disc = MultiResolutionDiscriminator().to(device)
         disc_opt = torch.optim.Adam(disc.parameters(), lr=2e-4, betas=(0.5, 0.9))
 
-    step, stage = 0, 1
+    step, stage, best, elapsed0 = 0, 1, math.inf, 0.0
     if args.resume:
         state = torch.load(args.resume, map_location=device)
         model.load_state_dict(state["model"])
         opt.load_state_dict(state["opt"])
         step, stage = state["step"], state["stage"]
-        log(f"resumed from {args.resume} at step {step}, stage {stage}")
+        best, elapsed0 = state.get("best", math.inf), state.get("elapsed", 0.0)
+        log(f"resumed from {args.resume} at step {step}, stage {stage}, {elapsed0 / 60:.1f} min in, best val {best:.4f}")
     with open(os.path.join(args.out, "config.json"), "w") as f:
         json.dump({"model": cfg.to_dict(), "args": vars(args)}, f, indent=2)
 
@@ -273,32 +275,34 @@ def main(argv=None):
         if not args.no_init:
             from .fit_init import initialise_from_data
 
-            init_set = MaestroSegments(args.data, "train", cfg, args.segment, args.warmup, args.lookback,
-                                       length=args.init_examples, deterministic=True, years=args.years, seed=3)
-            est = initialise_from_data(model, fixed_batches(init_set, args.init_examples, args.batch, device), log=log,
-                                       tuning=not args.mined)
-            log("init estimates", kind="init", **{k: v for k, v in est.items()})
+            for year in (args.years or sorted({p["year"] for p in dataset.pieces})):  # one recording condition at a time
+                init_set = MaestroSegments(args.data, "train", cfg, args.segment, args.warmup, args.lookback,
+                                           length=args.init_examples, deterministic=True, years=[year], seed=3)
+                est = initialise_from_data(model, fixed_batches(init_set, args.init_examples, args.batch, device),
+                                           log=log, tuning=not args.mined)
+                log(f"init estimates {year}", kind="init", year=year, **{k: v for k, v in est.items()})
             v0, per0 = validate(model, val_batches, recon, residual=False)
             log(f"val (prior after init): {v0:.4f}", kind="val", step=0, val_physics=v0, per_res=per0, tag="init_prior")
         dump_audio(model, dump_examples, os.path.join(args.out, "audio"), "prior", residual_too=False)
 
-    t_train = 0.0
+    t_train, steps_run = 0.0, 0
     budget_s = args.minutes * 60 if args.minutes else None
+    t_loop = time.time()
+    elapsed = lambda: elapsed0 + time.time() - t_loop  # wall clock of the training loop, validation included
 
     def stage2_due():
         if args.stage2_at < 0:
             return False
         if args.stage2_at >= 1:
             return step >= args.stage2_at
-        return (t_train >= args.stage2_at * budget_s) if budget_s else step >= args.stage2_at * n_steps
+        return (elapsed() >= args.stage2_at * budget_s) if budget_s else step >= args.stage2_at * n_steps
 
     set_stage(model, opt, stage, args.stage2_physics_lr)
     amp_ctx = lambda: torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp)
-    best = math.inf
 
     def save(tag):
         torch.save({"cfg": cfg.to_dict(), "model": model.state_dict(), "opt": opt.state_dict(), "step": step,
-                    "stage": stage, "args": vars(args)}, os.path.join(args.out, f"{tag}.pt"))
+                    "stage": stage, "best": best, "elapsed": elapsed(), "args": vars(args)}, os.path.join(args.out, f"{tag}.pt"))
 
     def run_validation():
         nonlocal best
@@ -372,6 +376,7 @@ def main(argv=None):
         if device.type == "cuda":
             torch.cuda.synchronize()
         t_train += time.time() - t0
+        steps_run += 1
 
         if step % args.log_every == 0:
             vals = {k: float(v.detach()) for k, v in logs.items()}
@@ -380,7 +385,7 @@ def main(argv=None):
             mem = torch.cuda.max_memory_allocated() / 2**30 if device.type == "cuda" else 0.0
             log(f"step {step} stage {stage} " + " ".join(f"{k}={v:.4f}" for k, v in vals.items())
                 + f" | grad {' '.join(f'{k}={v:.2g}' for k, v in gnorm.items())} | {dt / args.log_every:.2f}s/step "
-                  f"(compute {t_train / step if not args.resume else 0:.2f}) mem {mem:.1f}G notes {batch['pitch'].shape[1]}",
+                  f"(compute {t_train / steps_run:.2f}) mem {mem:.1f}G notes {batch['pitch'].shape[1]}",
                 kind="train", step=step, stage=stage, grad=gnorm, **vals)
         if step % args.val_every == 0:
             run_validation()
@@ -388,8 +393,8 @@ def main(argv=None):
             dump_audio(model, dump_examples, os.path.join(args.out, "audio"), f"step{step}", residual_too=stage >= 2)
         if step % args.save_every == 0:
             save("last")
-        if budget_s and t_train >= budget_s:
-            log(f"time limit reached after {step} steps ({t_train / 60:.1f} min of training)")
+        if budget_s and elapsed() >= budget_s:
+            log(f"time limit reached after {step} steps ({elapsed() / 60:.1f} min, {t_train / 60:.1f} of them in steps)")
             break
 
     run_validation()

@@ -72,7 +72,9 @@ def initialise_from_data(model, batches, log=print, max_latency=0.06, max_cents=
     ``tuning=False`` keeps the tuning (e.g. when it came from :func:`apply_mined_priors`)."""
     cfg = model.cfg
     sr = cfg.sample_rate
-    cond = int(batches[0]["condition"][0])
+    conds = torch.cat([b["condition"] for b in batches]).unique()
+    assert len(conds) == 1, "initialise one recording condition at a time (one MAESTRO year per call)"
+    cond = int(conds[0])
     s = int(batches[0]["loss_start"][0])
 
     def render():
@@ -134,13 +136,14 @@ def initialise_from_data(model, batches, log=print, max_latency=0.06, max_cents=
         est["eq_db"].append({int(f): round(float(eq_db[(freqs - f).abs().argmin()]), 1) for f in (63, 125, 250, 500, 1000, 2000, 4000, 8000)})
     log(f"init: mic gain {['%+.1f dB' % v for v in est['level_db']]}; body EQ (dB) {est['eq_db']}")
 
-    # 4. noise floor: 1st percentile of the recordings' band energy, 6 dB under (music is rarely absent from the
-    # mid bands, so a higher percentile overestimates the floor; the level is learned from here)
+    # 4. noise floor: 2nd percentile of the recordings' band energy averaged over ~0.2 s (single frames have only
+    # 1-2 bins in the bass bands, so their low percentiles sit 10-16 dB under the mean), 2 dB under; learned from here
     M = _band_matrix(model, n_fft).to(Pt.device)
     for c in range(cfg.channels):
         E = torch.einsum("kf,nft->nkt", M, _mag(tgt[:, c], n_fft, n_fft // 4) ** 2)  # [N, bands, frames]
-        q = torch.quantile(E.permute(1, 0, 2).reshape(E.shape[1], -1), 0.01, dim=-1)
-        model.room.floor_db.data[cond, c] = 10 * torch.log10(q.clamp(min=1e-14)) - 6.0
+        E = torch.nn.functional.avg_pool1d(E, 10, 5)  # ~0.2 s windows (hop 512 at 24 kHz)
+        q = torch.quantile(E.permute(1, 0, 2).reshape(E.shape[1], -1), 0.02, dim=-1)
+        model.room.floor_db.data[cond, c] = 10 * torch.log10(q.clamp(min=1e-14)) - 2.0
     fl = model.room.floor_db.data[cond].mean(0)
     est["floor_db"] = [round(float(v), 1) for v in fl[:: max(1, len(fl) // 8)]]
     log(f"init: noise floor (white-equivalent dBFS, every 4th band) {est['floor_db']}")
@@ -180,7 +183,12 @@ def apply_mined_priors(model, mined, log=print, min_notes=5, min_reliable=3):
 
     def curve(pts):
         pts = sorted(pts)
-        pts = [(0.0, pts[0][1])] + pts + [(float(N_KEYS - 1), pts[-1][1])]
+        if pts[0][0] > 0:
+            pts = [(0.0, pts[0][1])] + pts
+        if pts[-1][0] < N_KEYS - 1:
+            pts = pts + [(float(N_KEYS - 1), pts[-1][1])]
+        if len(pts) == 1:
+            pts = [(0.0, pts[0][1]), (float(N_KEYS - 1), pts[0][1])]
         return key_curve(pts).to(ph.raw_log_B.device)
 
     if b_pts:

@@ -88,9 +88,12 @@ def test_block_rendering_matches_single_pass():
                      sustain=lambda t: (t > 0.8).float())
     perf["sostenuto"] = perf["sustain"].flip(-1)
     with torch.no_grad():
+        # a trained-looking residual: non-zero band gains, noise and per-note corrections
+        for head in (m.context.head, m.context.frame_head):
+            head[-1].bias.normal_(0, 0.5)
         a = m(perf, n, generator=torch.Generator().manual_seed(0))["audio"]
         b = m(perf, n, block_seconds=0.37, generator=torch.Generator().manual_seed(0))["audio"]
-    assert torch.allclose(a, b, atol=1e-5)
+    assert torch.allclose(a, b, atol=1e-5), (a - b).abs().max()
 
 
 def test_soft_pedal_darkens(model):
