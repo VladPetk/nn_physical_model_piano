@@ -9,3 +9,4 @@ data/
 *.flac
 *.pt
 !samples/*.wav
+.claude/
