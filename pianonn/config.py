@@ -26,7 +26,7 @@ class PianoConfig:
     rec_chunk: int = 256  # chunk length for the parallel linear recurrence
     init_gain_db: float = -34.0
     use_noise: bool = True
-    use_sympathetic: bool = True
+    use_sympathetic: bool = False  # off by default: ~90% of a CPU training step; revisit after profiling on GPU
     use_context: bool = True
     use_room: bool = True  # body + hall; off = dry bridge-force signal
     checkpoint: bool = True

@@ -171,13 +171,15 @@ def run(model):
     check("C8 released vs held (dB, undamped)", d, "0 +-1", abs(d) <= 1, "{:+.1f}")
 
     # --- sustain-pedal halo and noise levels, full model ---
+    # the halo is checked even when the model has the bank switched off, so the prior stays valid
     chord = [(48, 0.0, 0.5, 90), (55, 0.0, 0.5, 90), (64, 0.0, 0.5, 90)]
-    full = _variant(model, use_room=False)
+    full = _variant(model, use_room=False, use_sympathetic=True)
     ped, noped = _render(full, 3.0, chord, sustain=1.0), _render(full, 3.0, chord, sustain=0.0)
+    off = "" if model.cfg.use_sympathetic else " [bank disabled in this model]"
     halo = _rms_db(ped["symp"][: 2 * sr]) - _rms_db(ped["strings"][: 2 * sr])
-    check("pedal halo, symp re strings (dB)", halo, "-40..-25", -40 <= halo <= -25, "{:.0f}")
+    check("pedal halo, symp re strings (dB)" + off, halo, "-40..-25", -40 <= halo <= -25, "{:.0f}")
     diff = _rms_db(ped["symp"][: 2 * sr]) - _rms_db(noped["symp"][: 2 * sr])
-    check("halo with vs without pedal (dB)", diff, ">= 10", diff >= 10, "{:.0f}")
+    check("halo with vs without pedal (dB)" + off, diff, ">= 10", diff >= 10, "{:.0f}")
     no_symp = _variant(model, use_room=False, use_sympathetic=False)
     for v, target in ((120, -25), (25, -12)):
         out = _render(no_symp, 1.0, [(60, 0.1, 0.8, v)])

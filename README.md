@@ -76,7 +76,7 @@ PianoPhysics: per-key params = literature prior + bounded learned offset (docs/p
 Strings: closed-form damped-sinusoid bank, attack ramp over the contact time,
    │     chunked + checkpointed (exact for pedalling; notes can start before the window)
    │ bridge force
-   ├─► SympatheticBank: 88 keys × S partials as resonators with time-varying poles
+   ├─► SympatheticBank (off by default, see roadmap): 88 keys × S partials as resonators with time-varying poles
    │                    (dampers), driven by the bridge minus the key's own strings
    ├─► NoiseBank: hammer knock, key-bottom thump, damper noise, pedal noise
    ▼
@@ -138,6 +138,6 @@ Next steps:
 - [ ] Re-strike interaction on a string that is still vibrating.
 - [ ] Calibrate the damper delay, the damper boundary key and hall T60s per year from MAESTRO.
 - [ ] Stereo output.
-- [ ] Speed up the sympathetic bank's scan (about 90% of a CPU training step; profile on GPU first).
+- [ ] Speed up the sympathetic bank's scan (about 90% of a CPU training step; profile on GPU first), then re-enable it (`use_sympathetic=True`).
 - [ ] Real-time C++/JUCE engine: recursive two-pole resonators replace the training-time closed form.
 - [ ] Evaluation suite (FAD, transcription F1, listening tests).

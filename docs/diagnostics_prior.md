@@ -54,8 +54,8 @@
 | A0 release to -60 dB (s) | 0.71 | >= 0.5 | PASS |
 | A4 release to -60 dB (s) | 0.25 | 0.2-0.4 | PASS |
 | C8 released vs held (dB, undamped) | +0.0 | 0 +-1 | PASS |
-| pedal halo, symp re strings (dB) | -32 | -40..-25 | PASS |
-| halo with vs without pedal (dB) | 11 | >= 10 | PASS |
+| pedal halo, symp re strings (dB) [bank disabled in this model] | -32 | -40..-25 | PASS |
+| halo with vs without pedal (dB) [bank disabled in this model] | 11 | >= 10 | PASS |
 | knock re tone, first 60 ms, vel 120 (dB) | -25 | -25 +-3 | PASS |
 | knock re tone, first 60 ms, vel 25 (dB) | -12 | -12 +-3 | PASS |
 | damper noise re released note (dB) | -40 | -45..-35 | PASS |

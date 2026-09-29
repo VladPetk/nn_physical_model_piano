@@ -6,7 +6,7 @@ from pianonn import NeuralPhysicalPiano, PianoConfig
 
 def small_cfg(**kw):
     base = dict(sample_rate=8000, hop=40, n_partials=16, body_seconds=0.05, hall_seconds=0.2, ctx_hidden=32, synth_chunk=512,
-                noise_bands=16)
+                noise_bands=16, use_sympathetic=True)  # exercise the bank even though it is off by default
     return PianoConfig(**{**base, **kw})
 
 
