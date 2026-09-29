@@ -252,9 +252,16 @@ def main(argv=None):
 
     step, stage, best, elapsed0 = 0, 1, math.inf, 0.0
     if args.resume:
+        from .render import load_weights
+
         state = torch.load(args.resume, map_location=device)
-        model.load_state_dict(state["model"])
-        opt.load_state_dict(state["opt"])
+        load_weights(model, state["model"], log=log)
+        try:
+            opt.load_state_dict(state["opt"])
+        except ValueError as e:  # parameter set changed: restart the optimiser's moments
+            log(f"optimiser state not restored ({e})")
+        for g in opt.param_groups:  # the learning-rate policy is this run's (--lr, lr_scale), not the checkpoint's
+            g["base_lr"] = args.lr * lr_scale(g["name"])
         step, stage = state["step"], state["stage"]
         best, elapsed0 = state.get("best", math.inf), state.get("elapsed", 0.0)
         log(f"resumed from {args.resume} at step {step}, stage {stage}, {elapsed0 / 60:.1f} min in, best val {best:.4f}")

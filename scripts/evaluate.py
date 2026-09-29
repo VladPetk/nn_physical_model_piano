@@ -156,6 +156,8 @@ def main():
     ap.add_argument("--mined", help="scripts/mine_notes.py output for the identifiability check")
     ap.add_argument("--render-seconds", type=float, default=20.0)
     ap.add_argument("--init-examples", type=int, default=32)
+    ap.add_argument("--start-without-mined", action="store_true",
+                    help="the run started from the prior + data init only (no --mined): model its start that way")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -165,8 +167,9 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     state = torch.load(args.ckpt, map_location=dev)
     cfg = PianoConfig.from_dict(state["cfg"])
-    trained = NeuralPhysicalPiano(cfg).to(dev)
-    trained.load_state_dict(state["model"])
+    from pianonn.render import load_weights
+
+    trained = load_weights(NeuralPhysicalPiano(cfg), state["model"]).to(dev)
     trained.eval()
     cond = year_to_condition(args.years[0])
 
@@ -182,11 +185,12 @@ def main():
     if args.mined:
         with open(args.mined) as f:
             mined = json.load(f)
-        apply_mined_priors(init, mined, log=lambda *a: None)
+        if not args.start_without_mined:
+            apply_mined_priors(init, mined, log=lambda *a: None)
     init_set = MaestroSegments(args.data, "train", cfg, 2.0, 1.0, 12.0, length=args.init_examples, deterministic=True,
                                years=args.years, seed=3)
     initialise_from_data(init, fixed_batches(init_set, args.init_examples, 8, dev), log=lambda *a: None,
-                         tuning=mined is None)
+                         tuning=mined is None or args.start_without_mined)
     rows = {
         "untrained prior": distances(raw, batches, False, M),
         "prior + data init": distances(init, batches, False, M),
@@ -238,11 +242,16 @@ def main():
                          years=args.years, seed=12)
     for i, b in enumerate(fixed_batches(rs, 2, 1, dev)):
         n = b["audio"].shape[-1]
-        sf.write(os.path.join(args.out, f"long{i}_target.wav"), b["audio"][0].T.cpu().numpy(), cfg.sample_rate)
+        clips = [b["audio"][0].T.cpu().numpy()]
+        sf.write(os.path.join(args.out, f"long{i}_target.wav"), clips[0], cfg.sample_rate)
         for tag, model, res in (("prior_init", init, False), ("physics", trained, False), ("residual", trained, True)):
             with torch.no_grad():
                 y = model(b, n, residual=res, block_seconds=4.0, generator=torch.Generator(device=dev).manual_seed(0))["audio"][0]
-            sf.write(os.path.join(args.out, f"long{i}_{tag}.wav"), y.T.clamp(-1, 1).cpu().numpy(), cfg.sample_rate)
+            clips.append(y.T.clamp(-1, 1).cpu().numpy())
+            sf.write(os.path.join(args.out, f"long{i}_{tag}.wav"), clips[-1], cfg.sample_rate)
+        gap = np.zeros((cfg.sample_rate // 2, clips[0].shape[1]), dtype=np.float32)
+        ab = np.concatenate([x for c in clips for x in (c, gap)])  # recording, prior + init, physics, physics + residual
+        sf.write(os.path.join(args.out, f"long{i}_ab.wav"), ab, cfg.sample_rate)
     text = "\n".join(lines) + "\n"
     with open(os.path.join(args.out, "report.md"), "w") as f:
         f.write(text)

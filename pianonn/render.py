@@ -10,11 +10,20 @@ from .data import _perf_from_notes, load_midi
 from .synth import NeuralPhysicalPiano
 
 
+def load_weights(model, state_dict, log=print):
+    """Load a checkpoint, tolerating parameters added since it was written (they keep their defaults)."""
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        log(f"checkpoint: {len(missing)} new parameter(s) at their defaults {missing[:6]}, "
+            f"{len(unexpected)} unknown ignored {unexpected[:6]}")
+    return model
+
+
 def load_model(ckpt=None, device="cpu", **overrides):
     if ckpt:
         state = torch.load(ckpt, map_location=device)
         model = NeuralPhysicalPiano(PianoConfig.from_dict({**state["cfg"], **overrides}))
-        model.load_state_dict(state["model"])
+        load_weights(model, state["model"])
     else:
         model = NeuralPhysicalPiano(PianoConfig(**overrides))
     return model.to(device).eval()
