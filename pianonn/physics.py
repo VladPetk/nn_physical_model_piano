@@ -72,9 +72,9 @@ class PianoPhysics(nn.Module):
         k = torch.arange(N_KEYS)
 
         # --- priors (buffers, not trained); see docs/physical_parameters.md ---
-        self.register_buffer("prior_log_B", LN10 * key_curve(
-            [(0, -3.52), (6, -3.66), (14, -3.85), (22, -3.96), (29, -3.92), (33, -3.70),
-             (39, -3.42), (48, -3.07), (56, -2.74), (63, -2.46), (75, -2.00), (87, -1.55)]))
+        # Rigaud, David & Daudet (DAFx 2011) two-asymptote fit, m = MIDI pitch (as used by DDSP-Piano)
+        m = (k + LOWEST_MIDI).float()
+        self.register_buffer("prior_log_B", torch.log(torch.exp(0.0926 * m - 13.64) + torch.exp(-0.0847 * m - 5.82)))
         self.register_buffer("prior_cents", key_curve(
             [(0, -30), (12, -18), (24, -8), (36, -3), (48, 0), (60, 5), (72, 13), (84, 25), (87, 30)]))
         self.register_buffer("prior_log_b1", torch.log(key_curve(
@@ -84,10 +84,12 @@ class PianoPhysics(nn.Module):
         # prompt/aftersound decay ratio at the fundamental (R): 1.5 mono, 1.7 bi, 2.5 -> 4 tri
         self.register_buffer("prior_prompt_ratio", key_curve([(0, 1.5), (7, 1.5), (8, 1.7), (25, 1.7), (26, 2.5), (39, 4.0), (87, 4.0)]))
         self.register_buffer("prior_log_after", torch.log(key_curve([(0, 0.10), (39, 0.06), (87, 0.06)])))
+        # contact time at mf (2.8 m/s): Askenfelt & Jansson, Five Lectures, Fig. 7
         self.register_buffer("prior_log_tc", torch.log(1e-3 * key_curve(
-            [(0, 3.5), (15, 3.0), (27, 2.4), (39, 1.9), (51, 1.5), (63, 1.1), (75, 0.8), (87, 0.6)])))
+            [(0, 3.7), (15, 3.0), (27, 2.8), (39, 2.1), (51, 1.45), (63, 1.1), (75, 0.6), (87, 0.5)])))
+        # strike position d/L: Conklin, Five Lectures, Fig. 11 (contemporary grand)
         self.register_buffer("prior_strike", key_curve(
-            [(0, 0.125), (15, 0.12), (27, 0.115), (39, 0.11), (48, 0.105), (56, 0.095), (63, 0.088), (75, 0.075), (87, 0.06)]))
+            [(0, 0.122), (27, 0.122), (39, 0.121), (49, 0.115), (54, 0.108), (59, 0.100), (69, 0.090), (79, 0.075), (87, 0.065)]))
         self.register_buffer("damper_strength", key_curve([(0, 1.0), (62, 1.0), (67, 0.3), (68, 0.0), (87, 0.0)]))
         self.register_buffer("prior_log_damp", torch.log(key_curve(
             [(0, 8.0), (12, 10.0), (24, 14.0), (36, 20.0), (48, 28.0), (60, 36.0), (67, 40.0), (87, 40.0)])))
@@ -151,9 +153,9 @@ class PianoPhysics(nn.Module):
 
     def contact_time(self, ki, u, soft, cond, ctx_log_fc=None):
         """Hammer-string contact time in seconds; shorter (brighter) for harder strikes."""
-        q = 0.25 * torch.exp(bounded(self.raw_tc_vel[ki], 0.7))
+        q = 0.2 * torch.exp(bounded(self.raw_tc_vel[ki], 0.7))  # Askenfelt Fig. 6: slope ~ -0.19 at C4
         log_tc = (self.prior_log_tc[ki] + bounded(self.raw_log_tc[ki], 1.0) + bounded(self.cond_log_tc[cond[:, None]], 0.5)
-                  - q * torch.log(hammer_velocity(u) / 2.0) + soft * self.soft_log_tc)
+                  - q * torch.log(hammer_velocity(u) / 2.8) + soft * self.soft_log_tc)
         if ctx_log_fc is not None:
             log_tc = log_tc - ctx_log_fc
         return log_tc.exp()

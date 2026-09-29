@@ -117,6 +117,16 @@ class SympatheticBank(nn.Module):
         return self._block(*args)
 
 
+def _key_bottom_delay(v):
+    """Key-bottom contact relative to hammer-string contact (s) vs hammer speed (m/s):
+    p +12 ms, mf +0.5 ms, f -2.5 ms, ff -5 ms (Askenfelt & Jansson, Five Lectures, Figs. 4-5)."""
+    vs = torch.tensor([1.0, 2.8, 5.5, 9.0], device=v.device, dtype=v.dtype)
+    ds = torch.tensor([0.012, 0.0005, -0.0025, -0.005], device=v.device, dtype=v.dtype)
+    i = torch.searchsorted(vs, v.clamp(vs[0], vs[-1]).contiguous()).clamp(1, len(vs) - 1)
+    w = ((v.clamp(vs[0], vs[-1]) - vs[i - 1]) / (vs[i] - vs[i - 1]))
+    return ds[i - 1] + w * (ds[i] - ds[i - 1])
+
+
 def _dark_bands(centers, corner, base):
     """Log-amplitude band levels: flat up to ``corner`` Hz, then -12 dB/oct."""
     return base - 2 * math.log(2) * torch.log2(centers / corner).clamp(min=0)
@@ -187,7 +197,7 @@ class NoiseBank(nn.Module):
         """Per-band power ``[B, bands, L]`` of note events."""
         cfg = self.cfg
         t = (start + torch.arange(length, device=ki.device, dtype=torch.float64)).to(u.dtype) / cfg.sample_rate
-        thump_at = onset + (0.012 - 0.00375 * (hammer_velocity(u) - 1)).clamp(-0.003, 0.012)
+        thump_at = onset + _key_bottom_delay(hammer_velocity(u))
         p_on = torch.exp(2 * (self.knock[ki] + (self.knock_vel[ki] * (u - 0.6) + log_knock)[..., None]))
         env_on = (self._env(t, onset, self.knock_log_tau[ki].exp())
                   + self.thump_log_gain.exp() ** 2 * self._env(t, thump_at, self.thump_log_tau.exp().expand_as(onset)))

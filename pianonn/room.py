@@ -21,8 +21,9 @@ from torch import nn
 
 from .dsp import bounded, fft_convolve
 
-BODY_TARGET_DB = [(20, -40), (30, -30), (40, -20), (55, -10), (70, -4), (100, 0), (1000, 0), (2000, -1),
-                  (4000, -3), (8000, -7), (11000, -12)]
+BODY_TARGET_DB = [(20, -40), (30, -30), (40, -20), (55, -10), (70, -4), (100, 0), (1000, 0), (2000, -3),
+                  (4000, -6), (8000, -11), (11000, -15)]  # HF droop: Wogram, Five Lectures, Fig. 5 (upright; low confidence)
+GRAND_LOW_MODES = [62.0, 90.0, 105.0, 127.0, 187.0, 222.0, 245.0, 325.0]  # 2.90 m concert grand (Wogram, modal.html)
 HALL_BANDS = [125, 250, 500, 1000, 2000, 4000, 8000]
 HALL_T60 = [2.0, 1.8, 1.7, 1.6, 1.45, 1.2, 0.8]
 
@@ -56,15 +57,19 @@ def _minimum_phase(log_mag):
     return torch.exp(torch.fft.rfft(fold))
 
 
-def soundboard_body(sr, seconds, seed=0, eta=0.02, predelay=0.003, crossover=1100.0):
+def soundboard_body(sr, seconds, seed=0, eta=0.02, predelay=0.003, crossover=1350.0):
     """Initial soundboard + case impulse response (see docs/physical_parameters.md, section 4)."""
     g = torch.Generator().manual_seed(seed)
     L = int(seconds * sr)
     t = torch.arange(L, dtype=torch.float64) / sr
 
-    # sparse modes below the plate/rib-strip transition: ~0.07 modes/Hz, T60 = 2.2 / (eta f)
-    n_modes = int(0.07 * (crossover - 60))
-    f = torch.sort(60 + (crossover - 60) * torch.rand(n_modes, generator=g, dtype=torch.float64)).values
+    # measured low modes of a concert grand, then ~0.07 modes/Hz (Steinway D model, Boutillon et al.)
+    # up to the plate/rib-strip transition (~1.35 kHz for a D); T60 = 2.2 / (eta f)
+    n_random = int(0.07 * (crossover - 330))
+    f = torch.cat([torch.tensor(GRAND_LOW_MODES, dtype=torch.float64),
+                   330 + (crossover - 330) * torch.rand(n_random, generator=g, dtype=torch.float64)])
+    f = torch.sort(f).values
+    n_modes = len(f)
     tau = (1 / (math.pi * eta * f)).clamp(max=0.25)
     phase = 2 * math.pi * torch.rand(n_modes, generator=g, dtype=torch.float64)
     amp = torch.randn(n_modes, generator=g, dtype=torch.float64)
