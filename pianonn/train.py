@@ -25,10 +25,10 @@ def perturb_physics(model, scale=0.3, seed=0):
     return model
 
 
-def param_groups(model, lr, ir_lr_scale=0.03):
-    """Thousands of FIR taps each taking a full Adam step drown out the physics, so the IR learns slower."""
-    rest = [p for name, p in model.named_parameters() if name != "ir"]
-    return [{"params": rest, "lr": lr}, {"params": [model.ir], "lr": lr * ir_lr_scale}]
+def param_groups(model, lr, fir_lr_scale=0.03):
+    """Thousands of FIR taps each taking a full Adam step drown out the physics, so the body FIR learns slower."""
+    rest = [p for name, p in model.named_parameters() if name != "room.body"]
+    return [{"params": rest, "lr": lr}, {"params": [model.room.body], "lr": lr * fir_lr_scale}]
 
 
 def to_device(batch, device):

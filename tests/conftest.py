@@ -5,7 +5,7 @@ from pianonn import NeuralPhysicalPiano, PianoConfig
 
 
 def small_cfg(**kw):
-    base = dict(sample_rate=8000, hop=40, n_partials=16, ir_seconds=0.1, ctx_hidden=32, synth_chunk=512,
+    base = dict(sample_rate=8000, hop=40, n_partials=16, body_seconds=0.05, hall_seconds=0.2, ctx_hidden=32, synth_chunk=512,
                 noise_fft=256, noise_bands=16)
     return PianoConfig(**{**base, **kw})
 

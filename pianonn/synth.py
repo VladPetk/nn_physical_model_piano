@@ -1,4 +1,4 @@
-"""The full differentiable piano: strings -> sympathetic resonance -> noise -> soundboard/room."""
+"""The full differentiable piano: strings -> sympathetic resonance -> noise -> soundboard body + hall."""
 
 import math
 
@@ -8,26 +8,26 @@ from torch.utils.checkpoint import checkpoint
 
 from .config import PianoConfig
 from .dsp import fft_convolve, frames_to_samples, linear_recurrence, sample_curve, sample_keyed
-from .physics import LOWEST_MIDI, N_KEYS, PianoPhysics
+from .physics import LOWEST_MIDI, N_KEYS, PianoPhysics, hammer_velocity, key_curve
+from .room import Room
 
 
-def _osc_bank(freq, alpha, amp, alpha_damp, onset, c_note, c_onset, t):
-    """Closed-form damped-sinusoid bank for one time chunk.
+def _osc_bank(freq, alpha, amp, alpha_damp, tc, onset, c_note, c_onset, t):
+    """Closed-form damped-sinusoid bank for one time chunk; returns per-note output ``[B,N,L]``.
 
     Decay is ``alpha * (t - onset) + alpha_damp * D(t)``, where ``D`` is the time
     the key's damper has been on the string since the onset, so key releases,
     pedalling and half-pedalling are all exact (no per-sample recursion) and
-    every chunk is independent of the others.
+    every chunk is independent of the others. Partials ramp in over the hammer
+    contact time ``tc`` with phases referenced to the centre of the force pulse.
     """
-    tau = t[None, None, :] - onset[..., None]  # [B,N,L]
-    active = (tau >= 0).to(freq.dtype)
-    tau = tau.clamp(min=0)[:, :, None, None, :]
+    tau = (t[None, None, :] - onset[..., None]).clamp(min=0)  # [B,N,L]
+    ramp = 0.5 - 0.5 * torch.cos(math.pi * (tau / tc[..., None]).clamp(max=1))
     damped = (c_note - c_onset[..., None]).clamp(min=0)[:, :, None, None, :]
-    log_env = -alpha[..., None] * tau - alpha_damp[..., None, None] * damped
-    cycles = freq[..., None] * tau
+    log_env = -alpha[..., None] * tau[:, :, None, None, :] - alpha_damp[..., None, None] * damped
+    cycles = freq[..., None] * (tau - 0.5 * tc[..., None])[:, :, None, None, :]
     phase = 2 * math.pi * (cycles - cycles.detach().floor())
-    y = (amp[..., None] * torch.exp(log_env) * torch.sin(phase)).sum((2, 3))
-    return (y * active).sum(1)
+    return (amp[..., None] * torch.exp(log_env) * torch.sin(phase)).sum((2, 3)) * ramp
 
 
 class ContextNet(nn.Module):
@@ -64,91 +64,117 @@ class ContextNet(nn.Module):
 
 
 class SympatheticBank(nn.Module):
-    """Every string on the instrument as a resonator driven by the bridge signal.
+    """Every string on the instrument as a resonator driven by the bridge.
 
     With the dampers down only the undamped treble strings respond; lift the
-    pedal and the whole bank rings. The damper state is time-varying, so this
-    is a linear recurrence with time-varying poles, solved by the chunked
-    parallel scan in :func:`linear_recurrence`.
+    pedal and the whole bank rings. Each key is driven by the bridge signal
+    minus its own strings (those are already modelled). The damper state is
+    time-varying, so this is a linear recurrence with time-varying poles, solved
+    by the chunked parallel scan in :func:`linear_recurrence`.
+
+    Drive coupling follows reciprocity: a string that loses energy to the
+    bridge at rate ``alpha`` also receives it at a rate ~ sqrt(alpha), so the
+    slowly decaying bass strings are not starved.
     """
 
     def __init__(self, cfg: PianoConfig):
         super().__init__()
         self.cfg = cfg
-        self.log_gain = nn.Parameter(torch.full((N_KEYS,), math.log(0.05)))
+        self.log_gain = nn.Parameter(torch.log(key_curve([(0, 0.08), (12, 0.12), (30, 0.15), (67, 0.15), (87, 0.10)])))
 
-    def _block(self, bridge, es, freq, alpha, alpha_damp, gin, state):
+    def _block(self, drive, es, freq, alpha, alpha_damp, gin, state):
         sr = self.cfg.sample_rate
         decay = (alpha[..., None] + es[:, :, None, :] * alpha_damp[..., None]).clamp(max=1000.0) / sr
         omega = (2 * math.pi / sr) * freq[..., None].expand_as(decay)
         log_a = torch.complex(-decay, omega)
-        drive = bridge[:, None, None, :] * gin[..., None]
-        x = torch.complex(drive, torch.zeros_like(drive))
-        y, state = linear_recurrence(x, log_a, state, self.cfg.rec_chunk)
+        x = drive[:, :, None, :] * gin[..., None]
+        y, state = linear_recurrence(torch.complex(x, torch.zeros_like(x)), log_a, state, self.cfg.rec_chunk)
         return y.real.sum((1, 2)), state
 
-    def forward(self, bridge, key_modes, engagement, block=None):
+    def forward(self, bridge, own, key_modes, engagement, start, state=None):
+        """``bridge[B,L]`` total string signal, ``own[B,88,L]`` per-key share, for samples ``[start, start+L)``."""
         cfg = self.cfg
         S = cfg.symp_partials
         freq = key_modes["freq"][..., :S, 0]
         alpha = key_modes["alpha"][..., :S, 0]
         alpha_damp = key_modes["alpha_damp"][..., :S]
         valid = (freq < 0.45 * cfg.sample_rate).to(freq.dtype)
-        # scale drive by (1 - |a|) so the steady-state gain at resonance is exp(log_gain)
-        gin = self.log_gain.exp()[None, :, None] * alpha / cfg.sample_rate * valid
-        T = bridge.shape[-1]
-        block = block or T
-        state, out = None, []
-        for s0 in range(0, T, block):
-            L = min(block, T - s0)
-            es = frames_to_samples(engagement, s0, L, cfg.hop)
-            args = (bridge[:, s0:s0 + L], es, freq, alpha, alpha_damp, gin, state)
-            if cfg.checkpoint and torch.is_grad_enabled():
-                y, state = checkpoint(self._block, *args, use_reentrant=False)
-            else:
-                y, state = self._block(*args)
-            out.append(y)
-        return torch.cat(out, -1)
+        gin = self.log_gain.exp()[None, :, None] * alpha.sqrt() / cfg.sample_rate * valid
+        drive = bridge[:, None, :] - own
+        es = frames_to_samples(engagement, start, bridge.shape[-1], cfg.hop)
+        args = (drive, es, freq, alpha, alpha_damp, gin, state)
+        if cfg.checkpoint and torch.is_grad_enabled():
+            return checkpoint(self._block, *args, use_reentrant=False)
+        return self._block(*args)
+
+
+def _dark_bands(centers, corner, base):
+    """Log-amplitude band levels: flat up to ``corner`` Hz, then -12 dB/oct."""
+    return base - 2 * math.log(2) * torch.log2(centers / corner).clamp(min=0)
 
 
 class NoiseBank(nn.Module):
-    """Hammer knock / key thump at note-on and damper noise at note-off, as
-    band-shaped noise with per-key spectra and exponential envelopes."""
+    """Mechanical noises as band-shaped noise with per-key spectra and exponential envelopes:
+    hammer/soundboard knock at note-on, key-bottom thump (velocity-dependent timing),
+    damper noise at release, and pedal-mechanism noise when the dampers move."""
 
     def __init__(self, cfg: PianoConfig):
         super().__init__()
         self.cfg = cfg
         nb, n_bins = cfg.noise_bands, cfg.noise_fft // 2 + 1
-        pos = torch.linspace(0, 1, nb)
-        self.knock = nn.Parameter((-3.0 - 1.5 * pos).repeat(N_KEYS, 1))
+        centers = torch.logspace(math.log10(40), math.log10(cfg.sample_rate / 2), nb)
+        self.knock = nn.Parameter(_dark_bands(centers, 600.0, -2.0).repeat(N_KEYS, 1))
         self.knock_vel = nn.Parameter(torch.full((N_KEYS,), 2.0))
-        self.knock_log_tau = nn.Parameter(torch.full((N_KEYS,), math.log(0.02)))
-        self.release = nn.Parameter((-4.0 - 1.5 * pos).repeat(N_KEYS, 1))
-        self.release_log_tau = nn.Parameter(torch.full((N_KEYS,), math.log(0.04)))
-        centers = torch.log(torch.logspace(math.log10(40), math.log10(cfg.sample_rate / 2), nb))
+        self.knock_log_tau = nn.Parameter(torch.log(key_curve([(0, 0.010), (40, 0.007), (87, 0.005)])))
+        self.thump_log_gain = nn.Parameter(torch.tensor(math.log(0.7)))
+        self.thump_log_tau = nn.Parameter(torch.tensor(math.log(0.008)))
+        self.release = nn.Parameter(_dark_bands(centers, 1500.0, -3.0).repeat(N_KEYS, 1))
+        self.release_log_tau = nn.Parameter(torch.full((N_KEYS,), math.log(0.005)))
+        self.pedal = nn.Parameter(_dark_bands(centers, 800.0, -1.0))
+        self.pedal_log_tau = nn.Parameter(torch.tensor(math.log(0.03)))
+        lc = torch.log(centers)
         bins = torch.log(torch.linspace(0, cfg.sample_rate / 2, n_bins).clamp(min=40))
-        idx = torch.searchsorted(centers, bins).clamp(1, nb - 1)
-        w = ((bins - centers[idx - 1]) / (centers[idx] - centers[idx - 1])).clamp(0, 1)
+        idx = torch.searchsorted(lc, bins).clamp(1, nb - 1)
+        w = ((bins - lc[idx - 1]) / (lc[idx] - lc[idx - 1])).clamp(0, 1)
         W = torch.zeros(nb, n_bins)
         W[idx - 1, torch.arange(n_bins)] = 1 - w
         W[idx, torch.arange(n_bins)] += w
         self.register_buffer("band_to_bin", W)
         self.register_buffer("window", torch.hann_window(cfg.noise_fft))
 
+    def _env(self, tf, t_event, tau):
+        """Power envelope of an exponentially decaying event, aligned to the first frame at/after it."""
+        hop_s = self.cfg.hop / self.cfg.sample_rate
+        start = torch.ceil(t_event / hop_s) * hop_s
+        d = tf - start[..., None]
+        return torch.exp(-2 * d.clamp(min=0) / tau[..., None]) * (d >= -1e-6)
+
     def magnitude(self, ki, u, onset, offset, weight_on, weight_off, log_knock, f_start, n_frames):
         cfg = self.cfg
         tf = (f_start + torch.arange(n_frames, device=ki.device)) * cfg.hop / cfg.sample_rate
-        d_on = tf - onset[..., None]
-        env_on = torch.exp(-2 * d_on.clamp(min=0) / self.knock_log_tau[ki].exp()[..., None]) * (d_on >= 0)
-        d_off = tf - offset[..., None]
-        env_off = torch.exp(-2 * d_off.clamp(min=0) / self.release_log_tau[ki].exp()[..., None]) * (d_off >= 0)
+        v = hammer_velocity(u)
+        thump_at = onset + (0.012 - 0.00375 * (v - 1)).clamp(-0.003, 0.012)
         p_on = torch.exp(2 * (self.knock[ki] + (self.knock_vel[ki] * (u - 0.6) + log_knock)[..., None]))
+        env_on = (self._env(tf, onset, self.knock_log_tau[ki].exp())
+                  + self.thump_log_gain.exp() ** 2 * self._env(tf, thump_at, self.thump_log_tau.exp().expand_as(onset)))
+        env_off = self._env(tf, offset, self.release_log_tau[ki].exp())
         p_off = torch.exp(2 * self.release[ki])
         power = (torch.einsum("bnk,bnf->bkf", p_on * weight_on[..., None], env_on)
                  + torch.einsum("bnk,bnf->bkf", p_off * weight_off[..., None], env_off))
-        return torch.sqrt(torch.einsum("bkf,kq->bqf", power, self.band_to_bin) + 1e-12)
+        return power
 
-    def synth(self, mag, n_samples, generator=None):
+    def pedal_power(self, lift):
+        """Pedal-mechanism noise power ``[B, bands, F]`` driven by how fast the damper rail moves."""
+        cfg = self.cfg
+        rate = torch.cat([lift.new_zeros(lift.shape[0], 1), (lift[:, 1:] - lift[:, :-1]).abs()], 1) * cfg.sample_rate / cfg.hop
+        drive = (rate / 20.0).clamp(max=1.0) ** 2  # a full press in ~50 ms saturates
+        n = torch.arange(lift.shape[-1], device=lift.device) * cfg.hop / cfg.sample_rate
+        kernel = torch.exp(-2 * n / self.pedal_log_tau.exp())
+        env = fft_convolve(drive, kernel).clamp(min=0)  # FFT round-off can go slightly negative
+        return torch.exp(2 * self.pedal)[None, :, None] * env[:, None, :]
+
+    def synth(self, power_bands, n_samples, generator=None):
+        mag = torch.sqrt(torch.einsum("bkf,kq->bqf", power_bands, self.band_to_bin).clamp(min=0) + 1e-12)
         phase = 2 * math.pi * torch.rand(mag.shape, generator=generator, device=mag.device)
         return torch.istft(torch.polar(mag, phase), self.cfg.noise_fft, self.cfg.hop,
                            window=self.window, length=n_samples)
@@ -171,12 +197,7 @@ class NeuralPhysicalPiano(nn.Module):
         self.context = ContextNet(cfg)
         self.symp = SympatheticBank(cfg)
         self.noise = NoiseBank(cfg)
-        L = int(cfg.ir_seconds * cfg.sample_rate)
-        g = torch.Generator().manual_seed(0)
-        t = torch.arange(L) / cfg.sample_rate
-        ir = 0.02 * torch.randn(cfg.n_conditions, L, generator=g) * torch.exp(-6.9 * t / 0.8)
-        ir[:, 0] = 1.0
-        self.ir = nn.Parameter(ir)
+        self.room = Room(cfg)
 
     def n_frames(self, n_samples: int) -> int:
         return n_samples // self.cfg.hop + 2
@@ -197,54 +218,73 @@ class NeuralPhysicalPiano(nn.Module):
         roll.scatter_add_(1, ki * F + on_f.clamp(max=F - 1), u * valid)
         return key_down, roll.view(B, N_KEYS, F)
 
+    @staticmethod
+    def sostenuto_latch(key_down, sostenuto, threshold=0.5):
+        """Keys held when the sostenuto pedal goes down keep their dampers up until it comes up."""
+        B, K, F = key_down.shape
+        on = sostenuto[:, :F] > threshold
+        rising = on & ~torch.cat([on.new_zeros(B, 1), on[:, :-1]], 1)
+        frames = torch.arange(F, device=key_down.device).expand(B, F)
+        last = torch.where(rising, frames, torch.full_like(frames, -1)).cummax(1).values
+        held = key_down.gather(2, last.clamp(min=0)[:, None, :].expand(-1, K, -1))
+        return held * (on & (last >= 0))[:, None, :].float()
+
     @torch.no_grad()
     def _ring_end(self, modes, onset, floor=1e-5, max_seconds=60.0):
-        amp, alpha = modes["amp"], modes["alpha"]
+        amp, alpha = modes["amp"].abs(), modes["alpha"]
         t = torch.log(amp.clamp(min=1e-30) / floor) / alpha
         t = torch.where(amp > floor, t, torch.zeros_like(t)).amax((2, 3))
         return onset + t.clamp(0, max_seconds)
 
-    def render_strings(self, modes, ki, onset, ring_end, C, start, length):
+    def render_strings(self, modes, ki, onset, ring_end, C, start, length, per_key=False):
+        """String (bridge-force) signal for samples ``[start, start+length)``; optionally also per key ``[B,88,L]``."""
         cfg = self.cfg
         sr = cfg.sample_rate
         B = ki.shape[0]
-        out = []
+        out, keys = [], []
         for s0 in range(start, start + length, cfg.synth_chunk):
             L = min(cfg.synth_chunk, start + length - s0)
             active = (onset < (s0 + L) / sr) & (ring_end > s0 / sr)
             sel = active.any(0).nonzero().squeeze(1)
             if sel.numel() == 0:
                 out.append(C.new_zeros(B, L))
+                keys.append(C.new_zeros(B, N_KEYS, L) if per_key else None)
                 continue
             m = {k: v[:, sel] for k, v in modes.items()}
             k_sel, on = ki[:, sel], onset[:, sel]
             c_note = frames_to_samples(C, s0, L, cfg.hop).gather(1, k_sel[..., None].expand(-1, -1, L))
             c_onset = sample_keyed(C, k_sel, on.clamp(min=0), sr, cfg.hop)
             t = (s0 + torch.arange(L, device=ki.device, dtype=torch.float64)) / sr
-            args = (m["freq"], m["alpha"], m["amp"], m["alpha_damp"], on, c_note, c_onset, t.to(C.dtype))
+            args = (m["freq"], m["alpha"], m["amp"], m["alpha_damp"], m["tc"], on, c_note, c_onset, t.to(C.dtype))
             if cfg.checkpoint and torch.is_grad_enabled():
-                out.append(checkpoint(_osc_bank, *args, use_reentrant=False))
+                notes = checkpoint(_osc_bank, *args, use_reentrant=False)
             else:
-                out.append(_osc_bank(*args))
-        return torch.cat(out, -1)
+                notes = _osc_bank(*args)
+            out.append(notes.sum(1))
+            if per_key:
+                keys.append(notes.new_zeros(B, N_KEYS, L).scatter_add(1, k_sel[..., None].expand(-1, -1, L), notes))
+        return torch.cat(out, -1), (torch.cat(keys, -1) if per_key else None)
 
-    def render_noise(self, ki, u, onset, offset, mask, lift, log_knock, F, n_samples, block_frames, generator):
+    def render_noise(self, ki, u, onset, offset, mask, lift, pedal_damping, log_knock, F, n_samples, block_frames,
+                     generator):
         cfg = self.cfg
         sr, hop = cfg.sample_rate, cfg.hop
-        lift_off = sample_curve(lift, offset.clamp(min=0), sr, hop)
+        release = offset + cfg.damper_delay
+        damp_at_release = sample_curve(pedal_damping, release.clamp(min=0), sr, hop)
         w_on = mask.float()
-        w_off = mask.float() * self.physics.has_damper[ki] * (1 - lift_off)
-        mags = []
+        w_off = mask.float() * self.physics.damper_strength[ki] * damp_at_release
+        powers = []
         for f0 in range(0, F, block_frames):
             nf = min(block_frames, F - f0)
             t0, t1 = f0 * hop / sr, (f0 + nf) * hop / sr
-            sel = ((onset < t1) & (torch.maximum(onset, offset) + 1.0 > t0) & mask).any(0).nonzero().squeeze(1)
+            sel = ((onset < t1) & (torch.maximum(onset, release) + 1.0 > t0) & mask).any(0).nonzero().squeeze(1)
             if sel.numel() == 0:
-                mags.append(u.new_zeros(ki.shape[0], cfg.noise_fft // 2 + 1, nf))
+                powers.append(u.new_zeros(ki.shape[0], cfg.noise_bands, nf))
                 continue
-            mags.append(self.noise.magnitude(ki[:, sel], u[:, sel], onset[:, sel], offset[:, sel], w_on[:, sel],
-                                             w_off[:, sel], log_knock[:, sel], f0, nf))
-        return self.noise.synth(torch.cat(mags, -1), n_samples, generator)
+            powers.append(self.noise.magnitude(ki[:, sel], u[:, sel], onset[:, sel], release[:, sel], w_on[:, sel],
+                                               w_off[:, sel], log_knock[:, sel], f0, nf))
+        power = torch.cat(powers, -1) + self.noise.pedal_power(lift)
+        return self.noise.synth(power, n_samples, generator)
 
     def forward(self, perf, n_samples, block_seconds=None, generator=None):
         cfg = self.cfg
@@ -259,8 +299,11 @@ class NeuralPhysicalPiano(nn.Module):
         assert pedals.shape[-1] == F, f"pedal curves need {F} frames, got {pedals.shape[-1]}"
 
         key_down, onset_roll = self.key_rolls(ki, onset, offset, u, mask, F)
+        damper_off, _ = self.key_rolls(ki, onset, offset + cfg.damper_delay, u, mask, F)
         lift = self.physics.pedal_lift(pedals[:, 0])
-        engagement = (1 - key_down) * (1 - lift[:, None])
+        pedal_damping = self.physics.pedal_damping(lift)
+        latch = self.sostenuto_latch(damper_off, pedals[:, 2])
+        engagement = (1 - damper_off) * pedal_damping[:, None] * (1 - latch)
         C = torch.cat([engagement.new_zeros(B, N_KEYS, 1), torch.cumsum(engagement[..., :-1], -1) * hop / sr], -1)
 
         soft_on = sample_curve(pedals[:, 1], onset.clamp(min=0), sr, hop)
@@ -269,22 +312,30 @@ class NeuralPhysicalPiano(nn.Module):
                else {name: zeros for name in ContextNet.OUTPUTS})
         modes = self.physics.modes(ki, u, soft_on, cond, ctx)
         modes["amp"] = modes["amp"] * mask[..., None, None]
+        ring_end = self._ring_end(modes, onset)
 
-        strings = self.render_strings(modes, ki, onset, self._ring_end(modes, onset), C, 0, n_samples)
-        out = {"strings": strings}
-        dry = strings
-        block = int(block_seconds * sr) if block_seconds else None
         if cfg.use_sympathetic:
             all_keys = torch.arange(N_KEYS, device=pitch.device).expand(B, N_KEYS)
             half = torch.full((B, N_KEYS), 0.6, device=pitch.device)
             key_modes = self.physics.modes(all_keys, half, torch.zeros_like(half), cond)
-            out["symp"] = self.symp(strings, key_modes, engagement, block)
+        block = int(block_seconds * sr) if block_seconds else n_samples
+        strings, symp, state = [], [], None
+        for s0 in range(0, n_samples, block):
+            L = min(block, n_samples - s0)
+            s, own = self.render_strings(modes, ki, onset, ring_end, C, s0, L, per_key=cfg.use_sympathetic)
+            strings.append(s)
+            if cfg.use_sympathetic:
+                y, state = self.symp(s, own, key_modes, engagement, s0, state)
+                symp.append(y)
+        out = {"strings": torch.cat(strings, -1)}
+        dry = out["strings"]
+        if cfg.use_sympathetic:
+            out["symp"] = torch.cat(symp, -1)
             dry = dry + out["symp"]
         if cfg.use_noise:
-            block_frames = block // hop if block else F
-            out["noise"] = self.render_noise(ki, u, onset, offset, mask, lift, ctx["log_knock"], F, n_samples,
-                                             block_frames, generator)
+            out["noise"] = self.render_noise(ki, u, onset, offset, mask, lift, pedal_damping, ctx["log_knock"], F,
+                                             n_samples, block // hop, generator)
             dry = dry + out["noise"]
         out["dry"] = dry
-        out["audio"] = fft_convolve(dry, self.ir[cond])
+        out["audio"] = fft_convolve(dry, self.room(cond)) if cfg.use_room else dry
         return out

@@ -1,120 +1,190 @@
-"""Measure what the model actually does on isolated notes, for comparison with published piano data.
+"""Measure what the model does on isolated notes and check it against docs/physical_parameters.md.
 
     python -m pianonn.diagnostics [--ckpt runs/x/last.pt] [--out report.md]
 
-Per key/velocity: measured partial frequencies (as effective inharmonicity), partial
-levels relative to the fundamental, early/late decay of the fundamental (double decay),
-T60 of low partials, spectral centroid, peak level, and the time for a released
-(undamped -> damped) note to drop 60 dB.
+Prints a per-note table (effective inharmonicity, partial levels, prompt/aftersound
+T60, spectral centroid, peak level) and the acceptance checks of section 7 of the
+spec, each with the measured value, the target and PASS/FAIL.
 """
 
 import argparse
+import copy
+import math
 
 import numpy as np
 import torch
 
 from .render import load_model
 
-KEYS = {"A0": 21, "C2": 36, "C4": 60, "A4": 69, "C6": 84, "C8": 108}
-VELOCITIES = (40, 80, 120)
+KEYS = {"A0": 21, "C2": 36, "C4": 60, "A4": 69, "C6": 84, "C7": 96, "C8": 108}
+T60_TARGETS = {"A0": ((20, 40), None), "C4": ((6, 8), (20, 35)), "A4": ((5, 6.5), (15, 30)),
+               "C6": ((2.5, 3.5), (8, 15)), "C7": ((1.2, 2.0), (3, 6))}
 
 
-def _perf(model, n, pitch, velocity, offset):
+def _variant(model, **flags):
+    m = copy.copy(model)
+    m.cfg = type(model.cfg)(**{**model.cfg.to_dict(), **flags})
+    return m
+
+
+def _perf(model, n, notes, sustain=0.0):
     F = model.n_frames(n)
-    z = torch.zeros(1, F)
-    return {"pitch": torch.tensor([[pitch]]), "onset": torch.zeros(1, 1), "offset": torch.tensor([[offset]]),
-            "velocity": torch.tensor([[float(velocity)]]), "mask": torch.ones(1, 1, dtype=torch.bool),
-            "condition": torch.tensor([9]), "sustain": z, "soft": z, "sostenuto": z}
-
-
-def _partial_track(x, sr, f, t0, t1, win=0.1):
-    """Level (dB) of a narrow band around f over time via a heterodyne + moving average."""
-    t = np.arange(len(x)) / sr
-    z = x * np.exp(-2j * np.pi * f * t)
-    k = max(1, int(win * sr))
-    env = np.abs(np.convolve(z, np.ones(k) / k, mode="same"))
-    sel = (t >= t0) & (t < t1)
-    return t[sel], 20 * np.log10(env[sel] + 1e-12)
-
-
-def _slope_db_per_s(t, db):
-    return np.polyfit(t, db, 1)[0] if len(t) > 2 else float("nan")
+    t = torch.tensor(notes, dtype=torch.float32)[None]
+    return {"pitch": t[..., 0].long(), "onset": t[..., 1], "offset": t[..., 2], "velocity": t[..., 3],
+            "mask": torch.ones(1, len(notes), dtype=torch.bool), "condition": torch.tensor([9]),
+            "sustain": torch.full((1, F), float(sustain)), "soft": torch.zeros(1, F), "sostenuto": torch.zeros(1, F)}
 
 
 @torch.no_grad()
-def measure_note(model, pitch, velocity, seconds=6.0, release=None):
-    cfg = model.cfg
-    sr = cfg.sample_rate
-    n = int(seconds * sr)
-    out = model(_perf(model, n, pitch, velocity, release if release is not None else seconds), n,
-                generator=torch.Generator().manual_seed(0))
-    x = out["audio"][0].numpy().astype(np.float64)
-    strings = out["strings"][0].numpy().astype(np.float64)
+def _render(model, seconds, notes, sustain=0.0):
+    n = int(seconds * model.cfg.sample_rate)
+    return {k: v[0].double().numpy() for k, v in
+            model(_perf(model, n, notes, sustain), n, block_seconds=2.0, generator=torch.Generator().manual_seed(0)).items()}
 
-    ki = torch.tensor([[pitch - 21]])
-    modes = model.physics.modes(ki, torch.tensor([[velocity / 127]]), torch.zeros(1, 1), torch.tensor([9]))
-    f_model = modes["freq"][0, 0, :, 0].numpy()
 
-    # measured partial frequencies from a long FFT of the string signal
-    seg = strings[int(0.05 * sr): int(min(seconds, 3.0) * sr)]
-    spec = np.abs(np.fft.rfft(seg * np.hanning(len(seg)), 8 * len(seg)))
-    hz = np.fft.rfftfreq(8 * len(seg), 1 / sr)
-    meas, levels = [], []
-    for fk in f_model[:10]:
-        if fk > 0.45 * sr:
-            break
+def _t60(t, db):
+    slope = np.polyfit(t, db, 1)[0]
+    return -60 / slope if slope < 0 else np.inf
+
+
+def _edc_t60(x, sr, f, lo=-3.0, hi=-13.0):
+    """Prompt T60 of the partial at ``f`` from its energy decay curve (Schroeder), fitted from ``lo`` to ``hi`` dB.
+    Backward integration averages out unison beating, which ruins envelope slope fits."""
+    t = np.arange(len(x)) / sr
+    k = max(1, int(0.02 * sr))
+    p = np.abs(np.convolve(x * np.exp(-2j * np.pi * f * t), np.ones(k) / k, mode="same")) ** 2
+    edc = 10 * np.log10(np.cumsum(p[::-1])[::-1] + 1e-30)
+    edc -= edc[int(0.05 * sr)]
+    sel = (edc <= lo) & (edc >= hi) & (t > 0.05)
+    return _t60(t[sel], edc[sel]) if sel.sum() > 10 else float("nan")
+
+
+def _partials(x, sr, freqs, t0=0.05, t1=2.0):
+    seg = x[int(t0 * sr): int(t1 * sr)]
+    n_fft = 8 * len(seg)
+    spec = np.abs(np.fft.rfft(seg * np.hanning(len(seg)), n_fft))
+    hz = np.fft.rfftfreq(n_fft, 1 / sr)
+    meas, lev = [], []
+    for fk in freqs:
         band = (hz > fk * 0.985) & (hz < fk * 1.015)
+        if fk > 0.45 * sr or not band.any():
+            break
         i = np.argmax(spec[band])
         meas.append(hz[band][i])
-        levels.append(20 * np.log10(spec[band][i] + 1e-12))
-    meas, levels = np.array(meas), np.array(levels) - levels[0]
-    f1 = meas[0]
-    B_eff = np.nan
-    if len(meas) >= 5:  # fit f_n = n f0 sqrt(1 + B n^2)
-        nn = np.arange(1, len(meas) + 1)
-        y = (meas / (nn * f1)) ** 2
-        B_eff = max(0.0, np.polyfit(nn**2 - 1, y - 1, 1)[0])
+        lev.append(20 * np.log10(spec[band][i] + 1e-15))
+    return np.array(meas), np.array(lev)
 
-    t_e, db_e = _partial_track(x, sr, f1, 0.05, 0.6)
-    t_l, db_l = _partial_track(x, sr, f1, 2.0, seconds - 0.2)
-    early, late = _slope_db_per_s(t_e, db_e), _slope_db_per_s(t_l, db_l)
 
-    frame = x[int(0.02 * sr): int(0.12 * sr)]
+def _b_eff(meas):
+    n = np.arange(1, len(meas) + 1)
+    y = (meas / (n * meas[0])) ** 2 - 1
+    return max(0.0, np.polyfit(n**2 - 1, y, 1)[0]) if len(meas) >= 5 else float("nan")
+
+
+def _centroid(x, sr, t0=0.02, t1=0.12):
+    frame = x[int(t0 * sr): int(t1 * sr)]
     s = np.abs(np.fft.rfft(frame * np.hanning(len(frame))))
-    centroid = float((s * np.fft.rfftfreq(len(frame), 1 / sr)).sum() / (s.sum() + 1e-12))
-    return {"f1": f1, "B_eff": B_eff, "levels": levels, "early_db_s": early, "late_db_s": late,
-            "t60_early": -60 / early if early < 0 else np.inf, "t60_late": -60 / late if late < 0 else np.inf,
-            "centroid": centroid, "peak_db": 20 * np.log10(np.abs(x).max() + 1e-12)}
+    return float((s * np.fft.rfftfreq(len(frame), 1 / sr)).sum() / (s.sum() + 1e-15))
 
 
-@torch.no_grad()
-def release_time(model, pitch, velocity=80, hold=1.0, seconds=3.0):
-    """Seconds after key release (no pedal) for the note's RMS to fall 60 dB below its level at release."""
-    sr = model.cfg.sample_rate
-    n = int(seconds * sr)
-    x = model(_perf(model, n, pitch, velocity, hold), n, generator=torch.Generator().manual_seed(0))["strings"][0]
-    x = x.numpy()
+def _model_freqs(model, pitch, velocity):
+    ki = torch.tensor([[pitch - 21]])
+    m = model.physics.modes(ki, torch.tensor([[velocity / 127]]), torch.zeros(1, 1), torch.tensor([9]))
+    return m["freq"][0, 0, :12, 0].numpy()
+
+
+def _release_time(x, sr, t_release):
     k = int(0.02 * sr)
-    rms = np.sqrt(np.convolve(x**2, np.ones(k) / k, mode="same")) + 1e-12
-    i0 = int(hold * sr)
-    ref = rms[i0 - k]
-    below = np.nonzero(rms[i0:] < ref * 1e-3)[0]
+    rms = np.sqrt(np.convolve(x**2, np.ones(k) / k, mode="same")) + 1e-15
+    i0 = int(t_release * sr)
+    below = np.nonzero(rms[i0:] < rms[i0 - k] * 1e-3)[0]
     return below[0] / sr if len(below) else np.inf
 
 
-def report(model):
-    lines = ["| key | vel | f1 Hz | B_eff | partials 2..6 dB re f1 | T60 early s | T60 late s | centroid Hz | peak dBFS |",
-             "|---|---|---|---|---|---|---|---|---|"]
+def _rms_db(x):
+    return 10 * np.log10(np.mean(x**2) + 1e-30)
+
+
+@torch.no_grad()
+def run(model):
+    sr = model.cfg.sample_rate
+    dry = _variant(model, use_noise=False, use_sympathetic=False, use_room=False)
+    radiated = _variant(model, use_noise=False, use_sympathetic=False)
+    rows, checks = [], []
+
+    def check(name, value, target, ok, fmt="{:.3g}"):
+        checks.append((name, value if isinstance(value, str) else fmt.format(value), target, "PASS" if ok else "FAIL"))
+
+    # --- per-note table + decay / inharmonicity checks on the dry string signal ---
+    notes = {}
     for name, pitch in KEYS.items():
-        for v in VELOCITIES:
-            m = measure_note(model, pitch, v)
-            lv = " ".join(f"{d:+.0f}" for d in m["levels"][1:6])
-            lines.append(f"| {name} | {v} | {m['f1']:.2f} | {m['B_eff']:.2e} | {lv} | {m['t60_early']:.1f} | "
-                         f"{m['t60_late']:.1f} | {m['centroid']:.0f} | {m['peak_db']:.1f} |")
-    lines += ["", "| key | damper release to -60 dB (s) |", "|---|---|"]
-    for name, pitch in KEYS.items():
-        lines.append(f"| {name} | {release_time(model, pitch):.2f} |")
-    return "\n".join(lines)
+        for v in (40, 80, 120):
+            x = _render(dry, 12.0, [(pitch, 0.0, 12.0, v)])["audio"]
+            meas, lev = _partials(x, sr, _model_freqs(model, pitch, v))
+            f1 = meas[0]
+            after_alpha = model.physics.modes(torch.tensor([[pitch - 21]]), torch.tensor([[v / 127]]), torch.zeros(1, 1),
+                                             torch.tensor([9]))["alpha"][0, 0, 0, 1].item()
+            notes[(name, v)] = dict(f1=f1, B=_b_eff(meas), lev=lev - lev[0], t60p=_edc_t60(x, sr, f1),
+                                    t60a=6.91 / after_alpha,
+                                    centroid=_centroid(x, sr), peak=20 * np.log10(np.abs(x).max() + 1e-15))
+            r = notes[(name, v)]
+            rows.append(f"| {name} | {v} | {f1:.2f} | {r['B']:.2e} | {' '.join(f'{d:+.0f}' for d in r['lev'][1:6])} | "
+                        f"{r['t60p']:.1f} | {r['t60a']:.1f} | {r['centroid']:.0f} | {r['peak']:.1f} |")
+
+    for name, (prompt, after) in T60_TARGETS.items():
+        r = notes[(name, 80)]
+        check(f"{name} prompt T60 (s)", r["t60p"], f"{prompt[0]}-{prompt[1]}", prompt[0] <= r["t60p"] <= prompt[1])
+        if after:  # analytic from the mode parameters: beating between aftersound modes defeats any fit
+            check(f"{name} aftersound T60, model (s)", r["t60a"], f"{after[0]}-{after[1]}", after[0] <= r["t60a"] <= after[1])
+    for name, target in (("C4", 3.8e-4), ("C6", 3.5e-3)):
+        b = notes[(name, 80)]["B"]
+        check(f"{name} effective B", b, f"{target:.1e} (x1.5)", target / 1.5 <= b <= target * 1.5)
+    lev = notes[("C4", 80)]["lev"]
+    check("C4 mf partials 2-6 re p1 (dB)", " ".join(f"{d:+.0f}" for d in lev[1:6]), "-30..+3",
+          bool(np.all((lev[1:6] >= -30) & (lev[1:6] <= 3))))
+    check("C4 mf partial 10 re p1 (dB)", lev[9], "<= -30", lev[9] <= -30, "{:+.0f}")
+    ratio = notes[("C4", 120)]["centroid"] / notes[("C4", 40)]["centroid"]
+    check("C4 centroid vel120 / vel40", ratio, "1.1-2", 1.1 <= ratio <= 2.0, "{:.2f}")
+
+    # --- radiated bass fundamentals (body high-pass) ---
+    for name in ("A0", "C2"):
+        pitch = KEYS[name]
+        x = _render(radiated, 3.0, [(pitch, 0.0, 3.0, 80)])["audio"]
+        _, lv = _partials(x, sr, _model_freqs(model, pitch, 80), 0.05, 2.5)
+        check(f"{name} radiated fundamental below strongest partial (dB)", lv.max() - lv[0], ">= 10",
+              lv.max() - lv[0] >= 10, "{:.0f}")
+
+    # --- dampers ---
+    for name, lo, hi in (("A0", 0.5, np.inf), ("A4", 0.2, 0.4)):
+        x = _render(dry, 4.0, [(KEYS[name], 0.0, 1.0, 80)])["audio"]
+        t = _release_time(x, sr, 1.0)
+        check(f"{name} release to -60 dB (s)", t, f">= {lo}" if hi == np.inf else f"{lo}-{hi}", lo <= t <= hi, "{:.2f}")
+    released = _render(dry, 1.0, [(KEYS["C8"], 0.0, 0.3, 80)])["audio"]
+    held = _render(dry, 1.0, [(KEYS["C8"], 0.0, 1.0, 80)])["audio"]
+    w = slice(int(0.35 * sr), int(0.6 * sr))
+    d = _rms_db(released[w]) - _rms_db(held[w])
+    check("C8 released vs held (dB, undamped)", d, "0 +-1", abs(d) <= 1, "{:+.1f}")
+
+    # --- sustain-pedal halo and noise levels, full model ---
+    chord = [(48, 0.0, 0.5, 90), (55, 0.0, 0.5, 90), (64, 0.0, 0.5, 90)]
+    full = _variant(model, use_room=False)
+    ped, noped = _render(full, 3.0, chord, sustain=1.0), _render(full, 3.0, chord, sustain=0.0)
+    halo = _rms_db(ped["symp"][: 2 * sr]) - _rms_db(ped["strings"][: 2 * sr])
+    check("pedal halo, symp re strings (dB)", halo, "-40..-25", -40 <= halo <= -25, "{:.0f}")
+    diff = _rms_db(ped["symp"][: 2 * sr]) - _rms_db(noped["symp"][: 2 * sr])
+    check("halo with vs without pedal (dB)", diff, ">= 10", diff >= 10, "{:.0f}")
+    for v, target in ((120, -25), (25, -12)):
+        out = _render(full, 1.0, [(60, 0.1, 0.8, v)])
+        w = slice(int(0.1 * sr), int(0.16 * sr))
+        lvl = _rms_db(out["noise"][w]) - _rms_db(out["strings"][w])
+        check(f"knock re tone, first 60 ms, vel {v} (dB)", lvl, f"{target} +-8", abs(lvl - target) <= 8, "{:.0f}")
+
+    table = ["| key | vel | f1 Hz | B_eff | partials 2..6 dB re f1 | T60 prompt s (EDC) | T60 after s (model) | centroid Hz | peak dBFS |",
+             "|---|---|---|---|---|---|---|---|---|"] + rows
+    acc = ["| check | measured | target | result |", "|---|---|---|---|"] + [f"| {a} | {b} | {c} | {d} |" for a, b, c, d in checks]
+    n_pass = sum(c[3] == "PASS" for c in checks)
+    return "\n".join(["## Isolated notes (dry strings)", "", *table, "",
+                      f"## Acceptance checks: {n_pass}/{len(checks)} pass", "", *acc])
 
 
 def main(argv=None):
@@ -122,7 +192,7 @@ def main(argv=None):
     ap.add_argument("--ckpt")
     ap.add_argument("--out")
     args = ap.parse_args(argv)
-    text = report(load_model(args.ckpt))
+    text = run(load_model(args.ckpt))
     print(text)
     if args.out:
         with open(args.out, "w") as f:

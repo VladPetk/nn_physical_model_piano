@@ -7,8 +7,8 @@ note- and pedal-level MIDI aligned to about 3 ms, which is exactly the supervisi
 needs.
 
 The core is about 7k interpretable physical parameters. A small causal context network
-(about 145k params) predicts bounded corrections, and a learned soundboard/room impulse
-response is kept for each recording condition. Synthesis is closed-form or a linear
+(about 145k params) predicts bounded corrections, and a soundboard body plus a parametric
+hall is kept for each recording condition. Synthesis is closed-form or a linear
 recurrence, and nothing is autoregressive.
 
 ## Honest assessment
@@ -67,19 +67,20 @@ MIDI notes + pedals (+ year)
    ├─ ContextNet (causal GRU over piano roll/pedals) ─► bounded per-note corrections
    │                                                    (gain, brightness, decay, knock)
    ▼
-PianoPhysics: per-key params = literature prior + bounded learned offset
-   │   f_n = n f0 √(1+Bn²) · stretch · unison detune    (inharmonic, beating)
-   │   α_n = b1 + b3 f_n², prompt/aftersound modes       (two-stage decay)
-   │   a_n = gain(v) · hammer_lowpass(f; v) · |sin(nπx0)| (velocity, strike point)
-   │   damper decay α_d(f) × engagement(key up, pedal lift(sustain))  (half-pedal, no dampers on the top keys)
+PianoPhysics: per-key params = literature prior + bounded learned offset (docs/physical_parameters.md)
+   │   f_n = n f0 √(1+Bn²) · stretch · unison detune          (inharmonic, beating)
+   │   α_n = b1 + b3 f_n²  (+ bridge loss for the prompt mode)  (two-stage decay)
+   │   a_n = gain(v) · half-sine pulse(f; T_c(v)) · sin(nπx0)   (bridge force; velocity, strike point)
+   │   damper decay α_d,n × (key up) · (1-lift(sustain))^2.5 · (not sostenuto-latched)
    ▼
-Strings: closed-form damped-sinusoid bank, chunked + checkpointed (exact for pedalling; notes can start before the window)
-   │ bridge signal
+Strings: closed-form damped-sinusoid bank, attack ramp over the contact time,
+   │     chunked + checkpointed (exact for pedalling; notes can start before the window)
+   │ bridge force
    ├─► SympatheticBank: 88 keys × S partials as resonators with time-varying poles
-   │                    (dampers), solved with a chunked parallel linear recurrence
-   ├─► NoiseBank: hammer knock at note-on, damper noise at note-off
+   │                    (dampers), driven by the bridge minus the key's own strings
+   ├─► NoiseBank: hammer knock, key-bottom thump, damper noise, pedal noise
    ▼
-Soundboard + room + mics: learned IR per year (FFT convolution)
+Soundboard body FIR (modal, 60-70 Hz high-pass) + parametric octave-band hall, per year
    ▼
 audio
 ```
@@ -89,7 +90,7 @@ audio
 | `physics` | ~7k | inharmonicity, tuning, unison detune, loss curves, prompt/aftersound, strike point, hammer cutoff/rolloff/velocity response, damper strength, pedal curve, una corda, per-partial residual |
 | `context` | ~145k | per-note corrections (zero-initialised, so training starts from pure physics) |
 | `symp` / `noise` | ~6k | coupling gains; knock and release spectra and envelopes |
-| `ir` | 24k × conditions | soundboard + hall + mic response for each MAESTRO year |
+| `room` | 7.2k body taps + 15 hall params per condition | soundboard body; hall T60 and level per octave band, for each MAESTRO year |
 
 ## Usage
 
@@ -108,11 +109,22 @@ python -m pianonn.train --synthetic --out runs/synthetic
 
 # 3. render (without --ckpt you hear the untrained physics prior)
 python -m pianonn.render some.mid out.wav --ckpt runs/v0/last.pt --year 2018
+
+# check a model against the literature targets in docs/physical_parameters.md
+python -m pianonn.diagnostics [--ckpt runs/v0/last.pt]
 ```
+
+The physics prior is specified in [`docs/physical_parameters.md`](docs/physical_parameters.md).
+The two literature reviews it condenses are in [`docs/literature/`](docs/literature/), and the
+prior's current acceptance report is [`docs/diagnostics_prior.md`](docs/diagnostics_prior.md).
+`samples/` has renders of `samples/demo.mid`: `physics_prior_v1.wav` is the first guess and
+`physics_prior_v2.wav` is the literature-calibrated prior.
 
 ## Status
 
-The package is a scaffold that runs end to end and has tests. Gradients reach every
+The package runs end to end and has tests. The untrained prior passes all 23 literature
+acceptance checks (decay times, inharmonicity, partial spectra, velocity brightness, bass
+radiation, damper release, pedal halo, noise levels). Gradients reach every
 physical parameter, block-wise rendering matches single-pass rendering, dampers, sustain,
 una corda and sympathetic resonance all behave as expected, and a student fitted to a
 perturbed teacher moves towards it. **It has not been trained on MAESTRO yet.**
@@ -121,8 +133,9 @@ Next steps:
 - [ ] Estimate B, tuning and decays from MAESTRO directly (partial tracking at known pitches) and use them as the prior.
 - [ ] First real training run on a single year, then all years.
 - [ ] Weinreich coupled-string eigenmodes instead of the mode-space shortcut.
-- [ ] Initial pitch glide at *ff* (tension modulation) and phantom partials.
-- [ ] Sostenuto (it is currently only an input to the context network), and re-strike interaction on a string that is still vibrating.
+- [ ] Initial pitch glide at *ff* (tension modulation), longitudinal modes and phantom partials.
+- [ ] Re-strike interaction on a string that is still vibrating.
+- [ ] Calibrate the damper delay, the damper boundary key and hall T60s per year from MAESTRO.
 - [ ] Stereo output.
 - [ ] Real-time C++/JUCE engine: recursive two-pole resonators replace the training-time closed form.
 - [ ] Evaluation suite (FAD, transcription F1, listening tests).

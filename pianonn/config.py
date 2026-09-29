@@ -13,11 +13,13 @@ def year_to_condition(year: int) -> int:
 class PianoConfig:
     sample_rate: int = 24000
     hop: int = 120  # control rate = 200 Hz
-    n_partials: int = 64  # transverse partials per string
+    n_partials: int = 96  # transverse partials per string (A0 reaches ~5 kHz with inharmonicity)
     n_modes: int = 3  # coupled-string modes per partial (1 prompt + 2 aftersound)
     n_conditions: int = 16
     symp_partials: int = 4  # partials per key in the sympathetic resonator bank
-    ir_seconds: float = 1.0  # soundboard + room + mic impulse response
+    body_seconds: float = 0.3  # learnable soundboard/case FIR (bridge force -> pressure)
+    hall_seconds: float = 2.5  # parametric per-year hall tail
+    damper_delay: float = 0.015  # damper touches the string this long after MIDI note-off (to calibrate on data)
     noise_fft: int = 512
     noise_bands: int = 32
     ctx_hidden: int = 128
@@ -27,6 +29,7 @@ class PianoConfig:
     use_noise: bool = True
     use_sympathetic: bool = True
     use_context: bool = True
+    use_room: bool = True  # body + hall; off = dry bridge-force signal
     checkpoint: bool = True
 
     def to_dict(self):

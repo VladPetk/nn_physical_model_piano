@@ -1,0 +1,150 @@
+"""Soundboard body and hall: bridge force -> sound pressure at the microphones.
+
+One set per recording condition (MAESTRO year):
+
+* ``body``: a learnable FIR (default 0.3 s) initialised as a soundboard. It has
+  sparse modes with loss factor 0.02 below 1.1 kHz, a diffuse short response
+  above, the radiation high-pass around 60-70 Hz and a 3 ms pre-delay.
+* ``hall``: a parametric tail. Fixed octave-band noise carriers are shaped by a
+  learnable T60 and gain per band, which is far more identifiable than tens of
+  thousands of free FIR taps.
+
+The two responses are summed (the hall is excited by the same bridge force), so
+the full impulse response is ``body + hall``.
+"""
+
+import math
+
+import torch
+from torch import nn
+
+from .dsp import bounded
+
+BODY_TARGET_DB = [(20, -40), (30, -30), (40, -20), (55, -10), (70, -4), (100, 0), (1000, 0), (2000, -1),
+                  (4000, -3), (8000, -7), (11000, -12)]
+HALL_BANDS = [125, 250, 500, 1000, 2000, 4000, 8000]
+HALL_T60 = [2.0, 1.8, 1.7, 1.6, 1.45, 1.2, 0.8]
+
+
+def _interp_log_f(points, f):
+    xs = torch.log(torch.tensor([p[0] for p in points], dtype=torch.float64))
+    ys = torch.tensor([p[1] for p in points], dtype=torch.float64)
+    lf = torch.log(f.clamp(min=1.0))
+    idx = torch.searchsorted(xs, lf).clamp(1, len(xs) - 1)
+    w = ((lf - xs[idx - 1]) / (xs[idx] - xs[idx - 1])).clamp(0, 1)
+    return ys[idx - 1] + w * (ys[idx] - ys[idx - 1])
+
+
+def _octave_smooth(power, freqs, width=1 / 3):
+    """Average a power spectrum over a moving band ``width`` octaves wide."""
+    lo = torch.searchsorted(freqs, freqs * 2 ** (-width / 2))
+    hi = torch.searchsorted(freqs, freqs * 2 ** (width / 2), right=True).clamp(min=1)
+    hi = torch.maximum(hi, lo + 1)
+    c = torch.cat([power.new_zeros(1), torch.cumsum(power, 0)])
+    return (c[hi] - c[lo]) / (hi - lo)
+
+
+def _minimum_phase(log_mag):
+    """Minimum-phase spectrum with the given log magnitude (real-cepstrum folding)."""
+    n = 2 * (log_mag.shape[-1] - 1)
+    cep = torch.fft.irfft(log_mag.to(torch.float64), n)
+    fold = torch.zeros_like(cep)
+    fold[0] = cep[0]
+    fold[1: n // 2] = 2 * cep[1: n // 2]
+    fold[n // 2] = cep[n // 2]
+    return torch.exp(torch.fft.rfft(fold))
+
+
+def soundboard_body(sr, seconds, seed=0, eta=0.02, predelay=0.003, crossover=1100.0):
+    """Initial soundboard + case impulse response (see docs/physical_parameters.md, section 4)."""
+    g = torch.Generator().manual_seed(seed)
+    L = int(seconds * sr)
+    t = torch.arange(L, dtype=torch.float64) / sr
+
+    # sparse modes below the plate/rib-strip transition: ~0.07 modes/Hz, T60 = 2.2 / (eta f)
+    n_modes = int(0.07 * (crossover - 60))
+    f = torch.sort(60 + (crossover - 60) * torch.rand(n_modes, generator=g, dtype=torch.float64)).values
+    tau = (1 / (math.pi * eta * f)).clamp(max=0.25)
+    phase = 2 * math.pi * torch.rand(n_modes, generator=g, dtype=torch.float64)
+    amp = torch.randn(n_modes, generator=g, dtype=torch.float64)
+    modal = (amp[:, None] * torch.exp(-t / tau[:, None]) * torch.sin(2 * math.pi * f[:, None] * t + phase[:, None])).sum(0)
+
+    # diffuse response above: noise with the same frequency-dependent decay
+    n_fft, hop = 512, 64
+    noise = torch.randn(L, generator=g, dtype=torch.float64)
+    win = torch.hann_window(n_fft, dtype=torch.float64)
+    S = torch.stft(noise, n_fft, hop, window=win, return_complex=True)
+    fb = torch.fft.rfftfreq(n_fft, 1 / sr).to(torch.float64)
+    tf = torch.arange(S.shape[-1], dtype=torch.float64) * hop / sr
+    tau_b = 1 / (math.pi * eta * fb.clamp(min=crossover * 0.8))
+    xfade = torch.clamp((torch.log2(fb.clamp(min=1)) - math.log2(crossover * 0.8)) / math.log2(1.6), 0, 1)
+    diffuse = torch.istft(S * (xfade[:, None] * torch.exp(-tf[None] / tau_b[:, None])), n_fft, hop, window=win, length=L)
+
+    h = modal / modal.abs().max() + diffuse / diffuse.abs().max()
+
+    # impose the target envelope (1/3-octave smoothed) with a causal minimum-phase correction
+    n = 2 * L
+    H = torch.fft.rfft(h, n)
+    freqs = torch.fft.rfftfreq(n, 1 / sr).to(torch.float64)
+    smooth = _octave_smooth(H.abs() ** 2, freqs).clamp(min=1e-20).sqrt()
+    target = 10 ** (_interp_log_f(BODY_TARGET_DB, freqs) / 20)
+    correction = _minimum_phase(torch.log(target / smooth))
+    h = torch.fft.irfft(H * correction, n)[:L]
+
+    h = torch.cat([torch.zeros(int(predelay * sr), dtype=torch.float64), h])[:L]
+    Hn = torch.fft.rfft(h, n).abs()
+    plateau = Hn[(freqs >= 200) & (freqs <= 1000)].mean()
+    return (h / plateau).float()
+
+
+def band_carriers(sr, seconds, seed=1):
+    """White noise split into octave bands (raised-cosine crossovers, bands sum to the original)."""
+    g = torch.Generator().manual_seed(seed)
+    L = int(seconds * sr)
+    X = torch.fft.rfft(torch.randn(L, generator=g, dtype=torch.float64))
+    lf = torch.log2(torch.fft.rfftfreq(L, 1 / sr).clamp(min=1.0).to(torch.float64))
+    centers = torch.log2(torch.tensor(HALL_BANDS, dtype=torch.float64))
+    masks = []
+    for i, c in enumerate(centers):
+        m = torch.ones_like(lf)
+        if i > 0:  # rising edge from the previous centre
+            m = torch.where(lf < c, torch.sin(0.5 * math.pi * ((lf - centers[i - 1]) / (c - centers[i - 1])).clamp(0, 1)) ** 2, m)
+        if i < len(centers) - 1:
+            m = torch.where(lf > c, torch.cos(0.5 * math.pi * ((lf - c) / (centers[i + 1] - c)).clamp(0, 1)) ** 2, m)
+        masks.append(m)
+    return torch.stack([torch.fft.irfft(X * m, L) for m in masks]).float()
+
+
+class Room(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        sr, C = cfg.sample_rate, cfg.n_conditions
+        body = soundboard_body(sr, cfg.body_seconds)
+        self.body = nn.Parameter(body.repeat(C, 1))
+        L = int(cfg.hall_seconds * sr)
+        self.register_buffer("carriers", band_carriers(sr, cfg.hall_seconds))
+        t = torch.arange(L) / sr
+        self.register_buffer("t", t)
+        # tail builds up between 10 and 40 ms after the direct sound
+        self.register_buffer("ramp", torch.sin(0.5 * math.pi * ((t - 0.010) / 0.030).clamp(0, 1)) ** 2)
+        self.register_buffer("prior_log_t60", torch.log(torch.tensor(HALL_T60)))
+        self.raw_log_t60 = nn.Parameter(torch.zeros(C, len(HALL_BANDS)))
+        self.band_log_gain = nn.Parameter(torch.zeros(C, len(HALL_BANDS)))
+        # initial direct-to-reverberant ratio ~0 dB: hall energy = body energy
+        with torch.no_grad():
+            hall = self._hall(torch.zeros(1, dtype=torch.long), gain=torch.zeros(1))
+            ratio = body.pow(2).sum() / hall.pow(2).sum()
+        self.log_gain = nn.Parameter(torch.full((C,), 0.5 * math.log(ratio.item())))
+
+    def _hall(self, cond, gain=None):
+        t60 = torch.exp(self.prior_log_t60 + bounded(self.raw_log_t60[cond], 0.7))  # [B,7]
+        env = torch.exp(-6.91 * self.t / t60[..., None]) * torch.exp(self.band_log_gain[cond])[..., None]
+        gain = self.log_gain[cond] if gain is None else gain
+        return (self.carriers * env).sum(1) * self.ramp * torch.exp(gain)[:, None]
+
+    def forward(self, cond):
+        """Impulse responses ``[B, L]`` for conditions ``cond[B]``."""
+        hall = self._hall(cond)
+        body = self.body[cond]
+        return torch.cat([body + hall[:, : body.shape[-1]], hall[:, body.shape[-1]:]], -1)

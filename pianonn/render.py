@@ -43,14 +43,15 @@ def main(argv=None):
     ap.add_argument("--ckpt")
     ap.add_argument("--year", type=int, default=2018, help="MAESTRO year = piano/hall/mic condition")
     ap.add_argument("--sr", type=int, help="override sample rate (untrained model only)")
+    ap.add_argument("--normalize", action="store_true", help="scale the output to a -1 dBFS peak")
     args = ap.parse_args(argv)
 
     model = load_model(args.ckpt, **({"sample_rate": args.sr} if args.sr else {}))
     notes, pedals = load_midi(args.midi)
     audio = render_notes(model, notes, pedals, year_to_condition(args.year))
     peak = np.abs(audio).max()
-    if peak > 0.99:
-        audio = audio * (0.99 / peak)
+    if peak > 0.99 or args.normalize:
+        audio = audio * (0.89 / peak)
     sf.write(args.out, audio, model.cfg.sample_rate)
     print(f"wrote {args.out}: {len(audio) / model.cfg.sample_rate:.1f}s, peak {peak:.3f}")
 
