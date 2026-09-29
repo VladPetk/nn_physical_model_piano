@@ -2,100 +2,101 @@
 
 ## Data
 
-- University of Iowa Electronic Music Studios, *Musical Instrument Samples*, Piano: a Steinway &
-  Sons model B (6'11"), recorded in 2001.
-- 260 isolated notes, each at pp, mf and ff, left to ring for 10–54 s.
-- Two Neumann KM 84 microphones 8" above the bass and treble strings; 16-bit / 44.1 kHz stereo;
-  a non-anechoic room.
-- Download: `https://theremin.music.uiowa.edu/MISpiano.html` (free to use). The files live in
-  `data/iowa/`, which is not committed.
+- University of Iowa Electronic Music Studios, *Musical Instrument Samples*, Piano: a Steinway & Sons model B
+  (6'11"), recorded in 2001.
+- 260 isolated notes at pp, mf and ff, each left to ring for 10–54 s.
+- Two Neumann KM 84 microphones 8" above the bass and treble strings; 16-bit / 44.1 kHz stereo; a non-anechoic
+  room.
+- Source: `https://theremin.music.uiowa.edu/MISpiano.html`, free to use. Stored in `data/iowa/`, not committed.
 
-What this data is good for:
-- **Good for** string physics: inharmonicity, tuning, prompt and aftersound decay, spectra, and
-  how the spectrum changes with dynamics. The close microphones hear the strings and soundboard,
-  not a hall.
-- **Not good for** room and radiation, or absolute level against MIDI velocity: the dynamics are
-  pp/mf/ff, not MIDI numbers.
-- **Not the same instrument** as the MAESTRO Yamaha Disklaviers, so instrument-specific values
-  are priors to be re-fitted.
+What the data can and cannot tell us:
+- Good for string physics: inharmonicity, tuning, how notes decay over time, spectra, and how the spectrum changes
+  with dynamics.
+- Not good for room and radiation, or for absolute level against MIDI velocity (the files are labelled pp/mf/ff,
+  not with MIDI numbers).
+- A different instrument from the MAESTRO Yamaha Disklaviers, so instrument-specific values are priors to be
+  re-fitted there.
 
-## Method (`pianonn/calibration.py`)
+## Method (`pianonn/calibration.py`, v3 after review 2)
 
-Per note:
-1. **Onset** by level threshold.
-2. **Partials** by a grid search over (f₀, B) of a stiff-string comb against the spectrum. The
-   search is robust to a weak fundamental and stray peaks. It is followed by peak refinement,
-   regression of fₙ²/n² on n², and rejection of outliers more than 5 cents off.
-3. **Decays** per partial, from a heterodyne power envelope with a noise floor estimated before
-   the onset:
-   - prompt T60 from the energy decay curve, −3 to −13 dB;
-   - aftersound T60 and knee from a line fitted after the level drops 25 dB, down to 10 dB above
-     the noise floor.
-4. **Early spectrum** (10–200 ms), noise-compensated at the tracked partials; from it the spectral
-   slope in dB/oct and a partial-based centroid.
+- **Channels.** Both channels are combined in *power* in every spectrum and envelope. A mono sum comb-filters: in
+  review 2, a C2 partial's decay read 73 s from the mono sum but 6–8 s on either channel alone.
+- **Onset** by level threshold.
+- **Partials.** A grid search over (f₀, B) of a stiff-string comb, with B restricted to ×/÷4 of Rigaud's curve (so
+  treble distortion harmonics cannot win with B ≈ 0). This is followed by peak refinement, regression of fₙ²/n² on
+  n², and outlier rejection.
+- **Decay profile** (the primary decay target): power of the decay partials, chosen **by number** (n = 2..5 below
+  C3, where recordings often lack the fundamental; n = 1..4 above), noise-subtracted, smoothed over 0.1 s. It is
+  read at 0.5, 1, 2, 4, 8 and 16 s in dB re peak, and set to NaN within 6 dB of the noise floor.
+- **Two-segment fit** of the same envelope with a free breakpoint (prompt T60, aftersound T60, knee). Reported for
+  information only: mid-range envelopes have three phases (fast drop, beating plateau, slow tail), which two
+  segments cannot capture.
+- **Early spectrum** (10–200 ms): noise-compensated partial levels, spectral slope (dB/oct) and a partial-based
+  centroid.
+- **Quality flags.** B is "reliable" with at least 8 partials and residuals under 3 cents. A note is "suspect" if it
+  lies more than 50 cents off its label: 12 notes, including `ff.A0` and `ff.B0`, which sound a semitone high.
+- **Aggregation.** Medians over mf and ff and over ±3 semitones around each landmark. The last row of the table
+  gives the number of notes behind each landmark: A0 and C8 rest on 2–3 notes and are not used as targets.
+- **Model.** The model is rendered like a recording and analysed by the same code:
+  - 0.3 s of silence first;
+  - dry strings for 45 s, for decays;
+  - strings through the soundboard body, for spectra;
+  - white noise 60 dB below the peak, so that weak partials are censored the same way;
+  - MIDI 64 = "mf", 110 = "ff".
 
-Quality control:
-- A fit's B is trusted only with at least 8 partials and a residual under 3 cents. In the treble,
-  distortion in the recording chain adds exact integer harmonics that mimic B ≈ 0.
-- Notes more than 50 cents off their label are flagged as suspect. There are 15: `ff.A0` and
-  `ff.B0` sound about 80 cents sharp (probably mislabelled), plus many top-octave pp/mf files.
-
-Aggregation: medians over partials 1–4, over mf and ff (decay does not depend on blow force,
-per Hundley et al. as quoted in arXiv 1212.2323), then over ±3 semitones around each landmark.
-
-The model is rendered at the landmark keys (MIDI velocity 64 = "mf", 110 = "ff"). Decays and
-spectra use the dry strings rendered for 45 s, with a −140 dB noise floor. The same code then
-analyses those renders.
+  The model's "C1" column repeats A0, because only landmark keys are rendered.
 
 ## Recording vs current prior
 
 | quantity | source | A0 | C1 | C2 | C3 | C4 | A4 | C5 | C6 | C7 | C8 |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| inharmonicity B (reliable fits) | recording | 2.51e-04 | 2.15e-04 | 1.19e-04 | 1.23e-04 | 3.04e-04 | 7.53e-04 | 9.86e-04 | - | - | - |
-| inharmonicity B (reliable fits) | model | 4.55e-04 | 4.55e-04 | 1.74e-04 | 1.53e-04 | 3.30e-04 | 8.57e-04 | 8.57e-04 | 2.85e-03 | - | - |
-| tuning, cents re ET | recording | -13.1 | -11.7 | -1.1 | +2.8 | +1.6 | +3.0 | +2.6 | +8.7 | +16.9 | +44.5 |
-| tuning, cents re ET | model | -15.4 | -15.4 | -3.9 | +0.0 | -1.0 | -0.2 | -0.2 | +6.0 | +14.0 | +25.0 |
-| prompt T60, median partials 1-4 (s) | recording | 26.4 | 19.8 | 26.7 | 15.7 | 10.3 | 5.8 | 5.7 | 5.0 | 17.9 | 27.4 |
-| prompt T60, median partials 1-4 (s) | model | 26.4 | 26.4 | 24.6 | 13.3 | 8.5 | 5.8 | 5.8 | 5.1 | 2.7 | 1.8 |
-| aftersound T60, median partials 1-4 (s) | recording | 113 | 110 | 93 | 51 | 26 | 18 | 14 | 9 | 5 | 3 |
-| aftersound T60, median partials 1-4 (s) | model | 112 | 112 | 83 | 43 | 23 | 16 | 16 | 9 | 5 | 3 |
-| aftersound knee, partials 1-4 (dB re peak) | recording | -24 | -24 | -21 | -21 | -21 | -20 | -14 | -13 | -15 | -12 |
-| aftersound knee, partials 1-4 (dB re peak) | model | -25 | -25 | -23 | -19 | -16 | -16 | -16 | -12 | -13 | -10 |
-| aftersound knee, partials 5-8 (dB re peak) | recording | -27 | -25 | -20 | -18 | -13 | -13 | -7 | -35 | - | - |
-| aftersound knee, partials 5-8 (dB re peak) | model | -20 | -20 | -18 | -19 | -15 | -12 | -12 | -32 | - | - |
-| early spectral slope, mf (dB/oct) | recording | -1 | 1 | -4 | -5 | -14 | -17 | -26 | -27 | -33 | - |
-| early spectral slope, mf (dB/oct) | model | -4 | -4 | -7 | -9 | -14 | -16 | -16 | -19 | -26 | - |
-| rise time 10-90 %, mf (ms) | recording | 54 | 35 | 8 | 11 | 16 | 13 | 13 | 9 | 7 | 11 |
-| rise time 10-90 %, mf (ms) | model | 2 | 2 | 3 | 9 | 5 | 2 | 2 | 2 | 2 | 2 |
-| slope change mf -> ff (dB/oct) | recording | +1.3 | +0.2 | +1.0 | +1.2 | +4.6 | +2.7 | +6.9 | +3.2 | -12.7 | - |
-| slope change mf -> ff (dB/oct) | model | +1.0 | +1.0 | +1.4 | +1.6 | +2.2 | +0.9 | +0.9 | +0.8 | -13.2 | - |
-| peak level ff - mf (dB) | recording | +16 | +13 | +8 | +8 | +12 | +11 | +13 | +15 | +15 | +11 |
-| peak level ff - mf (dB) | model | +16 | +16 | +17 | +17 | +18 | +19 | +19 | +22 | +25 | +28 |
-| harmonic centroid ff / mf | recording | x1.04 | x1.03 | x1.04 | x1.09 | x1.22 | x1.22 | x1.25 | x1.05 | x1.01 | x1.05 |
-| harmonic centroid ff / mf | model | x1.08 | x1.08 | x1.11 | x1.14 | x1.21 | x1.20 | x1.20 | x1.14 | x1.06 | x1.03 |
+| inharmonicity B (reliable fits) | recording | 2.50e-04 | 2.16e-04 | 1.17e-04 | 1.23e-04 | 3.26e-04 | 7.57e-04 | 9.55e-04 | 1.87e-03 | - | - |
+| inharmonicity B (reliable fits) | model | 4.55e-04 | 4.55e-04 | 1.74e-04 | 1.53e-04 | 3.24e-04 | - | - | - | - | - |
+| tuning, cents re ET | recording | -13.2 | -12.8 | -1.2 | +3.6 | +1.7 | +3.1 | +2.7 | +8.4 | +17.1 | +11.1 |
+| tuning, cents re ET | model | -15.5 | -15.5 | -3.2 | +0.3 | -0.3 | +0.9 | +0.9 | +6.3 | +14.0 | - |
+| decay profile at 0.5 s (dB re peak) | recording | 1 | -3 | -5 | -5 | -12 | -15 | -20 | -15 | -19 | -33 |
+| decay profile at 0.5 s (dB re peak) | model | -2 | -2 | -3 | -5 | -10 | -15 | -15 | -11 | -16 | - |
+| decay profile at 1 s (dB re peak) | recording | -1 | -6 | -10 | -10 | -21 | -26 | -21 | -22 | -34 | -53 |
+| decay profile at 1 s (dB re peak) | model | -4 | -4 | -7 | -12 | -20 | -27 | -27 | -21 | -35 | - |
+| decay profile at 2 s (dB re peak) | recording | -5 | -10 | -12 | -22 | -25 | -29 | -29 | -36 | -53 | -70 |
+| decay profile at 2 s (dB re peak) | model | -9 | -9 | -15 | -21 | -31 | -36 | -36 | -33 | -50 | - |
+| decay profile at 4 s (dB re peak) | recording | -10 | -18 | -22 | -24 | -31 | -38 | -37 | -47 | -66 | - |
+| decay profile at 4 s (dB re peak) | model | -17 | -17 | -23 | -27 | -30 | -38 | -38 | -48 | -66 | - |
+| decay profile at 8 s (dB re peak) | recording | -19 | -27 | -24 | -32 | -45 | -53 | -53 | -69 | - | - |
+| decay profile at 8 s (dB re peak) | model | -26 | -26 | -27 | -34 | -40 | -52 | -52 | - | - | - |
+| decay profile at 16 s (dB re peak) | recording | -29 | -33 | -35 | -45 | -55 | -64 | -70 | - | - | - |
+| decay profile at 16 s (dB re peak) | model | -34 | -34 | -36 | -47 | -60 | - | - | - | - | - |
+| prompt T60, two-segment fit (s) | recording | 18.3 | 18.2 | 14.9 | 10.2 | 12.8 | 10.0 | 10.0 | 3.5 | 1.7 | 0.7 |
+| prompt T60, two-segment fit (s) | model | 15.8 | 15.8 | 8.0 | 5.9 | 3.0 | 2.3 | 2.3 | 2.8 | 1.6 | - |
+| aftersound T60, two-segment fit (s) | recording | 55 | 68 | 81 | 52 | 51 | 40 | 23 | 10 | 4 | 2 |
+| aftersound T60, two-segment fit (s) | model | 62 | 62 | 52 | 37 | 27 | 27 | 27 | 10 | 5 | - |
+| knee, two-segment fit (dB re peak) | recording | -10 | -21 | -23 | -26 | -35 | -36 | -31 | -21 | -23 | -17 |
+| knee, two-segment fit (dB re peak) | model | -19 | -19 | -18 | -20 | -24 | -30 | -30 | -20 | -16 | - |
+| early spectral slope, mf (dB/oct) | recording | -1 | 1 | -4 | -5 | -15 | -19 | -20 | -29 | -37 | - |
+| early spectral slope, mf (dB/oct) | model | 3 | 3 | -4 | -7 | -15 | -19 | -19 | -29 | -32 | - |
+| rise time 10-90 %, mf (ms) | recording | 46 | 52 | 20 | 12 | 15 | 13 | 9 | 9 | 6 | 7 |
+| rise time 10-90 %, mf (ms) | model | 62 | 62 | 67 | 56 | 20 | 27 | 27 | 11 | 6 | 5 |
+| slope change mf -> ff (dB/oct) | recording | -2.4 | +0.8 | +1.0 | +1.4 | +6.0 | +2.3 | +4.3 | +5.1 | -8.2 | - |
+| slope change mf -> ff (dB/oct) | model | +1.0 | +1.0 | +1.5 | +1.9 | +3.5 | +2.2 | +2.2 | +5.1 | +7.1 | - |
+| peak level ff - mf (dB) | recording | +16 | +12 | +8 | +9 | +12 | +11 | +13 | +15 | +15 | +10 |
+| peak level ff - mf (dB) | model | +17 | +17 | +18 | +19 | +20 | +20 | +20 | +27 | +30 | +35 |
+| harmonic centroid ff / mf | recording | x1.10 | x1.04 | x1.04 | x1.10 | x1.20 | x1.25 | x1.28 | x1.09 | x1.02 | x1.05 |
+| harmonic centroid ff / mf | model | x1.06 | x1.06 | x1.13 | x1.20 | x1.24 | x1.27 | x1.27 | x1.07 | x1.05 | x1.02 |
+| notes behind each decay value | recording | 2 | 8 | 14 | 14 | 14 | 14 | 14 | 13 | 14 | 3 |
 
-Notes on reading the table:
-- The model's "C1" column repeats A0: the model is only rendered at landmark keys, and C1 sits
-  within ±3 semitones of A0.
-- The model's slope row here is the dry string signal. The acceptance check in
-  `pianonn.diagnostics` includes the soundboard body, as the near-field recording does, and
-  matches within ±5 dB/oct in every register.
+## Fitting
 
-## What changed because of this data
+`scripts/fit_decays.py` fits the aftersound loss b1, the prompt ratio R and the aftersound amplitude at each
+landmark, from an analytic decay profile (beats averaged). The fitted profiles are within a few dB of the targets.
 
-| quantity | v1 prior (memory) | measured here | now |
-|---|---|---|---|
-| bass aftersound T60 | 20–30 s | about 110 s (A0–C1), 93 s (C2) | measured |
-| bass double decay | none (R = 1.5–1.7) | clear knee, R ≈ 4 | measured |
-| mid prompt T60 | C4 7.3 s, A4 5.0 s (a model artefact of beating) | C4 10 s, A4 5.8 s | measured |
-| stretch | A0 −30, C7 +25 cents | A0 −16, C7 +14 cents | measured |
-| treble brightness | C6 partial 2 at −8 dB | C6 partial 2 at −26 dB | per-key hammer roll-off |
-| velocity brightening | ×1.0 roll-off, +2 dB at n = 8 mf→ff | ff/mf centroid ×1.22 at C4/A4 | velocity-dependent roll-off, fitted to Hall |
+Rendered notes are then checked against the targets, with the model aggregated like the recordings: medians over
+neighbouring keys and velocities. They pass at C1–C4, A4 and C7. C5–C7 were less reliable to begin with (see
+`physical_parameters.md`, section 6).
 
-## Known limitations
+## Review history
 
-- **Bass knee metric.** For the fundamental of A0–C3 it responds non-monotonically to the
-  aftersound amplitude, so the bass knee checks fail while the aftersound T60 matches.
-- **Bass rise time.** The model is too slow (see `physical_parameters.md`, section 7).
-- **Treble prompt T60 (C7, C8)** could not be measured reliably: there are few partials, and
-  the pp/mf files are often suspect.
+- **Review 2** ([`reviews/review_2_calibration.md`](reviews/review_2_calibration.md)) found that v2's per-partial
+  energy-decay-curve "prompt T60" misread recordings. Real mid-range notes fall about 20 dB in the first second,
+  while the v2 model fell about 5 dB.
+- It also found partial selection by list index, the mono-sum comb filtering, the unconstrained treble tracker, and
+  a NaN gradient. All are fixed in v3.

@@ -23,7 +23,7 @@ def test_forward_backward(model):
     out["audio"].pow(2).mean().backward()
     for name in ["physics.raw_log_B", "physics.raw_cents", "physics.gain_db", "physics.raw_log_tc", "room.body",
                  "room.raw_log_t60", "symp.log_gain", "noise.knock", "noise.pedal", "context.head.2.weight",
-                 "physics.pedal_theta", "physics.pedal_log_power"]:
+                 "physics.pedal_theta", "physics.pedal_log_power", "physics.raw_order", "physics.raw_order_vel"]:
         g = dict(model.named_parameters())[name].grad
         assert g is not None and torch.isfinite(g).all() and g.abs().sum() > 0, name
 
@@ -140,17 +140,43 @@ def test_per_key_strings_sum_to_total():
     assert per_key[0, 39].abs().sum() > 0 and per_key[0, 19].abs().sum() > 0 and per_key[0, 50].abs().sum() == 0
 
 
-def test_decay_times_match_measured_piano():
-    """Fundamental decays from the mode parameters against the Iowa Steinway B (docs/calibration_iowa.md):
-    prompt T60 within x1.5, a real two-stage decay, and aftersounds that are long in the bass and short in the
-    treble. Exact aftersound values are checked on rendered notes by pianonn.diagnostics, measured the same way
-    as the recordings (medians over partials 1-4), which an analytic fundamental-only test cannot reproduce."""
+def test_decay_profile_matches_measured_piano():
+    """Analytic decay profile (power-summed decay partials, beats averaged) within 6 dB of the profile measured on
+    the Iowa Steinway B (docs/calibration_iowa.md) in the bass and mid-range, and a real two-stage decay. Rendered
+    notes are checked the same way the recordings were measured by pianonn.diagnostics."""
+    import math
+
+    from pianonn.calibration import PROFILE_TIMES, decay_partials
+
     phys = PianoPhysics(small_cfg(sample_rate=24000, n_partials=12))
-    prompt_targets = {0: 26.4, 15: 26.7, 27: 15.7, 39: 10.3, 48: 5.8, 63: 5.0}
-    ki = torch.tensor([list(prompt_targets)])
-    m = phys.modes(ki, torch.full(ki.shape, 0.5), torch.zeros(ki.shape), torch.tensor([0]))
-    t60 = 6.91 / m["alpha"][0, :, 0]  # [keys, modes] at the fundamental
-    for i, (key, prompt) in enumerate(prompt_targets.items()):
-        assert prompt / 1.5 <= t60[i, 0] <= prompt * 1.5, (key, t60[i, 0])
-        assert t60[i, 1] >= 2 * t60[i, 0], (key, t60[i])  # two-stage decay
-    assert t60[0, 1] > 60 and t60[-1, 1] < 25
+    targets = {3: (-3, -6, -10, -18, -27, -33), 15: (-5, -10, -12, -22, -24, -35), 27: (-5, -10, -22, -24, -32, -45),
+               39: (-12, -21, -25, -31, -45, -55)}
+    for k, target in targets.items():
+        m = phys.modes(torch.tensor([[k]]), torch.tensor([[0.5]]), torch.zeros(1, 1), torch.tensor([0]))
+        idx = [n - 1 for n in decay_partials(k + 21)]
+        a2, al = m["amp"][0, 0, idx].double() ** 2, m["alpha"][0, 0, idx].double()
+        t = torch.tensor((0.05,) + PROFILE_TIMES, dtype=torch.float64)
+        P = (a2[..., None] * torch.exp(-2 * al[..., None] * t)).sum((0, 1))
+        prof = 10 * torch.log10(P[1:] / P[0])
+        assert (prof - torch.tensor(target, dtype=torch.float64)).abs().max() <= 6, (k, prof)
+        assert (m["alpha"][0, 0, 0, 0] / m["alpha"][0, 0, 0, 1]).item() > 3  # prompt much faster than aftersound
+
+
+def test_physics_gradients_finite_all_keys_and_velocities():
+    """Every physics parameter gets a finite gradient for every key at every velocity (full-rate config,
+    96 partials: partials far above Nyquist must not overflow before they are masked)."""
+    from pianonn import PianoConfig
+
+    phys = PianoPhysics(PianoConfig())
+    keys = torch.arange(88).repeat_interleave(22)
+    vels = torch.linspace(1, 127, 22).repeat(88)
+    ki, u = keys[None], (vels / 127)[None]
+    for soft in (0.0, 1.0):
+        phys.zero_grad()
+        m = phys.modes(ki, u, torch.full(ki.shape, soft), torch.tensor([0]))
+        loss = sum(v.float().pow(2).mean() for v in m.values() if v.is_floating_point())
+        loss.backward()
+        grads = {name: p.grad for name, p in phys.named_parameters() if p.grad is not None}  # pedals act in synth
+        assert {"raw_order", "raw_order_vel", "raw_log_tc", "raw_log_B", "gain_db"} <= set(grads)
+        for name, g in grads.items():
+            assert torch.isfinite(g).all(), (name, soft)

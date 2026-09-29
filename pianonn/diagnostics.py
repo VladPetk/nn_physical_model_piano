@@ -17,15 +17,21 @@ import torch
 from .render import load_model
 
 KEYS = {"A0": 21, "C2": 36, "C4": 60, "A4": 69, "C6": 84, "C7": 96, "C8": 108}
-# Measured on the Iowa Steinway B with pianonn.calibration (docs/calibration_iowa.md): robust medians over
-# partials 1-4 (mf + ff), smoothed +-3 semitones. Keys: prompt T60 s, aftersound T60 s, aftersound knee of the
-# fundamental dB re peak (partials 2-4 saturate in this fit, in recordings and model alike, so only partial 1 is
-# used; C1's -13 dB is an outlier between neighbours at -29/-28), early spectral slope at mf dB/oct, tuning
-# cents re A4.
-IOWA = {"A0": (26.4, 113, -29, -1, -16), "C1": (19.8, 110, None, 1.5, -15), "C2": (26.7, 93, -28, -3.5, -4),
-        "C3": (15.7, 51, -27, -4.7, 0), "C4": (10.3, 26, -25, -13.7, -1), "A4": (5.8, 18, -24, -17.3, 0),
-        "C5": (5.7, 14, -24, -25.8, 0), "C6": (5.0, 9.1, -16, -26.8, 6), "C7": (None, 4.6, -14, -32.6, 14)}
-IOWA_PITCH = {"A0": 21, "C1": 24, "C2": 36, "C3": 48, "C4": 60, "A4": 69, "C5": 72, "C6": 84, "C7": 96}
+# Measured on the Iowa Steinway B with pianonn.calibration (docs/calibration_iowa.md), both channels in power,
+# medians over mf + ff and +-3 semitones. Per landmark: decay profile (dB re peak of the power-summed decay partials
+# at 0.5/1/2/4/8/16 s; nan = at the noise floor), early spectral slope at mf (dB/oct), tuning (cents re A4).
+# A0 (2 notes) and C8 (3 notes) are not used as targets: too few, partly mislabelled recordings.
+IOWA = {
+    "C1": ((-3, -6, -10, -18, -27, -33), 0.7, -15.9),
+    "C2": ((-5, -10, -12, -22, -24, -35), -3.5, -4.3),
+    "C3": ((-5, -10, -22, -24, -32, -45), -5.3, 0.5),
+    "C4": ((-12, -21, -25, -31, -45, -55), -15.4, -1.4),
+    "A4": ((-15, -26, -29, -38, -53, -64), -19.2, 0.0),
+    "C5": ((-20, -21, -29, -37, -53, -70), -20.3, -0.4),
+    "C6": ((-15, -22, -36, -47, -69, None), -28.5, 5.3),
+    "C7": ((-19, -34, -53, -66, None, None), -37.2, 14.0),
+}
+IOWA_PITCH = {"C1": 24, "C2": 36, "C3": 48, "C4": 60, "A4": 69, "C5": 72, "C6": 84, "C7": 96}
 
 
 def _variant(model, **flags):
@@ -47,23 +53,6 @@ def _render(model, seconds, notes, sustain=0.0):
     n = int(seconds * model.cfg.sample_rate)
     return {k: v[0].double().numpy() for k, v in
             model(_perf(model, n, notes, sustain), n, block_seconds=2.0, generator=torch.Generator().manual_seed(0)).items()}
-
-
-def _t60(t, db):
-    slope = np.polyfit(t, db, 1)[0]
-    return -60 / slope if slope < 0 else np.inf
-
-
-def _edc_t60(x, sr, f, lo=-3.0, hi=-13.0):
-    """Prompt T60 of the partial at ``f`` from its energy decay curve (Schroeder), fitted from ``lo`` to ``hi`` dB.
-    Backward integration averages out unison beating, which ruins envelope slope fits."""
-    t = np.arange(len(x)) / sr
-    k = max(1, int(0.02 * sr))
-    p = np.abs(np.convolve(x * np.exp(-2j * np.pi * f * t), np.ones(k) / k, mode="same")) ** 2
-    edc = 10 * np.log10(np.cumsum(p[::-1])[::-1] + 1e-30)
-    edc -= edc[int(0.05 * sr)]
-    sel = (edc <= lo) & (edc >= hi) & (t > 0.05)
-    return _t60(t[sel], edc[sel]) if sel.sum() > 10 else float("nan")
 
 
 def _partials(x, sr, freqs, t0=0.05, t1=2.0):
@@ -135,51 +124,55 @@ def run(model):
             rows.append(f"| {name} | {v} | {f1:.2f} | {r['B']:.2e} | {' '.join(f'{d:+.0f}' for d in r['lev'][1:6])} | "
                         f"{r['centroid']:.0f} | {r['peak']:.1f} |")
 
-    # --- decays, knee, brightness and stretch vs the Iowa recordings, analysed by the same code ---
-    from .calibration import analyze_note
+    # --- decays, brightness and stretch vs the Iowa recordings, analysed by the same code ---
+    from .calibration import PROFILE_TIMES, analyze_note, render_note
 
-    pre = int(0.3 * sr)
-    body = _variant(model, use_noise=False, use_sympathetic=False)
-    with torch.no_grad():
-        saved = body.room.log_gain.clone()
-        body.room.log_gain.fill_(-30.0)  # near-field recording: soundboard, no hall
     measured = {}
     for name, p in IOWA_PITCH.items():
-        n = int(45 * sr) + pre
-        x = _render(dry, n / sr, [(p, pre / sr, n / sr, 64)])["audio"]
-        x = x + 1e-7 * np.random.default_rng(p).standard_normal(len(x))  # a noise floor, as in a recording
-        r = analyze_note(x, sr, p)
-        y = _render(body, 1.5 + pre / sr, [(p, pre / sr, 1.5 + pre / sr, 64)])["audio"]
-        y = y + 1e-7 * np.random.default_rng(p).standard_normal(len(y))
-        r["slope_db_oct"] = analyze_note(y, sr, p).get("slope_db_oct", float("nan"))
+        r = analyze_note(render_note(model, p, 64, 20.0), sr, p)  # dry strings, 60 dB noise floor
+        spec = analyze_note(render_note(model, p, 64, 1.5, body=True), sr, p)  # through the soundboard body
+        r["slope_db_oct"] = spec.get("slope_db_oct", float("nan"))
+        # decay profile aggregated like the recordings' targets (median over neighbouring keys and mf + ff),
+        # so single-note beat nulls are averaged out on both sides
+        profiles = [analyze_note(render_note(model, q, vel, 20.0), sr, q).get("profile_db")
+                    for q in range(max(21, p - 3), min(108, p + 3) + 1, 2) for vel in (64, 110)]
+        profiles = np.array([pr for pr in profiles if pr], dtype=float)
+        r["profile_db"] = list(np.nanmedian(profiles, 0)) if len(profiles) else r.get("profile_db")
         measured[name] = r
-    with torch.no_grad():
-        body.room.log_gain.copy_(saved)
     a4 = measured["A4"]["cents"]
-    for name, (prompt, after, knee, slope, cents) in IOWA.items():
+    for name, (profile, slope, cents) in IOWA.items():
         r = measured[name]
-        med = lambda key, lo=0, hi=4: float(np.nanmedian(r.get(key, [np.nan])[lo:hi]))
-        if prompt:
-            v = med("t60_prompt")
-            check(f"{name} prompt T60, partials 1-4 (s)", v, f"{prompt} (x/1.35)", prompt / 1.35 <= v <= prompt * 1.35, "{:.1f}")
-        v = med("t60_after")
-        check(f"{name} aftersound T60, partials 1-4 (s)", v, f"{after} (x/1.35)", after / 1.35 <= v <= after * 1.35, "{:.1f}")
-        if knee is not None:
-            v = r.get("after_level_db", [np.nan])[0]
-            check(f"{name} aftersound knee of the fundamental (dB re peak)", v, f"{knee} +-4", abs(v - knee) <= 4, "{:.0f}")
+        got = r.get("profile_db", [float("nan")] * len(PROFILE_TIMES))
+        pairs = [(t, g, w) for t, g, w in zip(PROFILE_TIMES, got, profile) if w is not None and np.isfinite(g)]
+        dev = max(abs(g - w) for _, g, w in pairs) if pairs else float("inf")
+        shown = " ".join(f"{g:.0f}/{w}" for _, g, w in pairs)
+        check(f"{name} decay profile (median, +-3 keys, mf+ff), model/recording dB at {'/'.join(f'{t:g}' for t, _, _ in pairs)} s", shown,
+              "each +-6 dB", dev <= 6)
         v = r["slope_db_oct"]
         check(f"{name} early spectral slope, mf, radiated (dB/oct)", v, f"{slope} +-5", abs(v - slope) <= 5, "{:.1f}")
         v = r["cents"] - a4
-        check(f"{name} tuning re A4 (cents)", v, f"{cents:+d} +-4", abs(v - cents) <= 4, "{:+.1f}")
+        check(f"{name} tuning re A4 (cents) [regression: the prior copies these values]", v, f"{cents:+.1f} +-4",
+              abs(v - cents) <= 4, "{:+.1f}")
 
-    for name, target in (("C4", 3.3e-4), ("C6", 2.85e-3)):  # Rigaud et al. (DAFx 2011)
+    for name, target in (("C4", 3.3e-4), ("C6", 2.85e-3)):
         b = notes[(name, 80)]["B"]
-        check(f"{name} effective B (Rigaud et al.)", b, f"{target:.2e} (x1.5)", target / 1.5 <= b <= target * 1.5)
-    for name, target in (("C2", 1.19e-4), ("C4", 3.04e-4)):  # measured on the Iowa Steinway B
+        check(f"{name} effective B vs Rigaud et al. [regression: the prior is this curve]", b, f"{target:.2e} (x1.5)",
+              target / 1.5 <= b <= target * 1.5)
+    for name, target in (("C2", 1.17e-4), ("C4", 3.26e-4)):  # measured on the Iowa Steinway B (independent of the prior)
         b = measured[name]["B"]
-        check(f"{name} effective B (Iowa, x2: bass is piano-specific)", b, f"{target:.2e} (x2)", target / 2 <= b <= target * 2)
-    ratio = notes[("C4", 120)]["centroid"] / notes[("C4", 40)]["centroid"]
-    check("C4 centroid vel120 / vel40", ratio, "1.1-2", 1.1 <= ratio <= 2.0, "{:.2f}")
+        check(f"{name} effective B vs Iowa (x2: bass is piano-specific)", b, f"{target:.2e} (x2)", target / 2 <= b <= target * 2)
+    lev = notes[("C4", 80)]["lev"]  # v1 memory-based sanity ranges, kept (tag M)
+    check("C4 vel 80 partials 2-6 re p1 (dB) [M]", " ".join(f"{d:+.0f}" for d in lev[1:6]), "-30..+3",
+          bool(np.all((lev[1:6] >= -30) & (lev[1:6] <= 3))))
+    check("C4 vel 80 partial 10 re p1 (dB) [M]", lev[9], "<= -30", lev[9] <= -30, "{:+.0f}")
+    # Hall, Five Lectures, Fig. 15: C4 spectral slope over partials 1-10 at pp / mf / ff (the roll-off law was
+    # fitted to these, so this is a regression check of the rendering path)
+    ki = torch.tensor([[39]])
+    for vel, target in ((30, -18.0), (64, -15.0), (110, -11.0)):
+        a = model.physics.modes(ki, torch.tensor([[vel / 127]]), torch.zeros(1, 1), torch.tensor([9]))["amp"][0, 0, :10, 0].abs().numpy()
+        s_ = np.polyfit(np.log2(np.arange(1, 11)), 20 * np.log10(a / a[0] + 1e-12), 1)[0]
+        check(f"C4 spectral slope, partials 1-10, vel {vel} (dB/oct) [regression: fitted to Hall]", s_, f"{target:+.0f} +-2",
+              abs(s_ - target) <= 2, "{:.1f}")
     for name in ("C2", "C4", "C6", "C7"):
         cs = [_centroid(_render(dry, 0.5, [(KEYS[name], 0.0, 0.5, v)])["audio"], sr) for v in (30, 60, 90, 120)]
         check(f"{name} brightness rises with velocity (centroid Hz, vel 30/60/90/120)", " ".join(f"{c:.0f}" for c in cs),

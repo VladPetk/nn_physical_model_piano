@@ -2,11 +2,18 @@
 
     python -m pianonn.calibration data/iowa --json data/iowa_analysis.json --out docs/calibration_iowa.md
 
-Per note (key, dynamic): inharmonicity B and tuning (from a regression over the tracked
-partials, f_n^2 / n^2 = f0^2 + f0^2 B n^2), prompt T60 of the lowest partials (energy decay
-curve, -3 to -13 dB: the same convention as ``pianonn.diagnostics``), aftersound T60 and the
-level of the knee, partial levels, spectral centroid and rise time. The report compares the
-recordings with the model prior analysed by the same code.
+Recordings may be multichannel. Every spectrum and envelope sums the channels' *powers*, so
+microphone positions never comb-filter each other as they would in a mono sum.
+
+Per note (key, dynamic):
+- inharmonicity B and tuning, from a stiff-string comb search (B constrained to x/4 of the
+  Rigaud et al. curve) and a regression f_n^2 / n^2 = f0^2 + f0^2 B n^2 over the tracked partials;
+- the decay profile: level (dB re peak) of the power-summed decay partials at fixed times.
+  The partials are chosen by number, with the same rule for recordings and model
+  (``decay_partials``: n = 2..5 below C3, where recordings often lack the fundamental; else 1..4);
+- a two-segment fit of that envelope with a free breakpoint: prompt T60, aftersound T60, and
+  the knee (the aftersound line extrapolated to the onset);
+- early partial levels, the spectral slope (dB/oct), a partial-based centroid, and the rise time.
 """
 
 import argparse
@@ -21,6 +28,7 @@ from scipy.signal import fftconvolve
 
 PITCH_CLASS = {"C": 0, "Db": 1, "D": 2, "Eb": 3, "E": 4, "F": 5, "Gb": 6, "G": 7, "Ab": 8, "A": 9, "Bb": 10, "B": 11}
 LANDMARKS = {"A0": 21, "C1": 24, "C2": 36, "C3": 48, "C4": 60, "A4": 69, "C5": 72, "C6": 84, "C7": 96, "C8": 108}
+PROFILE_TIMES = (0.5, 1.0, 2.0, 4.0, 8.0, 16.0)
 
 
 def note_to_midi(name):
@@ -33,6 +41,21 @@ def midi_name(p):
     return f"{names[p % 12]}{p // 12 - 1}"
 
 
+def rigaud_B(pitch):
+    """Rigaud, David & Daudet (DAFx 2011) two-asymptote inharmonicity curve (m = MIDI pitch)."""
+    return math.exp(0.0926 * pitch - 13.64) + math.exp(-0.0847 * pitch - 5.82)
+
+
+def decay_partials(pitch):
+    """Partial numbers whose summed power defines a note's decay (same rule for recordings and model)."""
+    return (2, 3, 4, 5) if pitch < 48 else (1, 2, 3, 4)
+
+
+def _as_2d(x):
+    x = np.asarray(x, dtype=np.float64)
+    return x[:, None] if x.ndim == 1 else x
+
+
 def _moving_average(x, k):
     """Centred moving average of length ``k`` in O(N) (np.convolve is O(N k))."""
     c = np.concatenate([[0.0], np.cumsum(x)])
@@ -42,12 +65,16 @@ def _moving_average(x, k):
 
 
 def _rms(x, sr, win=0.005):
-    return np.sqrt(np.clip(_moving_average(x**2, max(1, int(win * sr))), 0, None))
+    return np.sqrt(np.clip(_moving_average((_as_2d(x) ** 2).sum(1), max(1, int(win * sr))), 0, None))
 
 
 def find_onset(x, sr):
     r = _rms(x, sr)
     return int(np.argmax(r > 0.05 * r.max()))
+
+
+def _power_spectrum(seg, n_fft, window):
+    return (np.abs(np.fft.rfft(seg * window[:, None], n_fft, axis=0)) ** 2).sum(1)
 
 
 def _peak(spec_db, hz, f, tol):
@@ -63,13 +90,14 @@ def _peak(spec_db, hz, f, tol):
     return hz[i] + d * (hz[1] - hz[0]), b - 0.25 * (a - c) * d, b - np.median(local)
 
 
-def comb_search(spec_db, hz, f_nominal, max_freq, n_max=40, cents=100.0, decimate=4):
+def comb_search(spec_db, hz, f_nominal, max_freq, B_range, n_max=40, cents=100.0, decimate=4):
     """Coarse (f0, B) that best explains the spectrum as a stiff-string comb.
 
     Scores every (f0, B) on a grid by the prominence (dB above a moving average) of the peaks at
-    the predicted partials n = 1..N, counting only clear peaks (> 10 dB), weighting low partials
-    more (1/sqrt(n)) and max-pooling over +-0.6 % of each partial's frequency so the coarse grid
-    still lands on it. Robust to a weak fundamental and stray peaks, which fool greedy peak picking.
+    the predicted partials, counting only clear peaks (> 10 dB), weighting low partials more
+    (1/sqrt(n)) and max-pooling over +-0.6 % of each partial's frequency. B is searched only
+    within ``B_range``: otherwise near-harmonic components (distortion, phantom partials) that
+    dominate treble recordings win with B ~ 0.
     """
     from scipy.ndimage import maximum_filter1d, uniform_filter1d
 
@@ -79,7 +107,7 @@ def comb_search(spec_db, hz, f_nominal, max_freq, n_max=40, cents=100.0, decimat
     tols = [1, 2, 4, 8, 16, 32, 64, 128]
     pooled = np.stack([maximum_filter1d(prom, 2 * t + 1) for t in tols])
     f0s = f_nominal * 2 ** (np.linspace(-cents, cents, 81) / 1200)
-    Bs = np.concatenate([[0.0], np.logspace(-5, -1, 60)])
+    Bs = np.logspace(math.log10(B_range[0]), math.log10(B_range[1]), 40)
     n = np.arange(1, n_max + 1)
     n = n[: max(2, min(n_max, int(max_freq / (1.02 * f_nominal))))]
     w = 1 / np.sqrt(n)
@@ -92,14 +120,15 @@ def comb_search(spec_db, hz, f_nominal, max_freq, n_max=40, cents=100.0, decimat
     return f0s[i], Bs[j]
 
 
-def track_partials(x, sr, onset, f_nominal, seconds=4.0, max_freq=11000.0, snr_db=15.0):
-    """Partial frequencies and levels; returns (n, f, level_db), f0 and B."""
+def track_partials(x, sr, onset, f_nominal, B_range, seconds=4.0, max_freq=11000.0, snr_db=15.0):
+    """Partial frequencies and levels; returns n, f, level_db, f0, B and the fit residual."""
+    x = _as_2d(x)
     seg = x[onset + int(0.05 * sr): onset + int(seconds * sr)]
     n_fft = 1 << int(math.ceil(math.log2(len(seg) * 4)))
-    spec = 20 * np.log10(np.abs(np.fft.rfft(seg * np.blackman(len(seg)), n_fft)) + 1e-12)
+    spec = 10 * np.log10(_power_spectrum(seg, n_fft, np.blackman(len(seg))) + 1e-24)
     hz = np.fft.rfftfreq(n_fft, 1 / sr)
+    f0, B = comb_search(spec, hz, f_nominal, min(max_freq, 0.45 * sr), B_range)
 
-    f0, B = comb_search(spec, hz, f_nominal, max_freq=min(max_freq, 0.45 * sr))
     found = {}
     for n in range(1, 7):  # seed from the best stiff-string comb, tight tolerance
         p = _peak(spec, hz, n * f0 * math.sqrt(1 + B * n * n), 0.05 * f0)
@@ -110,7 +139,7 @@ def track_partials(x, sr, onset, f_nominal, seconds=4.0, max_freq=11000.0, snr_d
         n = np.array(sorted(ps), dtype=float)
         f = np.array([ps[k][0] for k in sorted(ps)])
         if len(n) < 3:
-            return f[0] / n[0], 0.0
+            return f[0] / n[0], B
         slope, icpt = np.polyfit(n**2, (f / n) ** 2, 1)
         return math.sqrt(max(icpt, 1e-6)), max(slope / max(icpt, 1e-6), 0.0)
 
@@ -156,74 +185,90 @@ def track_partials(x, sr, onset, f_nominal, seconds=4.0, max_freq=11000.0, snr_d
 
 
 def partial_power(x, sr, f, f_spacing):
-    """Power envelope of the partial at ``f`` (heterodyne + Hann low-pass narrower than the partial spacing)."""
+    """Power envelope of the partial at ``f`` (heterodyne + Hann low-pass narrower than the partial
+    spacing), summed over channels."""
+    x = _as_2d(x)
     t = np.arange(len(x)) / sr
     k = int(np.clip(2.5 / f_spacing, 0.02, 0.2) * sr)
     w = np.hanning(k)
     w /= w.sum()
-    z = fftconvolve(x * np.exp(-2j * np.pi * f * t), w, mode="same")
-    return np.abs(z) ** 2
+    z = fftconvolve(x * np.exp(-2j * np.pi * f * t)[:, None], w[:, None], mode="same", axes=0)
+    return (np.abs(z) ** 2).sum(1)
 
 
-def edc_t60(p, sr, start, noise, lo=-3.0, hi=-13.0):
-    """Prompt T60 from the noise-compensated energy decay curve, fitted from ``lo`` to ``hi`` dB."""
-    q = np.clip(p[start:] - noise, 0, None)
-    edc = np.cumsum(q[::-1])[::-1]
-    if edc[0] <= 0:
-        return float("nan")
-    edc = 10 * np.log10(edc / edc[0] + 1e-30)
-    sel = np.nonzero((edc <= lo) & (edc >= hi))[0]
-    if len(sel) < 10:
-        return float("nan")
-    slope = np.polyfit(sel / sr, edc[sel], 1)[0]
-    return -60 / slope if slope < 0 else float("inf")
+def decay_envelope(x, sr, onset, partials, f_spacing, pre):
+    """Noise-subtracted power of the given partials, 0.1 s smoothing, decimated to 100 Hz: (t, dB re peak, floor dB)."""
+    P = sum(partial_power(x, sr, f, f_spacing) for f in partials)
+    noise = 0.0
+    if len(pre) > int(0.1 * sr):
+        noise = float(np.median(sum(partial_power(pre, sr, f, f_spacing) for f in partials)[int(0.05 * sr):]))
+    else:
+        noise = float(np.percentile(P[-int(sr):], 10))
+    step = sr // 100
+    Ps = _moving_average(P, int(0.1 * sr))[onset::step]
+    peak = Ps[: 30].max()
+    db = 10 * np.log10(np.clip(Ps - noise, 1e-30, None) / peak)
+    floor = 10 * math.log10(max(noise, 1e-30) / peak)
+    return np.arange(len(db)) / 100.0, db, floor
 
 
-def aftersound(p, sr, start, noise, knee_db=-25.0, margin_db=10.0, min_span=1.5):
-    """Late-decay T60 and the level of the aftersound line extrapolated back to the onset (dB re peak)."""
-    k = int(0.5 * sr)
-    ps = _moving_average(p[start:], k)
-    db = 10 * np.log10(ps + 1e-30)
-    peak = db[: int(0.3 * sr)].max()
-    floor = 10 * math.log10(noise + 1e-30)
-    below = np.nonzero(db < peak + knee_db)[0]
-    if len(below) == 0:
-        return float("nan"), float("nan")
-    i0 = below[0]
-    live = np.nonzero(db[i0:] > floor + margin_db)[0]
+def decay_profile(t, db, floor, times=PROFILE_TIMES, margin=6.0):
+    """Level at fixed times (nan where the note is within ``margin`` dB of the noise floor)."""
+    out = []
+    for tt in times:
+        i = int(round(tt * 100))
+        out.append(float(db[i]) if i < len(db) and db[i] > floor + margin else float("nan"))
+    return out
+
+
+def two_segment(t, db, floor, t_start=0.05, margin=10.0):
+    """Continuous two-segment fit with a free breakpoint: prompt T60, aftersound T60, breakpoint, knee.
+
+    The knee is the aftersound line extrapolated back to the onset (dB re peak). With no clear
+    second stage the two slopes coincide.
+    """
+    live = np.nonzero(db > floor + margin)[0]
     if len(live) == 0:
-        return float("nan"), float("nan")
-    i1 = i0 + live[-1] - k // 2
-    if (i1 - i0) / sr < min_span:
-        return float("nan"), float("nan")
-    t = np.arange(i0, i1) / sr
-    slope, icpt = np.polyfit(t, db[i0:i1], 1)
-    return (-60 / slope if slope < 0 else float("inf")), icpt - peak
+        return {}
+    i0, i1 = int(t_start * 100), live[-1] + 1
+    tt, yy = t[i0:i1], db[i0:i1]
+    if len(tt) < 30:
+        return {}
+    best = None
+    for tb in np.linspace(tt[0] + 0.1, tt[-1] - 0.2, 60):
+        A = np.stack([np.ones_like(tt), tt, np.maximum(0, tt - tb)], 1)
+        coef, res, *_ = np.linalg.lstsq(A, yy, rcond=None)
+        err = float(np.sum((A @ coef - yy) ** 2))
+        if best is None or err < best[0]:
+            best = (err, tb, coef)
+    _, tb, (a, s1, ds) = best
+    s2 = s1 + ds
+    t60 = lambda s: -60 / s if s < 0 else float("inf")
+    return {"t60_prompt": t60(s1), "t60_after": t60(s2), "t_knee": float(tb), "knee_db": float(a - ds * tb),
+            "fit_until_s": float(tt[-1])}
 
 
 def early_partials(x, sr, onset, freqs, noise_seg, t0=0.01, t1=0.2):
-    """Noise-compensated levels (dB) of the partials at ``freqs`` in the early window after the onset.
-
-    The noise power at each frequency is estimated from ``noise_seg`` (the silence before the note)
-    and subtracted, so quiet pp notes are not mistaken for bright ones by the recording hiss.
-    """
+    """Noise-compensated levels (dB) of the partials at ``freqs`` in the early window after the onset
+    (nan below 10 dB SNR)."""
+    x, noise_seg = _as_2d(x), _as_2d(noise_seg)
     seg = x[onset + int(t0 * sr): onset + int(t1 * sr)]
     n_fft = 1 << int(math.ceil(math.log2(len(seg) * 8)))
     win = np.hanning(len(seg))
-    P = np.abs(np.fft.rfft(seg * win, n_fft)) ** 2
+    P = _power_spectrum(seg, n_fft, win)
     hz = np.fft.rfftfreq(n_fft, 1 / sr)
     if len(noise_seg) >= len(seg):
         chunks = [noise_seg[i: i + len(seg)] for i in range(0, len(noise_seg) - len(seg) + 1, len(seg))]
-        N = np.mean([np.abs(np.fft.rfft(c * win, n_fft)) ** 2 for c in chunks], 0)
+        N = np.mean([_power_spectrum(c, n_fft, win) for c in chunks], 0)
     else:
         N = np.zeros_like(P)
-    tol = max(2, int(0.5 / (t1 - t0) / (hz[1] - hz[0])))  # half the window's main lobe
+    tol = max(2, int(0.5 / (t1 - t0) / (hz[1] - hz[0])))
     out = []
     for f in freqs:
         i = int(round(f / (hz[1] - hz[0])))
         lo, hi = max(0, i - tol), i + tol + 1
         sig = P[lo:hi].max() - N[lo:hi].mean()
-        out.append(10 * math.log10(sig) if sig > 10 * N[lo:hi].mean() + 1e-30 else float("nan"))  # SNR > 10 dB
+        out.append(10 * math.log10(sig) if sig > 10 * N[lo:hi].mean() + 1e-30 else float("nan"))
     return np.array(out)
 
 
@@ -235,12 +280,6 @@ def spectral_slope(levels, n):
     return float(np.polyfit(np.log2(np.asarray(n, dtype=float)[ok]), levels[ok], 1)[0])
 
 
-def centroid(x, sr, onset, t0=0.02, t1=0.12):
-    frame = x[onset + int(t0 * sr): onset + int(t1 * sr)]
-    s = np.abs(np.fft.rfft(frame * np.hanning(len(frame))))
-    return float((s * np.fft.rfftfreq(len(frame), 1 / sr)).sum() / (s.sum() + 1e-15))
-
-
 def rise_time(x, sr, onset):
     r = _rms(x, sr, 0.002)
     seg = r[max(0, onset - int(0.02 * sr)): onset + int(0.2 * sr)]
@@ -248,22 +287,23 @@ def rise_time(x, sr, onset):
     return (np.argmax(seg >= 0.9 * pk) - np.argmax(seg >= 0.1 * pk)) / sr
 
 
-def analyze_note(x, sr, pitch, n_decay=8):
-    """All measurements for one isolated note ``x`` (mono) of MIDI ``pitch``."""
+def analyze_note(x, sr, pitch):
+    """All measurements for one isolated note ``x`` ([T] or [T, channels]) of MIDI ``pitch``."""
+    x = _as_2d(x)
     onset = find_onset(x, sr)
     pre = x[: max(0, onset - int(0.05 * sr))]
     f_nom = 440.0 * 2 ** ((pitch - 69) / 12)
-    tr = track_partials(x, sr, onset, f_nom)
+    Br = rigaud_B(pitch)
+    tr = track_partials(x, sr, onset, f_nom, (Br / 4, Br * 4))
     out = {"pitch": pitch, "onset_s": onset / sr, "peak_db": 20 * math.log10(np.abs(x).max() + 1e-12),
-           "centroid_hz": centroid(x, sr, onset), "rise_ms": 1000 * rise_time(x, sr, onset)}
+           "rise_ms": 1000 * rise_time(x, sr, onset)}
     if tr is None:
         return out
     f1 = tr["f"][0] if tr["n"][0] == 1 else tr["f0"] * math.sqrt(1 + tr["B"])
     cents = 1200 * math.log2(f1 / f_nom)
-    # quality: B needs many partials and a clean stiff-string fit (treble recordings carry exact
-    # integer harmonics from distortion that mimic B ~ 0); a note > 50 cents off is mislabelled
-    out.update(B_reliable=bool(len(tr["n"]) >= 8 and tr["fit_rms_cents"] < 3.0), suspect=bool(abs(cents) > 50),
-               fit_rms_cents=tr["fit_rms_cents"])
+    out.update(B=tr["B"], B_reliable=bool(len(tr["n"]) >= 8 and tr["fit_rms_cents"] < 3.0), f1=f1, cents=cents,
+               suspect=bool(abs(cents) > 50), fit_rms_cents=tr["fit_rms_cents"], n_partials=len(tr["n"]))
+
     lv = early_partials(x, sr, onset, tr["f"][:12], pre)
     n12 = tr["n"][:12]
     ok = np.isfinite(lv)
@@ -271,22 +311,17 @@ def analyze_note(x, sr, pitch, n_decay=8):
         amp = 10 ** (lv[ok] / 20)
         out["harmonic_centroid_hz"] = float((np.array(tr["f"][:12])[ok] * amp).sum() / amp.sum())
     out["slope_db_oct"] = spectral_slope(lv, n12)
-    out["early_partials"] = {int(k): float(v - lv[0]) for k, v in zip(n12, lv)} if n12[0] == 1 and np.isfinite(lv[0]) else {}
-    out.update(B=tr["B"], f1=f1, cents=cents, n_partials=len(tr["n"]),
-               partials=dict(zip(tr["n"], [lv - tr["level"][0] if tr["n"][0] == 1 else float("nan") for lv in tr["level"]])))
-    prompt, after, after_level = [], [], []
-    for n, f in list(zip(tr["n"], tr["f"]))[:n_decay]:
-        p = partial_power(x, sr, f, tr["f0"])
-        if len(pre) > int(0.05 * sr):
-            noise = float(np.median(partial_power(pre, sr, f, tr["f0"])[int(0.02 * sr):]))
-        else:
-            noise = float(np.percentile(p[-int(1.0 * sr):], 10))
-        start = onset + int(0.05 * sr)
-        prompt.append(edc_t60(p, sr, start, noise))
-        a, lvl = aftersound(p, sr, start, noise)
-        after.append(a)
-        after_level.append(lvl)
-    out.update(t60_prompt=prompt, t60_after=after, after_level_db=after_level, decay_partials=tr["n"][:n_decay])
+    ref = lv[0] if n12[0] == 1 and np.isfinite(lv[0]) else None
+    out["early_partials"] = {int(k): float(v - ref) for k, v in zip(n12, lv)} if ref is not None else {}
+
+    want = decay_partials(pitch)
+    freqs = [f for n, f in zip(tr["n"], tr["f"]) if n in want]
+    if freqs:
+        t, db, floor = decay_envelope(x, sr, onset, freqs, tr["f0"], pre)
+        out["decay_partials"] = [n for n in tr["n"] if n in want]
+        out["profile_db"] = decay_profile(t, db, floor)
+        out["floor_db"] = floor
+        out.update(two_segment(t, db, floor))
     return out
 
 
@@ -295,7 +330,7 @@ def _analyze_file(path):
 
     _, dyn, note = os.path.basename(path).rsplit(".", 1)[0].split(".")
     x, sr = sf.read(path, always_2d=True)
-    r = analyze_note(x.mean(1), sr, note_to_midi(note))
+    r = analyze_note(x, sr, note_to_midi(note))
     r.update(file=os.path.basename(path), dynamic=dyn)
     return r
 
@@ -310,37 +345,52 @@ def analyze_dir(root, workers=None):
             results.append(r)
             print(f"{r['file']:24s} B={r.get('B', float('nan')):.2e}{'' if r.get('B_reliable') else '?'} "
                   f"cents={r.get('cents', float('nan')):+.1f}{' SUSPECT' if r.get('suspect') else ''} "
-                  f"T60p={_first(r.get('t60_prompt')):.1f} T60a={_first(r.get('t60_after')):.1f}", flush=True)
+                  f"T60p={r.get('t60_prompt', float('nan')):.1f} T60a={r.get('t60_after', float('nan')):.1f} "
+                  f"knee={r.get('knee_db', float('nan')):.0f}", flush=True)
     return results
 
 
-def _first(v):
-    return v[0] if v else float("nan")
-
-
-def analyze_model(model, dynamics=None, keys=None, seconds=45.0):
-    """Run the same analysis on the model's dry string output."""
+def render_note(model, pitch, velocity, seconds, body=False, snr_db=60.0, seed=0):
+    """Render one isolated note like a recording: 0.3 s of silence first, dry strings (or strings through
+    the soundboard body, no hall), and a white noise floor ``snr_db`` below the peak so that low-level
+    partials are censored as they are in the recordings."""
     import torch
 
     from .diagnostics import _perf, _variant
 
-    dynamics = dynamics or {"pp": 30, "mf": 64, "ff": 110}
-    keys = keys or list(LANDMARKS.values())
-    dry = _variant(model, use_noise=False, use_sympathetic=False, use_room=False)
+    m = _variant(model, use_noise=False, use_sympathetic=False, use_room=body)
     sr = model.cfg.sample_rate
-    pre = int(0.3 * sr)  # silence before the onset so the analysis can estimate the noise floor
+    pre = int(0.3 * sr)
+    n = int(seconds * sr) + pre
+    with torch.no_grad():
+        if body:
+            saved = m.room.log_gain.clone()
+            m.room.log_gain.fill_(-30.0)
+        x = m(_perf(model, n, [(pitch, pre / sr, n / sr, velocity)]), n)["audio"][0].double().numpy()
+        if body:
+            m.room.log_gain.copy_(saved)
+    rng = np.random.default_rng(seed + pitch)
+    return x + np.abs(x).max() * 10 ** (-snr_db / 20) * rng.standard_normal(len(x))
+
+
+def analyze_model(model, dynamics=None, keys=None, seconds=45.0):
+    """Run the same analysis on the model: decays on the dry strings, spectra through the body."""
+    dynamics = dynamics or {"mf": 64, "ff": 110}
+    keys = keys or list(LANDMARKS.values())
+    sr = model.cfg.sample_rate
     results = []
     for dyn, vel in dynamics.items():
         for p in keys:
-            n = int(seconds * sr) + pre
-            with torch.no_grad():
-                x = dry(_perf(model, n, [(p, pre / sr, n / sr, vel)]), n)["audio"][0].double().numpy()
-            x = x + 1e-7 * np.random.default_rng(p).standard_normal(len(x))  # a noise floor, as in a recording
-            r = analyze_note(x, sr, p)
+            r = analyze_note(render_note(model, p, vel, seconds), sr, p)
+            spec = analyze_note(render_note(model, p, vel, 1.5, body=True), sr, p)
+            for k in ("slope_db_oct", "early_partials", "harmonic_centroid_hz", "rise_ms"):
+                r[k] = spec.get(k, float("nan"))
             r.update(file=f"model.{dyn}.{midi_name(p)}", dynamic=dyn)
             results.append(r)
     return results
 
+
+# ---------------------------------------------------------------- summaries
 
 def _median(v):
     v = [x for x in v if x is not None and np.isfinite(x)]
@@ -360,23 +410,39 @@ def _at_landmarks(per_key, half_width=3):
     return {name: _median([v for q, v in per_key.items() if abs(q - p) <= half_width]) for name, p in LANDMARKS.items()}
 
 
+def landmark_samples(results, extract, dynamics, half_width=3):
+    """All note-level values feeding each landmark (for counts and bootstrap intervals)."""
+    out = {}
+    for name, p in LANDMARKS.items():
+        out[name] = [v for r in results if r["dynamic"] in dynamics and not r.get("suspect") and abs(r["pitch"] - p) <= half_width
+                     for v in [extract(r)] if v is not None and np.isfinite(v)]
+    return out
+
+
+def bootstrap_ci(values, n=2000, q=(5, 95), seed=0):
+    if len(values) < 2:
+        return (float("nan"), float("nan"))
+    rng = np.random.default_rng(seed)
+    meds = [np.median(rng.choice(values, len(values))) for _ in range(n)]
+    return tuple(float(np.percentile(meds, qq)) for qq in q)
+
+
 def _pair(results, extract, a="ff", b="mf"):
-    """Per-key difference extract(a) - extract(b) for keys recorded at both dynamics."""
     notes = {(r["pitch"], r["dynamic"]): r for r in results if not r.get("suspect")}
     return {p: extract(notes[(p, a)]) - extract(notes[(p, b)]) for (p, d) in notes if d == a and (p, b) in notes}
 
 
-def _lst(r, key, lo, hi):
-    return _median((r.get(key) or [])[lo:hi])
+def _profile(i):
+    return lambda r: (r.get("profile_db") or [float("nan")] * len(PROFILE_TIMES))[i]
 
 
 SUMMARY_ROWS = [
     ("inharmonicity B (reliable fits)", lambda r: r.get("B") if r.get("B_reliable") else None, ("pp", "mf", "ff"), "{:.2e}"),
     ("tuning, cents re ET", lambda r: r.get("cents"), ("pp", "mf", "ff"), "{:+.1f}"),
-    ("prompt T60, median partials 1-4 (s)", lambda r: _lst(r, "t60_prompt", 0, 4), ("mf", "ff"), "{:.1f}"),
-    ("aftersound T60, median partials 1-4 (s)", lambda r: _lst(r, "t60_after", 0, 4), ("mf", "ff"), "{:.0f}"),
-    ("aftersound knee, partials 1-4 (dB re peak)", lambda r: _lst(r, "after_level_db", 0, 4), ("mf", "ff"), "{:.0f}"),
-    ("aftersound knee, partials 5-8 (dB re peak)", lambda r: _lst(r, "after_level_db", 4, 8), ("mf", "ff"), "{:.0f}"),
+] + [(f"decay profile at {t:g} s (dB re peak)", _profile(i), ("mf", "ff"), "{:.0f}") for i, t in enumerate(PROFILE_TIMES)] + [
+    ("prompt T60, two-segment fit (s)", lambda r: r.get("t60_prompt"), ("mf", "ff"), "{:.1f}"),
+    ("aftersound T60, two-segment fit (s)", lambda r: r.get("t60_after"), ("mf", "ff"), "{:.0f}"),
+    ("knee, two-segment fit (dB re peak)", lambda r: r.get("knee_db"), ("mf", "ff"), "{:.0f}"),
     ("early spectral slope, mf (dB/oct)", lambda r: r.get("slope_db_oct"), ("mf",), "{:.0f}"),
     ("rise time 10-90 %, mf (ms)", lambda r: r.get("rise_ms"), ("mf",), "{:.0f}"),
 ]
@@ -402,12 +468,14 @@ def summarize(results):
 def report(rec, mod=None):
     lines = ["| quantity | source | " + " | ".join(LANDMARKS) + " |", "|---|---|" + "---|" * len(LANDMARKS)]
     srec, smod = summarize(rec), summarize(mod) if mod else None
-    for label, (vals, fmt) in srec.items():
+    for label in srec:
         for tag, t in (("recording", srec), ("model", smod)):
             if t is None:
                 continue
-            v, _ = t[label]
+            v, fmt = t[label]
             lines.append(f"| {label} | {tag} | " + " | ".join(fmt.format(v[k]) if np.isfinite(v[k]) else "-" for k in LANDMARKS) + " |")
+    counts = landmark_samples(rec, lambda r: r.get("t60_prompt"), ("mf", "ff"))
+    lines.append("| notes behind each decay value | recording | " + " | ".join(str(len(counts[k])) for k in LANDMARKS) + " |")
     return "\n".join(lines)
 
 

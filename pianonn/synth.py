@@ -88,7 +88,7 @@ class SympatheticBank(nn.Module):
     def __init__(self, cfg: PianoConfig):
         super().__init__()
         self.cfg = cfg
-        self.log_gain = nn.Parameter(torch.log(key_curve([(0, 0.08), (12, 0.12), (30, 0.15), (67, 0.15), (87, 0.10)])))
+        self.log_gain = nn.Parameter(torch.log(0.262 * key_curve([(0, 0.08), (12, 0.12), (30, 0.15), (67, 0.15), (87, 0.10)])))
 
     def _block(self, drive, es, freq, alpha, alpha_damp, gin, state):
         sr = self.cfg.sample_rate
@@ -153,14 +153,14 @@ class NoiseBank(nn.Module):
         nb = cfg.noise_bands
         centers = torch.logspace(math.log10(40), math.log10(cfg.sample_rate / 2), nb)
         self.register_buffer("centers", centers)
-        self.knock = nn.Parameter(_dark_bands(centers, 600.0, -5.07).repeat(N_KEYS, 1))
+        self.knock = nn.Parameter(_dark_bands(centers, 600.0, -4.78).repeat(N_KEYS, 1))
         self.knock_vel = nn.Parameter(torch.full((N_KEYS,), 4.2))  # noise grows ~13 dB less than the tone pp -> ff
         self.knock_log_tau = nn.Parameter(torch.log(key_curve([(0, 0.010), (40, 0.007), (87, 0.005)])))
         self.thump_log_gain = nn.Parameter(torch.tensor(math.log(0.7)))
         self.thump_log_tau = nn.Parameter(torch.tensor(math.log(0.008)))
-        self.release = nn.Parameter(_dark_bands(centers, 1500.0, -8.63).repeat(N_KEYS, 1))
+        self.release = nn.Parameter(_dark_bands(centers, 1500.0, -9.88).repeat(N_KEYS, 1))
         self.release_log_tau = nn.Parameter(torch.full((N_KEYS,), math.log(0.005)))
-        self.pedal = nn.Parameter(_dark_bands(centers, 800.0, -8.09))
+        self.pedal = nn.Parameter(_dark_bands(centers, 800.0, -9.09))
         self.pedal_log_tau = nn.Parameter(torch.tensor(math.log(0.03)))
         self._masks = {}
 

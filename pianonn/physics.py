@@ -22,6 +22,7 @@ String model (per key k, partial n, coupled mode m), evaluated in closed form:
 import math
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from .config import PianoConfig
@@ -47,16 +48,24 @@ def _p(*shape, value=0.0):
     return nn.Parameter(torch.full(shape, float(value)))
 
 
-HAMMER_ORDER_VEL = 0.2  # fitted to Hall, Five Lectures, Fig. 15 (C4 slopes pp/mf/ff)
-# roll-off order at mf per key: 2.1 at C4 from Hall; the rest fitted to the early spectral slope of the
-# Iowa Steinway B (radiated, near field) -- gentle in the bass, steep in the treble where the contact
-# outlasts half the string period (Askenfelt & Jansson, Five Lectures, Fig. 8)
-HAMMER_ORDER_MF = [(0, 1.5), (27, 1.5), (39, 2.1), (48, 1.9), (51, 2.6), (63, 3.2), (75, 4.5), (87, 4.5)]
+HAMMER_ORDER_VEL = 0.225  # with the C4 order 2.35: Hall, Five Lectures, Fig. 15 (C4 slopes pp/mf/ff at vel 30/64/110)
+# roll-off order at mf per key: C4 = 2.35 from Hall (whose fit also reproduces the Iowa C4 slope within 1 dB/oct);
+# elsewhere a smooth curve, rising from bass to treble, through orders fitted to the early spectral slope of the
+# Iowa Steinway B (near field, both channels) -- gentle in the bass, steep in the treble where the contact
+# outlasts half the string period (Askenfelt & Jansson, Five Lectures, Fig. 8). Instrument/microphone-
+# specific away from C4, hence the wide learnable bound on raw_order.
+HAMMER_ORDER_MF = [(0, 1.3), (27, 1.3), (39, 2.35), (48, 3.2), (51, 4.0), (63, 4.7), (75, 5.3), (87, 5.3)]
 
 
 def hammer_velocity(u):
-    """MIDI velocity / 127 -> hammer speed in m/s (about 0.4 at pp, 5.5 at fff)."""
-    return 5.5 * u.clamp(min=1e-3) ** 1.4
+    """MIDI velocity / 127 -> hammer speed in m/s.
+
+    Exponential, anchored so that the dynamic labels of Askenfelt & Jansson (Five Lectures,
+    Fig. 6) fall on the usual MIDI velocities: mf = 64 -> 2.8 m/s, f ~ 90 -> 5.1, ff ~ 115 -> 9.0,
+    p ~ 40 -> 1.6. So "mf" means the same thing everywhere (contact time, roll-off order,
+    key-bottom timing). The level-vs-velocity law is learned separately.
+    """
+    return 2.8 * torch.exp(0.023 * (127.0 * u - 64.0))
 
 
 def hammer_spectrum(f, tc, order=1.0):
@@ -68,7 +77,9 @@ def hammer_spectrum(f, tc, order=1.0):
     Fig. 15: -18 / -15 / -11 dB/oct at pp / mf / ff for C4). The ideal half-sine's nulls are
     replaced by the smooth envelope: measured pulses are skewed and their nulls are filled.
     """
-    return torch.rsqrt(1 + (f * tc / 0.59) ** (2 * order))
+    # log domain: (f tc / 0.59)^(2 order) overflows float32 for partials far above the corner
+    # (inf -> NaN gradient w.r.t. the order), even though those partials are masked out later
+    return torch.exp(-0.5 * F.softplus(2 * order * torch.log(f * tc / 0.59)))
 
 
 class PianoPhysics(nn.Module):
@@ -86,13 +97,15 @@ class PianoPhysics(nn.Module):
         self.register_buffer("prior_cents", key_curve(
             [(0, -16), (3, -15), (15, -4), (27, 0), (39, -1), (48, 0), (51, 0), (63, 6), (75, 14), (87, 25)]))
         self.register_buffer("prior_log_b1", torch.log(key_curve(
-            [(0, 0.062), (15, 0.067), (27, 0.118), (39, 0.216), (48, 0.25), (51, 0.30), (63, 0.40), (75, 0.6), (87, 1.0)])))
+            [(0, 0.101), (3, 0.101), (15, 0.126), (27, 0.171), (39, 0.23), (48, 0.248), (51, 0.332), (63, 0.6), (75, 0.583), (87, 1.5)])))
         self.register_buffer("prior_log_b3", torch.log(key_curve([(0, 2.5e-7), (20, 2.5e-7), (30, 1.2e-7), (55, 1.0e-7), (63, 5e-8), (87, 2.5e-8)])))
         self.register_buffer("n_strings", torch.where(k < 8, 1, torch.where(k < 26, 2, 3)))
-        # prompt/aftersound decay ratio at the fundamental (R) and aftersound amplitude per mode: solved from the
-        # decays and knee levels measured on the Iowa Steinway B (docs/calibration_iowa.md)
-        self.register_buffer("prior_prompt_ratio", key_curve([(0, 4.3), (15, 3.7), (27, 3.5), (39, 3.0), (48, 3.5), (63, 2.8), (75, 3.0), (87, 3.0)]))
-        self.register_buffer("prior_log_after", torch.log(key_curve([(0, 0.06), (20, 0.06), (27, 0.06), (36, 0.09), (48, 0.09), (55, 0.10), (63, 0.12), (75, 0.06), (87, 0.05)])))
+        # prompt/aftersound decay ratio R and aftersound amplitude per mode, fitted (with b1) to the decay profiles
+        # measured on the Iowa Steinway B (scripts/fit_decays.py, docs/calibration_iowa.md). A0 rests on 3 notes,
+        # so it takes C1's values. R ~ 12-17 mid-range: the in-phase mode of 3 strings loads the bridge ~3x
+        # harder than one string (Weinreich), so the prompt stage is fast and the aftersound much quieter.
+        self.register_buffer("prior_prompt_ratio", key_curve([(0, 6.15), (3, 6.15), (15, 7.67), (27, 8.26), (39, 12.2), (48, 14.7), (51, 17.3), (63, 5.1), (75, 7.1), (87, 5.4)]))
+        self.register_buffer("prior_log_after", torch.log(key_curve([(0, 0.11), (3, 0.11), (15, 0.154), (27, 0.076), (39, 0.042), (48, 0.025), (51, 0.04), (63, 0.04), (75, 0.006), (87, 0.007)])))
         # contact time at mf (2.8 m/s): Askenfelt & Jansson, Five Lectures, Fig. 7
         self.register_buffer("prior_log_tc", torch.log(1e-3 * key_curve(
             [(0, 3.7), (15, 3.0), (27, 2.8), (39, 2.1), (51, 1.45), (63, 1.1), (75, 0.6), (87, 0.5)])))
@@ -114,8 +127,13 @@ class PianoPhysics(nn.Module):
         self.raw_log_b1 = _p(N_KEYS)
         self.raw_log_b3 = _p(N_KEYS)
         self.raw_prompt = _p(N_KEYS)
-        unison_init = torch.tensor([0.6, -0.4, 0.2, -0.1])[: M - 1]
-        self.raw_unison = nn.Parameter(unison_init.repeat(N_KEYS, 1).clone())  # cents
+        # unison mistuning (cents) of the aftersound modes: 0.2-2 cents with random sign, drawn per key -- tuners'
+        # mistuning "varied randomly from note to note" (Kirk 1959, via Weinreich, Five Lectures). A shared pattern
+        # would line up the beat nulls of neighbouring keys.
+        g = torch.Generator().manual_seed(1234)
+        mag = 0.2 + 1.8 * torch.rand(N_KEYS, M - 1, generator=g) ** 2  # skewed towards small mistuning
+        sign = torch.where(torch.rand(N_KEYS, M - 1, generator=g) < 0.5, -1.0, 1.0)
+        self.raw_unison = nn.Parameter(5.0 * torch.atanh(mag * sign / 5.0))  # so that bounded(raw, 5) = mag * sign
         self.raw_after = _p(N_KEYS, M - 1)
         self.raw_strike = _p(N_KEYS)
         self.raw_log_tc = _p(N_KEYS)
@@ -204,7 +222,7 @@ class PianoPhysics(nn.Module):
 
         # excitation: bridge force = gain(v) * half-sine pulse spectrum * signed strike-position comb
         tc = self.contact_time(ki, u, soft, cond, ctx.get("log_fc"))
-        order = (torch.exp(self.prior_log_order[ki] + bounded(self.raw_order[ki], 0.5))
+        order = (torch.exp(self.prior_log_order[ki] + bounded(self.raw_order[ki], 0.9))
                  * (hammer_velocity(u) / 2.8) ** (-HAMMER_ORDER_VEL * torch.exp(bounded(self.raw_order_vel[ki], 0.7))))
         hammer = hammer_spectrum(fn, tc[..., None], order[..., None])
         x0 = self.prior_strike[ki] * torch.exp(bounded(self.raw_strike[ki], 0.5))

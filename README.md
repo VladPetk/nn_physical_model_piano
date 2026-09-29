@@ -120,17 +120,17 @@ recording calibration is in [`docs/calibration_iowa.md`](docs/calibration_iowa.m
 `python -m pianonn.calibration data/iowa`), and the current acceptance report is
 [`docs/diagnostics_prior.md`](docs/diagnostics_prior.md).
 `samples/` has renders of `samples/demo.mid`: `physics_prior_v1.wav` is the first guess and
-`physics_prior_v2.wav` is the first literature pass, `v3` has the review fixes, and `v4` is calibrated
-against the sourced literature and the Steinway recordings.
+`physics_prior_v2.wav` is the first literature pass, `v3` has the review fixes, `v4` is the v2
+calibration, and `v5` is the corrected v3 calibration (fast three-string prompt decay).
 
 ## Status
 
 The package runs end to end and has tests. The prior is calibrated against the literature (the KTH
 *Five Lectures on the Acoustics of the Piano*, arXiv and Zenodo papers) and against 260 recorded
 notes of a Steinway B, which are analysed with the same code as the model's renders
-([`docs/calibration_iowa.md`](docs/calibration_iowa.md)). It passes 62 of 65 acceptance checks;
-the three failures are a known limitation of the bass knee metric. Reviews are in
-[`docs/reviews/`](docs/reviews/). Gradients reach every
+([`docs/calibration_iowa.md`](docs/calibration_iowa.md)). It passes 47 of 50 acceptance checks.
+The three failures are treble decay profiles, whose targets are low-confidence. Reviews are in
+[`docs/reviews/`](docs/reviews/); review 2 found real errors in the v2 calibration, all fixed in v3. Gradients reach every
 physical parameter, block-wise rendering matches single-pass rendering, dampers, sustain,
 una corda and sympathetic resonance all behave as expected, and a student fitted to a
 perturbed teacher moves towards it. **It has not been trained on MAESTRO yet.**

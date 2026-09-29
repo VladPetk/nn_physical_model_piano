@@ -13,10 +13,11 @@ def test_student_moves_towards_teacher():
     cfg = small_cfg(use_noise=False)  # noise is stochastic; keep the check deterministic
     teacher = perturb_physics(NeuralPhysicalPiano(cfg), scale=0.3, seed=1).eval()
     student = NeuralPhysicalPiano(cfg)
-    data = SyntheticPerformances(cfg, seconds=0.5, max_notes=4, length=64)
+    data = SyntheticPerformances(cfg, seconds=0.5, max_notes=4, length=160)
     loader = DataLoader(data, batch_size=2, collate_fn=collate)
     loss_fn = MultiResolutionSTFTLoss(fft_sizes=(1024, 256, 64))
-    opt = torch.optim.Adam(param_groups(student, 1e-2))
+    # 3e-3 (training uses 1e-3): at 1e-2 the fast prompt decays and wide hammer-order bounds make 32 steps diverge
+    opt = torch.optim.Adam(param_groups(student, 3e-3))
     n = int(0.5 * cfg.sample_rate)
     fixed = collate([data[i] for i in range(100, 104)])
 
