@@ -17,9 +17,15 @@ import torch
 from .render import load_model
 
 KEYS = {"A0": 21, "C2": 36, "C4": 60, "A4": 69, "C6": 84, "C7": 96, "C8": 108}
-# fundamental T60 (prompt, aftersound) ranges exactly as in docs/physical_parameters.md, section 2
-T60_TARGETS = {"A0": ((25, 40), None), "C2": ((15, 20), (20, 30)), "C4": ((6, 8), (20, 35)), "A4": ((5, 6), (15, 30)),
-               "C6": ((2.5, 3.5), (8, 15)), "C7": ((1.5, 2.0), (3, 6)), "C8": ((0.7, 1.2), None)}
+# Measured on the Iowa Steinway B with pianonn.calibration (docs/calibration_iowa.md): robust medians over
+# partials 1-4 (mf + ff), smoothed +-3 semitones. Keys: prompt T60 s, aftersound T60 s, aftersound knee of the
+# fundamental dB re peak (partials 2-4 saturate in this fit, in recordings and model alike, so only partial 1 is
+# used; C1's -13 dB is an outlier between neighbours at -29/-28), early spectral slope at mf dB/oct, tuning
+# cents re A4.
+IOWA = {"A0": (26.4, 113, -29, -1, -16), "C1": (19.8, 110, None, 1.5, -15), "C2": (26.7, 93, -28, -3.5, -4),
+        "C3": (15.7, 51, -27, -4.7, 0), "C4": (10.3, 26, -25, -13.7, -1), "A4": (5.8, 18, -24, -17.3, 0),
+        "C5": (5.7, 14, -24, -25.8, 0), "C6": (5.0, 9.1, -16, -26.8, 6), "C7": (None, 4.6, -14, -32.6, 14)}
+IOWA_PITCH = {"A0": 21, "C1": 24, "C2": 36, "C3": 48, "C4": 60, "A4": 69, "C5": 72, "C6": 84, "C7": 96}
 
 
 def _variant(model, **flags):
@@ -120,30 +126,58 @@ def run(model):
     notes = {}
     for name, pitch in KEYS.items():
         for v in (40, 80, 120):
-            x = _render(dry, 12.0, [(pitch, 0.0, 12.0, v)])["audio"]
+            x = _render(dry, 3.0, [(pitch, 0.0, 3.0, v)])["audio"]
             meas, lev = _partials(x, sr, _model_freqs(model, pitch, v))
             f1 = meas[0]
-            after_alpha = model.physics.modes(torch.tensor([[pitch - 21]]), torch.tensor([[v / 127]]), torch.zeros(1, 1),
-                                             torch.tensor([9]))["alpha"][0, 0, 0, 1].item()
-            notes[(name, v)] = dict(f1=f1, B=_b_eff(meas), lev=lev - lev[0], t60p=_edc_t60(x, sr, f1),
-                                    t60a=6.91 / after_alpha,
+            notes[(name, v)] = dict(f1=f1, B=_b_eff(meas), lev=lev - lev[0],
                                     centroid=_centroid(x, sr), peak=20 * np.log10(np.abs(x).max() + 1e-15))
             r = notes[(name, v)]
             rows.append(f"| {name} | {v} | {f1:.2f} | {r['B']:.2e} | {' '.join(f'{d:+.0f}' for d in r['lev'][1:6])} | "
-                        f"{r['t60p']:.1f} | {r['t60a']:.1f} | {r['centroid']:.0f} | {r['peak']:.1f} |")
+                        f"{r['centroid']:.0f} | {r['peak']:.1f} |")
 
-    for name, (prompt, after) in T60_TARGETS.items():
-        r = notes[(name, 80)]
-        check(f"{name} prompt T60 (s)", r["t60p"], f"{prompt[0]}-{prompt[1]}", prompt[0] <= r["t60p"] <= prompt[1])
-        if after:  # analytic from the mode parameters: beating between aftersound modes defeats any fit
-            check(f"{name} aftersound T60, model (s)", r["t60a"], f"{after[0]}-{after[1]}", after[0] <= r["t60a"] <= after[1])
-    for name, target in (("C4", 3.8e-4), ("C6", 3.5e-3)):
+    # --- decays, knee, brightness and stretch vs the Iowa recordings, analysed by the same code ---
+    from .calibration import analyze_note
+
+    pre = int(0.3 * sr)
+    body = _variant(model, use_noise=False, use_sympathetic=False)
+    with torch.no_grad():
+        saved = body.room.log_gain.clone()
+        body.room.log_gain.fill_(-30.0)  # near-field recording: soundboard, no hall
+    measured = {}
+    for name, p in IOWA_PITCH.items():
+        n = int(45 * sr) + pre
+        x = _render(dry, n / sr, [(p, pre / sr, n / sr, 64)])["audio"]
+        x = x + 1e-7 * np.random.default_rng(p).standard_normal(len(x))  # a noise floor, as in a recording
+        r = analyze_note(x, sr, p)
+        y = _render(body, 1.5 + pre / sr, [(p, pre / sr, 1.5 + pre / sr, 64)])["audio"]
+        y = y + 1e-7 * np.random.default_rng(p).standard_normal(len(y))
+        r["slope_db_oct"] = analyze_note(y, sr, p).get("slope_db_oct", float("nan"))
+        measured[name] = r
+    with torch.no_grad():
+        body.room.log_gain.copy_(saved)
+    a4 = measured["A4"]["cents"]
+    for name, (prompt, after, knee, slope, cents) in IOWA.items():
+        r = measured[name]
+        med = lambda key, lo=0, hi=4: float(np.nanmedian(r.get(key, [np.nan])[lo:hi]))
+        if prompt:
+            v = med("t60_prompt")
+            check(f"{name} prompt T60, partials 1-4 (s)", v, f"{prompt} (x/1.35)", prompt / 1.35 <= v <= prompt * 1.35, "{:.1f}")
+        v = med("t60_after")
+        check(f"{name} aftersound T60, partials 1-4 (s)", v, f"{after} (x/1.35)", after / 1.35 <= v <= after * 1.35, "{:.1f}")
+        if knee is not None:
+            v = r.get("after_level_db", [np.nan])[0]
+            check(f"{name} aftersound knee of the fundamental (dB re peak)", v, f"{knee} +-4", abs(v - knee) <= 4, "{:.0f}")
+        v = r["slope_db_oct"]
+        check(f"{name} early spectral slope, mf, radiated (dB/oct)", v, f"{slope} +-5", abs(v - slope) <= 5, "{:.1f}")
+        v = r["cents"] - a4
+        check(f"{name} tuning re A4 (cents)", v, f"{cents:+d} +-4", abs(v - cents) <= 4, "{:+.1f}")
+
+    for name, target in (("C4", 3.3e-4), ("C6", 2.85e-3)):  # Rigaud et al. (DAFx 2011)
         b = notes[(name, 80)]["B"]
-        check(f"{name} effective B", b, f"{target:.1e} (x1.5)", target / 1.5 <= b <= target * 1.5)
-    lev = notes[("C4", 80)]["lev"]
-    check("C4 mf partials 2-6 re p1 (dB)", " ".join(f"{d:+.0f}" for d in lev[1:6]), "-30..+3",
-          bool(np.all((lev[1:6] >= -30) & (lev[1:6] <= 3))))
-    check("C4 mf partial 10 re p1 (dB)", lev[9], "<= -30", lev[9] <= -30, "{:+.0f}")
+        check(f"{name} effective B (Rigaud et al.)", b, f"{target:.2e} (x1.5)", target / 1.5 <= b <= target * 1.5)
+    for name, target in (("C2", 1.19e-4), ("C4", 3.04e-4)):  # measured on the Iowa Steinway B
+        b = measured[name]["B"]
+        check(f"{name} effective B (Iowa, x2: bass is piano-specific)", b, f"{target:.2e} (x2)", target / 2 <= b <= target * 2)
     ratio = notes[("C4", 120)]["centroid"] / notes[("C4", 40)]["centroid"]
     check("C4 centroid vel120 / vel40", ratio, "1.1-2", 1.1 <= ratio <= 2.0, "{:.2f}")
     for name in ("C2", "C4", "C6", "C7"):
@@ -197,12 +231,17 @@ def run(model):
     w = slice(int(0.5 * sr), int(0.6 * sr))
     lvl = _rms_db(out["noise"][w]) - _rms_db(out["strings"][w])
     check("pedal-press noise re mf note (dB)", lvl, "-35 +-5", abs(lvl + 35) <= 5, "{:.0f}")
+    # at f/ff the key bottoms out a few ms *before* the hammer reaches the string (Askenfelt & Jansson,
+    # Figs. 4-5), so sound in the last 6 ms before the strike is correct; nothing earlier should sound
     x = _render(no_symp, 1.0, [(60, 0.2, 0.8, 100)])["noise"]
-    pre = float((x[: int(0.2 * sr)] ** 2).sum() / ((x**2).sum() + 1e-30))
-    check("noise energy before the hammer strikes (fraction)", pre, "< 0.01", pre < 0.01, "{:.3f}")
+    pre = float((x[: int(0.194 * sr)] ** 2).sum() / ((x**2).sum() + 1e-30))
+    check("noise energy > 6 ms before the hammer strikes (fraction)", pre, "< 0.01", pre < 0.01, "{:.3f}")
+    ff = _render(no_symp, 1.0, [(60, 0.2, 0.8, 127)])["noise"]
+    early = float((ff[int(0.194 * sr): int(0.2 * sr)] ** 2).sum() / ((ff**2).sum() + 1e-30))
+    check("ff: key-bottom thump before the hammer (fraction of noise energy)", early, "> 0.005", early > 0.005, "{:.3f}")
 
-    table = ["| key | vel | f1 Hz | B_eff | partials 2..6 dB re f1 | T60 prompt s (EDC) | T60 after s (model) | centroid Hz | peak dBFS |",
-             "|---|---|---|---|---|---|---|---|---|"] + rows
+    table = ["| key | vel | f1 Hz | B_eff | partials 2..6 dB re f1 | centroid Hz | peak dBFS |",
+             "|---|---|---|---|---|---|---|"] + rows
     acc = ["| check | measured | target | result |", "|---|---|---|---|"] + [f"| {a} | {b} | {c} | {d} |" for a, b, c, d in checks]
     n_pass = sum(c[3] == "PASS" for c in checks)
     return "\n".join(["## Isolated notes (dry strings)", "", *table, "",

@@ -1,150 +1,144 @@
-# Physical parameters: requirements
+# Physical parameters: requirements (v2)
 
-This is the spec the physics prior (`pianonn/physics.py`, `pianonn/synth.py`) must meet before
-any MAESTRO fitting. It condenses two literature reviews, kept verbatim in
-[`literature/strings_hammer.md`](literature/strings_hammer.md) and
-[`literature/body_dampers_pedals.md`](literature/body_dampers_pedals.md).
+This is the spec the physics prior (`pianonn/physics.py`, `pianonn/synth.py`, `pianonn/room.py`)
+must meet before any MAESTRO fitting. v2 replaces most of v1's from-memory values with
+values taken from two kinds of source:
 
-**Evidence level.** The reviewers could search the web but could not open papers (fetch was
-blocked). Values are tagged:
-- **S**: confirmed by a search snippet or abstract.
+- **Literature, read.** The KTH *Five Lectures on the Acoustics of the Piano* (Conklin, Askenfelt &
+  Jansson, Hall, Weinreich, Wogram), arXiv papers (Ege & Boutillon et al.) and Zenodo papers
+  (DDSP-Piano, Bank et al., Bader & Plath). See [`literature/round2_sourced.md`](literature/round2_sourced.md).
+  The round-1 reviews, which were memory-based, are kept in [`literature/`](literature/) for history.
+- **Measurement.** 260 isolated notes (pp/mf/ff) of the University of Iowa Steinway model B,
+  close-miked, analysed with `pianonn/calibration.py`. The model's rendered notes go through the
+  same code. See [`calibration_iowa.md`](calibration_iowa.md).
+
+Evidence tags:
+- **L**: read in a source (pointer given).
+- **I**: measured on the Iowa recordings.
 - **D**: derived from stated physics.
-- **M**: from memory or engineering judgement.
+- **M**: memory or engineering judgement (still unsourced).
 
-Everything here is a *prior*. Each value gets a bounded learned offset and is refined on
-data. Where the two reviews disagreed or were internally inconsistent, the decision is noted.
+Everything is a *prior*. Each value gets a bounded learned offset that MAESTRO fitting will
+refine. The Iowa piano is a 6'11" Steinway B, not the MAESTRO Yamaha Disklaviers. So
+per-instrument quantities are priors to be re-fitted per MAESTRO year (inharmonicity in the
+bass, stretch, decays), while mechanisms and shapes transfer.
 
-Key index `k = MIDI - 21`. Landmarks: A0 = 0, C2 = 15, C3 = 27, C4 = 39, A4 = 48, C6 = 63,
-C7 = 75, C8 = 87. Point lists are `key_curve` inputs, `(k, value)`.
+Key index `k = MIDI - 21`. Landmarks: A0 = 0, C1 = 3, C2 = 15, C3 = 27, C4 = 39, A4 = 48,
+C5 = 51, C6 = 63, C7 = 75, C8 = 87. Point lists are `key_curve` inputs, `(k, value)`.
 
-## 1. Why the prior sounds like a toy guitar (combined ranking)
-
-1. **No soundboard body and no hall.** The IR is a delta plus a 0.8 s white tail.
-2. **Hammer spectrum too bright.** It rolls off at -9 dB/oct from cutoffs up to 3.5 kHz; the
-   real force pulse is -12 dB/oct from a few hundred Hz. The cutoff also moves 5.4× with
-   velocity instead of 1.5–2×.
-3. **Bass fundamentals too strong.** There is no radiation high-pass around 60–70 Hz, where a
-   real piano radiates A0–C2 fundamentals 15–30 dB below partials 3–8.
-4. **Decay shape wrong.** Decays are too short, and the double decay is too weak and comes too
-   early.
-5. **Attack noise wrong.** The knock is near-white and 3–6× too long (a click rather than a
-   thud).
-6. **Smaller items:**
-   - flat damper rate;
-   - strike position constant across the keyboard;
-   - 64 partials cap the bass at about 2.6 kHz;
-   - treble inharmonicity 3–6× too low;
-   - weak una corda and a weak pedal halo.
-
-## 2. Strings
+## 1. Strings
 
 | parameter | prior | evidence |
 |---|---|---|
-| Inharmonicity B, log10 | `(0,-3.52) (6,-3.66) (14,-3.85) (22,-3.96) (29,-3.92) (33,-3.70) (39,-3.42) (48,-3.07) (56,-2.74) (63,-2.46) (75,-2.00) (87,-1.55)`. That is B = 3e-4 at A0, 1.1e-4 minimum at the bass break, 3.8e-4 at C4, 3.5e-3 at C6 and 2.8e-2 at C8. | Shape S (Rigaud 2013); values D/M. The reviewer proposed 4e-2 at C8; the string-scale formula gives 2–3e-2, so the decision is -1.55. |
-| Stretch, cents | `(0,-30) (12,-18) (24,-8) (36,-3) (48,0) (60,5) (72,13) (84,25) (87,30)` | M (Railsback) |
-| Strings per key | 1 for k < 8, 2 for k < 26, 3 above | M, ±2 keys |
-| Unison mistuning | 0.2–2 cents, same in cents for all partials (so beats grow with n). Keep the current (+0.6, -0.4) init. | M (Weinreich, Kirk) |
-| Aftersound decay b1 (1/s) | `(0,0.17) (15,0.25) (27,0.22) (39,0.25) (48,0.30) (63,0.55) (75,0.70) (87,1.3)` | Refit so the rendered notes land in the measured T60 table below |
-| Loss b3 (1/s per Hz²) | 2.5e-7 for k < 20 (wound strings), 1.2e-7 for k ≥ 30 | M (Chaigne & Askenfelt 1994) |
-| Prompt (in-phase) extra bridge loss | **Additive**: α_prompt,n = α_after,n + (R − 1)·b1, with R = 1.5 for monochords, 1.7 for bichords, ramping 2.5 → 4 from k = 26 to 39, then 4. The bichord value follows from the C2 targets below (15–20 s prompt against 20–30 s aftersound); the reviewer's rough 2–4 contradicts them. | S (Weinreich: 8 dB/s vs < 2 dB/s). The additive form is D. It replaces the current multiplicative ratio, which made high partials decay far too fast. |
-| Aftersound amplitude per mode | `(0,0.10) (39,0.06) (87,0.06)`, i.e. the knee sits 20–35 dB down | M |
+| Inharmonicity B | B(m) = exp(0.0926 m − 13.64) + exp(−0.0847 m − 5.82), m = MIDI pitch: 5.1e-4 at A0, minimum 1.4e-4 near k = 23, 3.3e-4 at C4, 2.85e-3 at C6, 2.6e-2 at C8 | **L**: Rigaud, David & Daudet (DAFx 2011), as used by DDSP-Piano (Zenodo 8386706, eq. 4). **I** agrees from C4 to C5 within 10 %. The Iowa bass is 1.3–2× lower, and the bass asymptote is piano-specific per Rigaud. |
+| Stretch (cents re A4, of the *sounding* fundamental f₁ = f₀√(1+B)) | `(0,-16) (3,-15) (15,-4) (27,0) (39,-1) (48,0) (51,0) (63,6) (75,14) (87,25)` | **I** (C8 extrapolated). v1's memory-based Railsback curve (−30 / +25 at A0 / A7) was about twice as wide. Tuners tune what sounds, so the model computes f₀ = f₁/√(1+B). |
+| Strings per key | 1 for k < 8, 2 for k < 26, 3 above | **L** only "except the lowest octave" (Bank et al.); break points M |
+| Unison mistuning | 0.2–2 cents, same in cents for all partials. Strings lock (no beats) below about 0.3 Hz of mistuning (mid-range). | **L**: Weinreich, *mistuned.html*, Fig. 8 |
+| Aftersound loss b1 (1/s) | `(0,0.062) (15,0.067) (27,0.118) (39,0.216) (48,0.25) (51,0.30) (63,0.40) (75,0.6) (87,1.0)` | **I**, solved from the measured aftersound T60s |
+| Loss b3 (per Hz²) | `(0,2.5e-7) (20,2.5e-7) (30,1.2e-7) (55,1.0e-7) (63,5e-8) (87,2.5e-8)` | M in the bass and mid; **I** requires it to fall in the treble, otherwise b1 < 0 |
+| Prompt (in-phase) mode | **Additive** bridge loss: α_prompt,n = α_after,n + (R − 1)·b1. R = `(0,4.3) (15,3.7) (27,3.5) (39,3.0) (48,3.5) (63,2.8) (75,3.0) (87,3.0)` | Form **L**: Weinreich (in-phase string motion loads the bridge; single-string 8 dB/s vs < 2 dB/s) and Ege & Boutillon (mean bridge mobility roughly frequency-independent, so the extra loss does not depend on n). R is **I**. v1's R = 1.5–1.7 in the bass gave no knee; the recordings show a clear two-stage decay in the bass too. |
+| Aftersound amplitude per mode | `(0,0.06) (20,0.06) (27,0.06) (36,0.09) (48,0.09) (55,0.10) (63,0.12) (75,0.06) (87,0.05)` | **I**, fitted to the measured aftersound T60 and knee (see section 6) |
+| Double decay on all partials | kept for every partial | **I** contradicts the claim that it is "mostly the lowest harmonics" (Bank et al.): mid-range partials 5–8 show a *stronger* aftersound (knee about −13 dB) than partials 1–4 |
 
-Target fundamental T60s the prior must reproduce (M). Values are prompt / aftersound:
+Measured decays the prior must reproduce (**I**; medians over partials 1–4, mf and ff):
 
-| key | A0 | C2 | C3 | C4 | A4 | C6 | C7 | C8 |
-|---|---|---|---|---|---|---|---|---|
-| T60 (s) | 25–40 | 15–20 / 20–30 | 10–15 / 25–40 | 6–8 / 20–35 | 5–6 / 15–30 | 2.5–3.5 / 8–15 | 1.5–2 / 3–6 | 0.7–1.2 |
+| key | A0 | C1 | C2 | C3 | C4 | A4 | C5 | C6 | C7 | C8 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| prompt T60 (s) | 26 | 20 | 27 | 16 | 10 | 5.8 | 5.7 | 5.0 | – | – |
+| aftersound T60 (s) | 113 | 110 | 93 | 51 | 26 | 18 | 14 | 9.1 | 4.6 | 3.1 |
 
-Partial 10 of C4 should have T60 of about 3–4 s.
+Notes on the table:
+- v1's memory-based table was wrong in the bass: it had the aftersound at 20–30 s where the
+  measured values are about 100 s, and no knee.
+- The mid-range agrees with Weinreich's single-string E♭4: prompt 8 dB/s and aftersound
+  1.8 dB/s, i.e. T60 7.5 s and 33 s (**L**).
+- These are *effective* decays: what an analysis reports, beating included. The recordings and
+  the model are measured with the same code.
 
-Measurement convention: these are *effective* decays, i.e. what an analysis of a recording
-reports, including beating. Diagnostics measure the prompt T60 from the energy decay curve
-(−3 to −13 dB) of the fundamental. In the treble the aftersound modes beat against the prompt
-mode within the first half-second, so the measured early decay is shorter than 6.91/α_prompt
-(C7: 1.65 s measured against 2.0 s analytic). The b1 prior is tuned so the *measured* values
-land in range, as they would on a real piano.
+Phase 2 (not implemented; there are no data to check against yet):
+- pitch glide at *ff*;
+- longitudinal modes at 12–20× f₀ (**L**: Conklin, *longitudinal.html*, Fig. 32; the E1 string's
+  longitudinal mode at about 600 Hz is about 20 dB below its neighbouring partials). v1's
+  k·c_L/(2L) estimate was 3× too high in the bass.
+- phantom partials.
 
-Phase 2 (low confidence, all D/M; do not implement until there are data to check against):
-- pitch glide at *ff* (1–5 cents, time constant 1/(2α_prompt));
-- longitudinal modes at k·c_L/(2L) (A0 about 1.3 kHz, C4 about 4.1 kHz);
-- phantom partials at f_n + f_m (-30 to -45 dB at mf, amplitude scaling with v²).
-
-## 3. Hammer and excitation
+## 2. Hammer and excitation
 
 | parameter | prior | evidence |
 |---|---|---|
-| Bridge-force partial amplitude | a_n ∝ **sin**(nπx₀/L) · \|F̂(f_n)\|. No 1/n (that factor belongs to displacement). Keep the sign; do not take abs. `strings` is therefore a bridge-force signal. | D (standard; Hall) |
-| Force spectrum | Smooth envelope of a half-sine pulse of length T_c: \|F̂(f)\| = 1/sqrt(1 + (fT_c/0.59)⁴), i.e. -3 dB at 0.59/T_c then -12 dB/oct. **Deliberate deviation**: the reviewers proposed the ideal half-sine with nulls filled to ε = 0.15. That form divides by zero at fT_c = 0.5, and its nulls slide across partials as T_c changes, so brightness falls with velocity in the treble (measured at C6). Real pulses are skewed and their nulls are largely filled, so the smooth envelope is the better prior. | D; pulse shape S (Askenfelt) |
-| Contact time T_c at mf (ms) | `(0,3.5) (15,3.0) (27,2.4) (39,1.9) (51,1.5) (63,1.1) (75,0.8) (87,0.6)` | S (about 2 ms typical); per-key values M |
-| Velocity dependence | Hammer speed v_h = 5.5·(vel/127)^1.4 m/s, so about 0.4 m/s at pp and 5.5 m/s at fff. T_c = T_c,mf·(v_h/2)^(−0.25). | S (1–5 m/s, T_c ±20 % p→ff); exponent D/M |
-| Level vs velocity | Keep the learned dB slope, about 40 dB across the MIDI range, per key. | S (Goebl: roughly linear in dB, pitch-dependent) |
-| Strike position x₀/L | `(0,0.125) (15,0.12) (27,0.115) (39,0.11) (48,0.105) (56,0.095) (63,0.088) (75,0.075) (87,0.06)` | S (Conklin: just under 1/8 in the bass, 1/12–1/17 at the top) |
-| Attack | Partials ramp in over T_c (raised cosine), phase referenced to the pulse centre (T_c/2), instead of starting all partials at full amplitude at the onset | D |
-| Partial count | 96. A0 then reaches about 5 kHz once inharmonic stretch is included. | Bandwidth argument |
+| Bridge-force partial amplitude | a_n ∝ **sin**(nπx₀/L)·\|F̂(f_n)\|, signed, with no 1/n | D (standard). **L**: Hall's C4 spectrum has the strike-position dip at n = 8 (*compare.html*, Fig. 15) |
+| Strike position x₀/L | `(0,0.122) (27,0.122) (39,0.121) (49,0.115) (54,0.108) (59,0.100) (69,0.090) (79,0.075) (87,0.065)` | **L**: Conklin, *whereshould.html*, Fig. 11 (contemporary grand) |
+| Contact time T_c at mf (2.8 m/s), ms | `(0,3.7) (15,3.0) (27,2.8) (39,2.1) (51,1.45) (63,1.1) (75,0.6) (87,0.5)` | **L**: Askenfelt & Jansson, *stricont.html*, Fig. 7 |
+| T_c vs hammer speed | T_c = T_c,mf·(v_h/2.8)^−0.2, with v_h = 5.5·(vel/127)^1.4 m/s | **L**: slope −0.19 at C4 (Askenfelt Fig. 6). The v_h map is M; MAESTRO fits the level law. |
+| Force spectrum | Smooth envelope \|F̂\| = (1 + (fT_c/0.59)^(2q))^−½: −3 dB at 0.59/T_c, then −6q dB/oct. The ideal half-sine's nulls are not modelled: they slide across partials with T_c and made treble brightness fall with velocity. | D; pulse shape **L** (Hall Fig. 18: smooth, slightly skewed bells) |
+| Roll-off order q at mf | `(0,1.5) (27,1.5) (39,2.1) (48,1.9) (51,2.6) (63,3.2) (75,4.5) (87,4.5)` | C4 = 2.1 is **L**: Hall Fig. 15, C4 slopes −18 / −15 / −11 dB/oct at pp / mf / ff; the model gives −17.8 / −14.2 / −11.9. The rest is **I**: early spectral slope of the radiated near-field sound. It is gentle in the bass and steep in the treble, where the contact outlasts half the string period (**L**: Askenfelt Fig. 8). |
+| q vs hammer speed | q = q_mf·(v_h/2.8)^−0.2: harder blows drive the felt into its stiff, nonlinear range and sharpen the pulse | **L**: Hall (felt exponent p = 2.2 bass → 3 treble, Fig. 20). The exponent is fitted to Hall's C4 slopes. **I**: mf→ff centroid ×1.22 at C4/A4 (model ×1.21). |
+| Level vs velocity | learned dB slope, about 40 dB across the MIDI range | **L**: 33 dB pp→ff on the pianist-accessible scale (Askenfelt, *keybott.html*, Fig. 5). Iowa's dynamics carry no MIDI velocities, so MAESTRO calibrates this. |
+| Attack | Partials ramp in over T_c, with phases referenced to the pulse centre | D. The slower rise measured in the recordings (8–16 ms mid-range) comes mainly from soundboard build-up: the model with its body gives 20 ms at C4 and 11 ms at C6, against 13 and 9 ms measured. |
+| Partial count | 96 | Bass bandwidth (**L**: the C2 spectrum reaches about 4 kHz at mf, Askenfelt) |
 
-## 4. Soundboard, radiation and room (one set per MAESTRO year)
+## 3. Soundboard, radiation and room (one set per MAESTRO year)
 
 - **Body FIR** (0.3 s, learnable), initialised from:
-  - Magnitude envelope, as `(Hz, dB)` points: `(20,-40) (30,-30) (40,-20) (55,-10) (70,-4) (100,0) (1000,0) (2000,-1) (4000,-3) (8000,-7) (11000,-12)`. (S: first mode 60–70 Hz; the rest D/M.)
-  - Below 1.1 kHz: about 0.07 modes/Hz with random amplitudes and loss factor η = 0.02, i.e. T60 = 2.2/(ηf): 1.1 s at 100 Hz, 0.11 s at 1 kHz. Above 1.1 kHz: diffuse noise with the same T60(f). (S: η 1–3 %, plate-to-rib-strip transition at 1.1 kHz.)
-  - A 3 ms pre-delay, so learned alignment can move either way.
-- **Body and hall are in series**: `ir = body ⊛ (δ + hall)`. The hall hears what the soundboard radiates, so the 60–70 Hz radiation high-pass shapes the reverberant field too. (A parallel sum let the hall bypass the high-pass: the response at 27.5 Hz was only -4.5 dB instead of about -35 dB.)
-- **Hall** (parametric, learnable per year): an octave-band noise tail with T60 per band starting from `(125,2.0) (250,1.8) (500,1.7) (1k,1.6) (2k,1.45) (4k,1.2) (8k,0.8)` s, onset at about 20 ms, direct-to-reverberant ratio about 0 dB, total length 2.5 s. (M; the venues are undocumented.)
-- **Why parametric:** 7 T60s and 7 gains per year are far more identifiable than 24k free FIR taps.
+  - Measured low modes of a 2.90 m concert grand at 62, 90, 105, 127, 187, 222, 245 and 325 Hz (**L**: Wogram, *modal.html*).
+  - Above them, random modes at 0.07 modes/Hz up to the plate/rib-strip transition at 1.35 kHz (**L**: Steinway D model, Boutillon et al., arXiv 1210.3948).
+  - Loss factor η = 0.02, i.e. T60 = 2.2/(ηf), capped at T60 0.7 s. The finished grand soundboard T60 is about 0.6 s (**L**: Bader & Plath 2020); v1's cap of 1.7 s made low modes ring and bass attacks swell.
+  - Diffuse response above the transition.
+  - Magnitude envelope `(20,-40) (30,-30) (40,-20) (55,-10) (70,-4) (100,0) (1000,0) (2000,-3) (4000,-6) (8000,-11) (11000,-15)` dB. The low-frequency corner comes from the first mode near 60 Hz (**L**); the high-frequency droop follows Wogram Fig. 5 (upright; low confidence).
+  - A 3 ms pre-delay.
+- **Body and hall are in series**: `ir = body ⊛ (δ + hall)`.
+- **Hall** (parametric, learnable per year): octave-band noise with T60 `(125,2.0) (250,1.8) (500,1.7) (1k,1.6) (2k,1.45) (4k,1.2) (8k,0.8)` s, direct-to-reverberant ratio about 0 dB, 2.5 s long. M: the MAESTRO paper says only that the "microphone setup varied between competition years"; DDSP-Piano likewise learns one reverb per recording environment.
 
-## 5. Dampers and pedals
+## 4. Dampers and pedals
 
 | parameter | prior | evidence |
 |---|---|---|
-| Undamped keys | Dampers up to k = 67 (E6). Soft edge: full strength to k = 62, 0.3 at k = 67, none from k = 68. Verify the boundary on MAESTRO. | M |
-| Damper rate at partial 1 (1/s) | `(0,8) (12,10) (24,14) (36,20) (48,28) (60,36) (67,40)`, i.e. released A0 lingers about 0.9 s and A4 dies in about 0.25 s | M |
-| Damper rate vs partial | α_d,n = α_d1 · min(n, 6)^0.6 | D/M |
-| Sustain lift | Logistic, θ = 0.42, width 0.06. Damping scales with (1 − lift)^2.5 rather than linearly. | M; half-pedalling S (Lehtonen 2009) |
-| Damper delay after note-off | +15 ms, fixed (`PianoConfig.damper_delay`). **Deviation**: it acts through hard frame-level key timing, which has no gradient, so instead of learning it we calibrate it per year from MAESTRO (section 8). | M |
-| Sostenuto (CC66) | Latch the dampers of keys held at the moment the pedal crosses 0.5 upward; hold them until the pedal falls. Engagement = (1 − key_down)·(1 − lift)^2.5·(1 − latch). Known approximation: if a training window starts with the pedal already down, the latch takes the keys held at the window start (the true press happened earlier). The 1 s warm-up before the loss region absorbs most of this. | Standard mechanics |
-| Una corda gain (dB) | 0 for monochords, −2 for bichords, −3.5 for trichords | D |
-| Una corda aftersound multiplier | ×1 for monochords, ×5 for bichords, ×3.5 for trichords; brightness ×0.7 | D (strike-vector geometry) |
-| Sympathetic resonance | All 88 keys × 4 partials; each key's damper state controls its decay. Drive ∝ the string's bridge-coupling rate κ = α_prompt − α_after (reciprocity: it gains energy through the bridge at the rate it loses it), so the resonant gain is G·κ/α, the bridge's share of the string's losses. (An earlier √α drive was wrong: it made the gain vary as 1/√α across the register.) Exclude each key's own strings from its drive. Target halo about -25 to -40 dB re the struck partial. | D (coupled modes); S (Lehtonen 2007) |
+| Undamped keys | full damper strength up to k = 62, 0.3 at k = 67, none from k = 68 | M. Verify on MAESTRO. |
+| Damper rate at partial 1 (1/s) | `(0,8) (12,10) (24,14) (36,20) (48,28) (60,36) (67,40)`; α_d,n = α_d1·min(n, 6)^0.6 | M. **L** consistency check: C4 broadband after damper contact is about 290–500 dB/s (Askenfelt, *measure.html*, Fig. 3); the prior gives about 510 dB/s for n ≥ 6. |
+| Damper delay after note-off | +15 ms, fixed | **L**: first damper contact about 18 ms after the finger releases (Askenfelt Fig. 3). Not learnable (hard key timing), so it is calibrated per year on MAESTRO. |
+| Sustain lift | logistic, θ = 0.42, width 0.06; damping ∝ (1 − lift)^2.5 | M; half-pedalling exists (**L**: Lehtonen et al. 2009, as quoted) |
+| Sostenuto | latch the keys held when CC66 crosses 0.5, until it drops; approximate at the start of a training window | Standard mechanics. **L**: CC64/66/67 are present in the MAESTRO MIDI (DDSP-Piano). |
+| Una corda | gain 0 / −2 / −3.5 dB (1 / 2 / 3 strings); aftersound ×1 / ×5 / ×3.5; brightness via T_c ×1.43 | D (strike-vector geometry) |
+| Sympathetic resonance | 88 keys × 4 partials; drive ∝ κ = α_prompt − α_after; each key's own strings excluded. **Off by default**: it costs about 90 % of a CPU training step. | D; **L** (Lehtonen 2007, Weinreich) |
 
-## 6. Mechanical noises
+## 5. Mechanical noises
 
 | event | timing | spectrum and envelope | level |
 |---|---|---|---|
-| Hammer / soundboard knock | at onset | Flat to 600 Hz, then -12 dB/oct. Amplitude time constant 10 ms (bass) to 5 ms (treble). | about -25 dB (ff) to -12 dB (pp) re the tone over the first 60 ms (M) |
-| Key-bottom thump | onset + 12 ms at pp, −3 ms at ff, linear in v_h | Same dark spectrum, τ ≈ 8 ms | M |
-| Damper / release noise | note-off + damper delay | Low-passed around 1.5 kHz, τ ≈ 5 ms | M |
-| Pedal noise | when lift changes; amplitude ∝ \|d lift/dt\| | Low-passed around 800 Hz, τ ≈ 30 ms | about -35 dB (M) |
+| Hammer / soundboard knock | at the strike | flat to 600 Hz, −12 dB/oct above; τ 10 → 5 ms (bass → treble) | −25 dB (ff) to −12 dB (pp) re the tone over the first 60 ms (M, consistent with an informal −25 dB measurement on a KTH sound example) |
+| Key-bottom thump | re the strike: +12 ms (p), +0.5 (mf), −2.5 (f), −5 ms (ff) | same spectrum, τ 8 ms | M |
+| Damper noise | note-off + damper delay | low-passed at 1.5 kHz, τ 5 ms | −40 dB re the released note (M) |
+| Pedal noise | when the damper rail moves | low-passed at 800 Hz, τ 30 ms | −35 dB re an mf note (M) |
 
-Timing is S (Askenfelt & Jansson); levels and spectra are M.
+Key-bottom timing is **L** (Askenfelt & Jansson, *keybott.html*, Figs. 4–5). At f/ff the key
+bottoms out *before* the hammer reaches the string, so a few milliseconds of sound before
+the strike are correct.
 
-Noises are rendered in the time domain (band-split white noise under sample-accurate
-envelopes), so the 5–10 ms decays and the thump timing are realised exactly and nothing
-sounds before the hammer. An STFT-based version put 36% of the knock's energy before the
-onset. Band levels are spectral densities, and the initial constants are calibrated so the
-levels above hold at C4 (checked by diagnostics).
+Not modelled yet, from **L**:
+- a 20–30 ms touch precursor before struck (staccato) notes;
+- hammer-shank resonances in the knock (about 250 Hz mid-range).
 
-## 7. Acceptance checks (`python -m pianonn.diagnostics`)
+## 6. Acceptance checks (`python -m pianonn.diagnostics`, report in [`diagnostics_prior.md`](diagnostics_prior.md))
 
-The ranges are exactly those of this document; the current report is in
-[`diagnostics_prior.md`](diagnostics_prior.md).
+Against the Iowa recordings, analysed identically, at A0, C1, C2, C3, C4, A4, C5, C6 and C7:
 
-1. Prompt T60 of the fundamental (energy-decay-curve fit) inside the section 2 ranges at A0, C2, C4, A4, C6, C7 and C8.
-   Aftersound T60 at C2, C4, A4, C6 and C7 is read from the model's mode parameters and labelled as such:
-   beating between the aftersound modes makes a render-based fit meaningless.
-2. Measured effective B at C4 is within 1.5× of 3.8e-4; at C6 within 1.5× of 3.5e-3.
-3. At C4 mf, partials 2–6 fall roughly 0 to -30 dB re partial 1, and partial 10 is ≤ -30 dB.
-4. Brightness (spectral centroid) rises monotonically with velocity at C2, C4, C6 and C7; at C4 it rises 1.1–2× from vel 40 to vel 120.
-5. In the radiated signal, A0 and C2 fundamentals sit ≥ 10 dB below their strongest partial.
-6. Released-note decay to -60 dB: A0 ≥ 0.5 s, A4 0.2–0.4 s. C8 released and held are identical (undamped).
-7. The pedal halo is -25 to -40 dB re the strings with pedal, and at least 10 dB weaker without.
-8. Noise: knock -25 ± 3 dB (ff) and -12 ± 3 dB (pp) re the tone; damper noise -35 to -45 dB re the released note;
-   pedal-press noise -35 ± 5 dB re an mf note; under 1 % of the noise energy before the hammer strikes.
+1. Prompt T60 and aftersound T60 (medians over partials 1–4) within ×/÷1.35.
+2. Aftersound knee **of the fundamental** within ±4 dB. For partials 2–4 the knee fit saturates at about −13 to −16 dB, in the recordings and the model alike, so they are not used.
+3. Early spectral slope at mf, radiated through the soundboard body, within ±5 dB/oct.
+4. Stretch re A4 within ±4 cents.
 
-## 8. Data-driven calibration once MAESTRO is available (both reviews recommend this)
+Against the literature and physics:
 
-- Calibrate the damper delay after note-off per year.
+5. Effective B within ×1.5 of Rigaud at C4 and C6, and within ×2 of Iowa at C2 and C4.
+6. Brightness rises monotonically with velocity at C2, C4, C6 and C7; the C4 centroid rises 1.1–2× from vel 40 to vel 120.
+7. A0 and C2 radiated fundamentals are ≥ 10 dB below their strongest partial.
+8. Damper release; C8 undamped; pedal halo (bank switched on for the check).
+9. Noise levels as in section 5; nothing more than 6 ms before the strike; the ff key-bottom thump lands before the strike.
 
-- Estimate B, tuning and prompt/aftersound decays per key by partial tracking at known MIDI pitches.
-- Find the damper boundary and per-key damper rates from notes released without pedal.
-- Estimate hall T60(f) per year from decays after loud staccato chords.
-- Check whether CC66 and CC67 are present in the MIDI at all.
+Current status: **62/65**. The three failures are the bass knees of the fundamental: A0 −17 against −29 dB, C2 −22 against −28, C3 −21 against −27. There, the knee metric responds non-monotonically to the aftersound amplitude: at A0 no amplitude reaches −29 dB while also keeping the aftersound T60 in range. The aftersound T60 check is the more robust of the two, so it wins.
+
+## 7. Open items
+
+- **Bass rise time.** The model (with body) is slower than measured: C2 67 ms against 8 ms. The soundboard's low modes are probably too strong.
+- **Level vs velocity per key** (ff − mf): the model gives 16–28 dB, Iowa 8–16 dB, but Iowa has no MIDI velocities. Fit on MAESTRO.
+- **To calibrate on MAESTRO:** damper delay and damper boundary key, hall T60 per year, bass inharmonicity per year.

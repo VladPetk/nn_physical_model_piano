@@ -47,21 +47,28 @@ def _p(*shape, value=0.0):
     return nn.Parameter(torch.full(shape, float(value)))
 
 
+HAMMER_ORDER_VEL = 0.2  # fitted to Hall, Five Lectures, Fig. 15 (C4 slopes pp/mf/ff)
+# roll-off order at mf per key: 2.1 at C4 from Hall; the rest fitted to the early spectral slope of the
+# Iowa Steinway B (radiated, near field) -- gentle in the bass, steep in the treble where the contact
+# outlasts half the string period (Askenfelt & Jansson, Five Lectures, Fig. 8)
+HAMMER_ORDER_MF = [(0, 1.5), (27, 1.5), (39, 2.1), (48, 1.9), (51, 2.6), (63, 3.2), (75, 4.5), (87, 4.5)]
+
+
 def hammer_velocity(u):
     """MIDI velocity / 127 -> hammer speed in m/s (about 0.4 at pp, 5.5 at fff)."""
     return 5.5 * u.clamp(min=1e-3) ** 1.4
 
 
-def hammer_spectrum(f, tc):
+def hammer_spectrum(f, tc, order=1.0):
     """Smooth magnitude envelope of the hammer force pulse of duration ``tc``.
 
-    A half-sine pulse is -3 dB at 0.59/tc and falls at -12 dB/oct; its ideal
-    nulls are replaced by the smooth second-order envelope with the same corner
-    and slope. Measured pulses are skewed and have filled nulls, and the ideal
-    nulls would make brightness non-monotonic in velocity (a null sliding over
-    a partial as the contact time changes). See docs/physical_parameters.md.
+    -3 dB at 0.59/tc (the corner of a half-sine pulse), then -6*order dB/oct. The felt is
+    nonlinear (F ~ x^p, p = 2-3.5), so a harder blow drives it into its stiff range and the
+    pulse gets sharper: the roll-off order falls with hammer speed (Hall, Five Lectures,
+    Fig. 15: -18 / -15 / -11 dB/oct at pp / mf / ff for C4). The ideal half-sine's nulls are
+    replaced by the smooth envelope: measured pulses are skewed and their nulls are filled.
     """
-    return torch.rsqrt(1 + (f * tc / 0.59) ** 4)
+    return torch.rsqrt(1 + (f * tc / 0.59) ** (2 * order))
 
 
 class PianoPhysics(nn.Module):
@@ -75,15 +82,17 @@ class PianoPhysics(nn.Module):
         # Rigaud, David & Daudet (DAFx 2011) two-asymptote fit, m = MIDI pitch (as used by DDSP-Piano)
         m = (k + LOWEST_MIDI).float()
         self.register_buffer("prior_log_B", torch.log(torch.exp(0.0926 * m - 13.64) + torch.exp(-0.0847 * m - 5.82)))
+        # stretch re A4, measured on the Iowa Steinway B (C8 extrapolated)
         self.register_buffer("prior_cents", key_curve(
-            [(0, -30), (12, -18), (24, -8), (36, -3), (48, 0), (60, 5), (72, 13), (84, 25), (87, 30)]))
+            [(0, -16), (3, -15), (15, -4), (27, 0), (39, -1), (48, 0), (51, 0), (63, 6), (75, 14), (87, 25)]))
         self.register_buffer("prior_log_b1", torch.log(key_curve(
-            [(0, 0.17), (15, 0.25), (27, 0.22), (39, 0.25), (48, 0.30), (63, 0.55), (75, 0.70), (87, 1.3)])))
-        self.register_buffer("prior_log_b3", torch.log(key_curve([(0, 2.5e-7), (20, 2.5e-7), (30, 1.2e-7), (87, 1.2e-7)])))
+            [(0, 0.062), (15, 0.067), (27, 0.118), (39, 0.216), (48, 0.25), (51, 0.30), (63, 0.40), (75, 0.6), (87, 1.0)])))
+        self.register_buffer("prior_log_b3", torch.log(key_curve([(0, 2.5e-7), (20, 2.5e-7), (30, 1.2e-7), (55, 1.0e-7), (63, 5e-8), (87, 2.5e-8)])))
         self.register_buffer("n_strings", torch.where(k < 8, 1, torch.where(k < 26, 2, 3)))
-        # prompt/aftersound decay ratio at the fundamental (R): 1.5 mono, 1.7 bi, 2.5 -> 4 tri
-        self.register_buffer("prior_prompt_ratio", key_curve([(0, 1.5), (7, 1.5), (8, 1.7), (25, 1.7), (26, 2.5), (39, 4.0), (87, 4.0)]))
-        self.register_buffer("prior_log_after", torch.log(key_curve([(0, 0.10), (39, 0.06), (87, 0.06)])))
+        # prompt/aftersound decay ratio at the fundamental (R) and aftersound amplitude per mode: solved from the
+        # decays and knee levels measured on the Iowa Steinway B (docs/calibration_iowa.md)
+        self.register_buffer("prior_prompt_ratio", key_curve([(0, 4.3), (15, 3.7), (27, 3.5), (39, 3.0), (48, 3.5), (63, 2.8), (75, 3.0), (87, 3.0)]))
+        self.register_buffer("prior_log_after", torch.log(key_curve([(0, 0.06), (20, 0.06), (27, 0.06), (36, 0.09), (48, 0.09), (55, 0.10), (63, 0.12), (75, 0.06), (87, 0.05)])))
         # contact time at mf (2.8 m/s): Askenfelt & Jansson, Five Lectures, Fig. 7
         self.register_buffer("prior_log_tc", torch.log(1e-3 * key_curve(
             [(0, 3.7), (15, 3.0), (27, 2.8), (39, 2.1), (51, 1.45), (63, 1.1), (75, 0.6), (87, 0.5)])))
@@ -96,6 +105,7 @@ class PianoPhysics(nn.Module):
         # una corda: lost string(s) of the unison -> quieter prompt, strong aftersound
         self.register_buffer("soft_gain_prior", key_curve([(0, 0.0), (7, 0.0), (8, -2.0), (25, -2.0), (26, -3.5), (87, -3.5)]))
         self.register_buffer("soft_log_after_prior", torch.log(key_curve([(0, 1.0), (7, 1.0), (8, 5.0), (25, 5.0), (26, 3.5), (87, 3.5)])))
+        self.register_buffer("prior_log_order", torch.log(key_curve(HAMMER_ORDER_MF)))
         self.register_buffer("harmonic", torch.arange(1, P + 1, dtype=torch.float32))
 
         # --- per-key string / hammer / damper parameters (learned offsets) ---
@@ -110,6 +120,8 @@ class PianoPhysics(nn.Module):
         self.raw_strike = _p(N_KEYS)
         self.raw_log_tc = _p(N_KEYS)
         self.raw_tc_vel = _p(N_KEYS)
+        self.raw_order = _p(N_KEYS)  # hammer roll-off order at mf (offset on the HAMMER_ORDER_MF prior)
+        self.raw_order_vel = _p(N_KEYS)  # how fast the roll-off flattens with hammer speed
         self.gain_db = _p(N_KEYS, value=cfg.init_gain_db)
         self.raw_vel_slope = _p(N_KEYS)
         self.partial_gain = _p(N_KEYS, P)  # what the hammer/comb model misses (regularised)
@@ -173,8 +185,9 @@ class PianoPhysics(nn.Module):
         zero = torch.zeros_like(u)
 
         cents = self.prior_cents[ki] + bounded(self.raw_cents[ki], 30.0) + bounded(self.cond_cents[cond_k], 30.0)
-        f0 = 440.0 * torch.pow(2.0, (ki + LOWEST_MIDI - 69).float() / 12 + cents / 1200)
         B = torch.exp(self.prior_log_B[ki] + bounded(self.raw_log_B[ki], 1.5))
+        # the tuner sets the *sounding* fundamental f1 = f0 sqrt(1 + B), so the stretch applies to f1
+        f0 = 440.0 * torch.pow(2.0, (ki + LOWEST_MIDI - 69).float() / 12 + cents / 1200) / torch.sqrt(1 + B)
         fn = f0[..., None] * n * torch.sqrt(1 + B[..., None] * n**2)  # [B,K,P]
 
         detune = torch.cat([torch.zeros_like(fn[..., :1]), bounded(self.raw_unison[ki], 5.0)], -1)
@@ -191,7 +204,9 @@ class PianoPhysics(nn.Module):
 
         # excitation: bridge force = gain(v) * half-sine pulse spectrum * signed strike-position comb
         tc = self.contact_time(ki, u, soft, cond, ctx.get("log_fc"))
-        hammer = hammer_spectrum(fn, tc[..., None])
+        order = (torch.exp(self.prior_log_order[ki] + bounded(self.raw_order[ki], 0.5))
+                 * (hammer_velocity(u) / 2.8) ** (-HAMMER_ORDER_VEL * torch.exp(bounded(self.raw_order_vel[ki], 0.7))))
+        hammer = hammer_spectrum(fn, tc[..., None], order[..., None])
         x0 = self.prior_strike[ki] * torch.exp(bounded(self.raw_strike[ki], 0.5))
         comb = torch.sin(math.pi * n * x0[..., None])
         u0 = u - 0.6
@@ -219,6 +234,6 @@ class PianoPhysics(nn.Module):
         def smooth(x):
             return ((x[2:] - 2 * x[1:-1] + x[:-2]) ** 2).mean()
         tables = [self.raw_log_B, self.raw_cents, self.raw_log_b1, self.raw_log_b3, self.raw_prompt,
-                  self.raw_strike, self.raw_log_tc, self.raw_tc_vel, self.raw_vel_slope,
+                  self.raw_strike, self.raw_log_tc, self.raw_tc_vel, self.raw_order, self.raw_order_vel, self.raw_vel_slope,
                   self.raw_log_damp, self.raw_damp_tilt, self.gain_db / 20]
         return sum(smooth(t) for t in tables) + 1e-2 * (self.partial_gain**2).mean()

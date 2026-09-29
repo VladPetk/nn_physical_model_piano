@@ -140,17 +140,17 @@ def test_per_key_strings_sum_to_total():
     assert per_key[0, 39].abs().sum() > 0 and per_key[0, 19].abs().sum() > 0 and per_key[0, 50].abs().sum() == 0
 
 
-def test_decay_times_match_literature():
-    """Fundamental T60 (prompt / aftersound) from the mode parameters inside the ranges of
-    docs/physical_parameters.md. Bass and mid only: in the treble the spec targets the *measured*
-    decay, which beating makes shorter than the prompt mode's own rate (see pianonn.diagnostics)."""
+def test_decay_times_match_measured_piano():
+    """Fundamental decays from the mode parameters against the Iowa Steinway B (docs/calibration_iowa.md):
+    prompt T60 within x1.5, a real two-stage decay, and aftersounds that are long in the bass and short in the
+    treble. Exact aftersound values are checked on rendered notes by pianonn.diagnostics, measured the same way
+    as the recordings (medians over partials 1-4), which an analytic fundamental-only test cannot reproduce."""
     phys = PianoPhysics(small_cfg(sample_rate=24000, n_partials=12))
-    targets = {0: ((25, 40), None), 15: ((15, 20), (20, 30)), 39: ((6, 8), (20, 35)), 48: ((5, 6), (15, 30)),
-               63: ((2.5, 3.5), (8, 15))}
-    ki = torch.tensor([list(targets)])
-    m = phys.modes(ki, torch.full(ki.shape, 0.6), torch.zeros(ki.shape), torch.tensor([0]))
+    prompt_targets = {0: 26.4, 15: 26.7, 27: 15.7, 39: 10.3, 48: 5.8, 63: 5.0}
+    ki = torch.tensor([list(prompt_targets)])
+    m = phys.modes(ki, torch.full(ki.shape, 0.5), torch.zeros(ki.shape), torch.tensor([0]))
     t60 = 6.91 / m["alpha"][0, :, 0]  # [keys, modes] at the fundamental
-    for i, (prompt, after) in enumerate(targets.values()):
-        assert prompt[0] <= t60[i, 0] <= prompt[1], (list(targets)[i], t60[i, 0])
-        if after:
-            assert after[0] <= t60[i, 1] <= after[1], (list(targets)[i], t60[i, 1])
+    for i, (key, prompt) in enumerate(prompt_targets.items()):
+        assert prompt / 1.5 <= t60[i, 0] <= prompt * 1.5, (key, t60[i, 0])
+        assert t60[i, 1] >= 2 * t60[i, 0], (key, t60[i])  # two-stage decay
+    assert t60[0, 1] > 60 and t60[-1, 1] < 25

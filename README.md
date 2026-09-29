@@ -114,18 +114,23 @@ python -m pianonn.render some.mid out.wav --ckpt runs/v0/last.pt --year 2018
 python -m pianonn.diagnostics [--ckpt runs/v0/last.pt]
 ```
 
-The physics prior is specified in [`docs/physical_parameters.md`](docs/physical_parameters.md).
-The two literature reviews it condenses are in [`docs/literature/`](docs/literature/), and the
-prior's current acceptance report is [`docs/diagnostics_prior.md`](docs/diagnostics_prior.md).
+The physics prior is specified in [`docs/physical_parameters.md`](docs/physical_parameters.md), with
+a source for every value. The literature reviews are in [`docs/literature/`](docs/literature/), the
+recording calibration is in [`docs/calibration_iowa.md`](docs/calibration_iowa.md) (reproduce it with
+`python -m pianonn.calibration data/iowa`), and the current acceptance report is
+[`docs/diagnostics_prior.md`](docs/diagnostics_prior.md).
 `samples/` has renders of `samples/demo.mid`: `physics_prior_v1.wav` is the first guess and
-`physics_prior_v2.wav` is the literature-calibrated prior.
+`physics_prior_v2.wav` is the first literature pass, `v3` has the review fixes, and `v4` is calibrated
+against the sourced literature and the Steinway recordings.
 
 ## Status
 
-The package runs end to end and has tests. The untrained prior passes all 33 literature
-acceptance checks (decay times, inharmonicity, partial spectra, velocity brightness, bass
-radiation, damper release, pedal halo, noise levels and timing). An independent review of how
-the spec was applied is in [`docs/reviews/`](docs/reviews/); its findings are fixed. Gradients reach every
+The package runs end to end and has tests. The prior is calibrated against the literature (the KTH
+*Five Lectures on the Acoustics of the Piano*, arXiv and Zenodo papers) and against 260 recorded
+notes of a Steinway B, which are analysed with the same code as the model's renders
+([`docs/calibration_iowa.md`](docs/calibration_iowa.md)). It passes 62 of 65 acceptance checks;
+the three failures are a known limitation of the bass knee metric. Reviews are in
+[`docs/reviews/`](docs/reviews/). Gradients reach every
 physical parameter, block-wise rendering matches single-pass rendering, dampers, sustain,
 una corda and sympathetic resonance all behave as expected, and a student fitted to a
 perturbed teacher moves towards it. **It has not been trained on MAESTRO yet.**

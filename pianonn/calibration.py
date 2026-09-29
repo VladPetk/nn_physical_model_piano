@@ -201,6 +201,40 @@ def aftersound(p, sr, start, noise, knee_db=-25.0, margin_db=10.0, min_span=1.5)
     return (-60 / slope if slope < 0 else float("inf")), icpt - peak
 
 
+def early_partials(x, sr, onset, freqs, noise_seg, t0=0.01, t1=0.2):
+    """Noise-compensated levels (dB) of the partials at ``freqs`` in the early window after the onset.
+
+    The noise power at each frequency is estimated from ``noise_seg`` (the silence before the note)
+    and subtracted, so quiet pp notes are not mistaken for bright ones by the recording hiss.
+    """
+    seg = x[onset + int(t0 * sr): onset + int(t1 * sr)]
+    n_fft = 1 << int(math.ceil(math.log2(len(seg) * 8)))
+    win = np.hanning(len(seg))
+    P = np.abs(np.fft.rfft(seg * win, n_fft)) ** 2
+    hz = np.fft.rfftfreq(n_fft, 1 / sr)
+    if len(noise_seg) >= len(seg):
+        chunks = [noise_seg[i: i + len(seg)] for i in range(0, len(noise_seg) - len(seg) + 1, len(seg))]
+        N = np.mean([np.abs(np.fft.rfft(c * win, n_fft)) ** 2 for c in chunks], 0)
+    else:
+        N = np.zeros_like(P)
+    tol = max(2, int(0.5 / (t1 - t0) / (hz[1] - hz[0])))  # half the window's main lobe
+    out = []
+    for f in freqs:
+        i = int(round(f / (hz[1] - hz[0])))
+        lo, hi = max(0, i - tol), i + tol + 1
+        sig = P[lo:hi].max() - N[lo:hi].mean()
+        out.append(10 * math.log10(sig) if sig > 10 * N[lo:hi].mean() + 1e-30 else float("nan"))  # SNR > 10 dB
+    return np.array(out)
+
+
+def spectral_slope(levels, n):
+    """Least-squares slope (dB/oct) of partial level against log2(n), over the partials that were measured."""
+    ok = np.isfinite(levels)
+    if ok.sum() < 3:
+        return float("nan")
+    return float(np.polyfit(np.log2(np.asarray(n, dtype=float)[ok]), levels[ok], 1)[0])
+
+
 def centroid(x, sr, onset, t0=0.02, t1=0.12):
     frame = x[onset + int(t0 * sr): onset + int(t1 * sr)]
     s = np.abs(np.fft.rfft(frame * np.hanning(len(frame))))
@@ -230,6 +264,14 @@ def analyze_note(x, sr, pitch, n_decay=8):
     # integer harmonics from distortion that mimic B ~ 0); a note > 50 cents off is mislabelled
     out.update(B_reliable=bool(len(tr["n"]) >= 8 and tr["fit_rms_cents"] < 3.0), suspect=bool(abs(cents) > 50),
                fit_rms_cents=tr["fit_rms_cents"])
+    lv = early_partials(x, sr, onset, tr["f"][:12], pre)
+    n12 = tr["n"][:12]
+    ok = np.isfinite(lv)
+    if ok.any():
+        amp = 10 ** (lv[ok] / 20)
+        out["harmonic_centroid_hz"] = float((np.array(tr["f"][:12])[ok] * amp).sum() / amp.sum())
+    out["slope_db_oct"] = spectral_slope(lv, n12)
+    out["early_partials"] = {int(k): float(v - lv[0]) for k, v in zip(n12, lv)} if n12[0] == 1 and np.isfinite(lv[0]) else {}
     out.update(B=tr["B"], f1=f1, cents=cents, n_partials=len(tr["n"]),
                partials=dict(zip(tr["n"], [lv - tr["level"][0] if tr["n"][0] == 1 else float("nan") for lv in tr["level"]])))
     prompt, after, after_level = [], [], []
@@ -276,7 +318,7 @@ def _first(v):
     return v[0] if v else float("nan")
 
 
-def analyze_model(model, dynamics=None, keys=None, seconds=12.0):
+def analyze_model(model, dynamics=None, keys=None, seconds=45.0):
     """Run the same analysis on the model's dry string output."""
     import torch
 
@@ -300,50 +342,73 @@ def analyze_model(model, dynamics=None, keys=None, seconds=12.0):
     return results
 
 
-def _smooth_by_key(results, field, dynamic="mf", idx=0, half_width=3):
-    """Median of ``field`` over keys within +-half_width semitones, at each landmark key."""
-    def usable(r):
-        if r["dynamic"] != dynamic or r.get(field) is None or r.get("suspect"):
-            return False
-        return r.get("B_reliable", True) if field == "B" else True
+def _median(v):
+    v = [x for x in v if x is not None and np.isfinite(x)]
+    return float(np.median(v)) if v else float("nan")
 
-    pts = [(r["pitch"], r[field][idx] if isinstance(r.get(field), list) else r.get(field))
-           for r in results if usable(r) and (not isinstance(r.get(field), list) or len(r[field]) > idx)]
-    out = {}
-    for name, p in LANDMARKS.items():
-        vals = [v for q, v in pts if abs(q - p) <= half_width and v is not None and np.isfinite(v)]
-        out[name] = float(np.median(vals)) if vals else float("nan")
-    return out
+
+def _key_values(results, extract, dynamics):
+    """Per-key medians of ``extract(note)`` over the given dynamics, skipping suspect notes."""
+    by_key = {}
+    for r in results:
+        if r["dynamic"] in dynamics and not r.get("suspect"):
+            by_key.setdefault(r["pitch"], []).append(extract(r))
+    return {p: _median(v) for p, v in by_key.items()}
+
+
+def _at_landmarks(per_key, half_width=3):
+    return {name: _median([v for q, v in per_key.items() if abs(q - p) <= half_width]) for name, p in LANDMARKS.items()}
+
+
+def _pair(results, extract, a="ff", b="mf"):
+    """Per-key difference extract(a) - extract(b) for keys recorded at both dynamics."""
+    notes = {(r["pitch"], r["dynamic"]): r for r in results if not r.get("suspect")}
+    return {p: extract(notes[(p, a)]) - extract(notes[(p, b)]) for (p, d) in notes if d == a and (p, b) in notes}
+
+
+def _lst(r, key, lo, hi):
+    return _median((r.get(key) or [])[lo:hi])
+
+
+SUMMARY_ROWS = [
+    ("inharmonicity B (reliable fits)", lambda r: r.get("B") if r.get("B_reliable") else None, ("pp", "mf", "ff"), "{:.2e}"),
+    ("tuning, cents re ET", lambda r: r.get("cents"), ("pp", "mf", "ff"), "{:+.1f}"),
+    ("prompt T60, median partials 1-4 (s)", lambda r: _lst(r, "t60_prompt", 0, 4), ("mf", "ff"), "{:.1f}"),
+    ("aftersound T60, median partials 1-4 (s)", lambda r: _lst(r, "t60_after", 0, 4), ("mf", "ff"), "{:.0f}"),
+    ("aftersound knee, partials 1-4 (dB re peak)", lambda r: _lst(r, "after_level_db", 0, 4), ("mf", "ff"), "{:.0f}"),
+    ("aftersound knee, partials 5-8 (dB re peak)", lambda r: _lst(r, "after_level_db", 4, 8), ("mf", "ff"), "{:.0f}"),
+    ("early spectral slope, mf (dB/oct)", lambda r: r.get("slope_db_oct"), ("mf",), "{:.0f}"),
+    ("rise time 10-90 %, mf (ms)", lambda r: r.get("rise_ms"), ("mf",), "{:.0f}"),
+]
+PAIR_ROWS = [
+    ("slope change mf -> ff (dB/oct)", lambda r: r.get("slope_db_oct", float("nan")), "{:+.1f}"),
+    ("peak level ff - mf (dB)", lambda r: r["peak_db"], "{:+.0f}"),
+    ("harmonic centroid ff / mf", lambda r: math.log(r.get("harmonic_centroid_hz", float("nan"))), "x{:.2f}"),
+]
+
+
+def summarize(results):
+    table = {}
+    for label, extract, dyns, fmt in SUMMARY_ROWS:
+        table[label] = (_at_landmarks(_key_values(results, extract, dyns)), fmt)
+    for label, extract, fmt in PAIR_ROWS:
+        vals = _at_landmarks(_pair(results, extract))
+        if fmt.startswith("x"):
+            vals = {k: math.exp(v) for k, v in vals.items()}
+        table[label] = (vals, fmt)
+    return table
 
 
 def report(rec, mod=None):
-    fields = [("B", "B", 0, "{:.2e}"), ("cents", "tuning (cents re ET)", 0, "{:+.1f}"),
-              ("t60_prompt", "prompt T60 of partial 1 (s)", 0, "{:.1f}"), ("t60_prompt", "prompt T60 of partial 2 (s)", 1, "{:.1f}"),
-              ("t60_after", "aftersound T60 of partial 1 (s)", 0, "{:.1f}"), ("after_level_db", "aftersound knee re peak (dB)", 0, "{:.0f}"),
-              ("centroid_hz", "spectral centroid, 20-120 ms (Hz)", 0, "{:.0f}"), ("rise_ms", "rise time 10-90 % (ms)", 0, "{:.1f}")]
-    lines = ["| quantity (mf) | source | " + " | ".join(LANDMARKS) + " |", "|---|---|" + "---|" * len(LANDMARKS)]
-    for field, label, idx, fmt in fields:
-        for tag, res in (("recording", rec), ("model prior", mod)):
-            if res is None:
+    lines = ["| quantity | source | " + " | ".join(LANDMARKS) + " |", "|---|---|" + "---|" * len(LANDMARKS)]
+    srec, smod = summarize(rec), summarize(mod) if mod else None
+    for label, (vals, fmt) in srec.items():
+        for tag, t in (("recording", srec), ("model", smod)):
+            if t is None:
                 continue
-            v = _smooth_by_key(res, field, "mf", idx)
+            v, _ = t[label]
             lines.append(f"| {label} | {tag} | " + " | ".join(fmt.format(v[k]) if np.isfinite(v[k]) else "-" for k in LANDMARKS) + " |")
-    # velocity dependence from the recordings
-    vel = ["", "| key | peak dB ff-pp | peak dB mf-pp | centroid ff/pp | centroid mf/pp |", "|---|---|---|---|---|"]
-    for name, p in LANDMARKS.items():
-        by = {r["dynamic"]: r for r in rec if r["pitch"] == p}
-        if {"pp", "mf", "ff"} <= set(by):
-            vel.append(f"| {name} | {by['ff']['peak_db'] - by['pp']['peak_db']:+.1f} | {by['mf']['peak_db'] - by['pp']['peak_db']:+.1f} | "
-                       f"{by['ff']['centroid_hz'] / by['pp']['centroid_hz']:.2f} | {by['mf']['centroid_hz'] / by['pp']['centroid_hz']:.2f} |")
-    spec = ["", "| key (mf) | partials 2..8 dB re partial 1, recording | model prior |", "|---|---|---|"]
-    for name, p in LANDMARKS.items():
-        row = []
-        for res in (rec, mod):
-            r = next((r for r in (res or []) if r["pitch"] == p and r["dynamic"] == "mf"), None)
-            parts = r.get("partials", {}) if r else {}
-            row.append(" ".join(f"{parts[n]:+.0f}" if n in parts and np.isfinite(parts[n]) else "." for n in range(2, 9)) if r else "-")
-        spec.append(f"| {name} | {row[0]} | {row[1]} |")
-    return "\n".join(lines + vel + spec)
+    return "\n".join(lines)
 
 
 def main(argv=None):

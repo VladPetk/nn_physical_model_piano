@@ -70,7 +70,7 @@ def soundboard_body(sr, seconds, seed=0, eta=0.02, predelay=0.003, crossover=135
                    330 + (crossover - 330) * torch.rand(n_random, generator=g, dtype=torch.float64)])
     f = torch.sort(f).values
     n_modes = len(f)
-    tau = (1 / (math.pi * eta * f)).clamp(max=0.25)
+    tau = (1 / (math.pi * eta * f)).clamp(max=0.1)  # finished grand soundboard T60 ~0.6 s (Bader & Plath 2020)
     phase = 2 * math.pi * torch.rand(n_modes, generator=g, dtype=torch.float64)
     amp = torch.randn(n_modes, generator=g, dtype=torch.float64)
     modal = (amp[:, None] * torch.exp(-t / tau[:, None]) * torch.sin(2 * math.pi * f[:, None] * t + phase[:, None])).sum(0)

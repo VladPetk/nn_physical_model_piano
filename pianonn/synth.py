@@ -153,8 +153,8 @@ class NoiseBank(nn.Module):
         nb = cfg.noise_bands
         centers = torch.logspace(math.log10(40), math.log10(cfg.sample_rate / 2), nb)
         self.register_buffer("centers", centers)
-        self.knock = nn.Parameter(_dark_bands(centers, 600.0, -4.73).repeat(N_KEYS, 1))
-        self.knock_vel = nn.Parameter(torch.full((N_KEYS,), 3.9))  # noise grows ~13 dB less than the tone pp -> ff
+        self.knock = nn.Parameter(_dark_bands(centers, 600.0, -5.07).repeat(N_KEYS, 1))
+        self.knock_vel = nn.Parameter(torch.full((N_KEYS,), 4.2))  # noise grows ~13 dB less than the tone pp -> ff
         self.knock_log_tau = nn.Parameter(torch.log(key_curve([(0, 0.010), (40, 0.007), (87, 0.005)])))
         self.thump_log_gain = nn.Parameter(torch.tensor(math.log(0.7)))
         self.thump_log_tau = nn.Parameter(torch.tensor(math.log(0.008)))
