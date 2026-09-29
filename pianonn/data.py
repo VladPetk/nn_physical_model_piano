@@ -17,7 +17,7 @@ def load_midi(path):
     """Return ``notes[N, 4]`` = (pitch, onset, offset, velocity) and raw pedal events."""
     import pretty_midi
 
-    pm = pretty_midi.PrettyMIDI(str(path))
+    pm = pretty_midi.PrettyMIDI(path if hasattr(path, "read") else str(path))
     notes, ccs = [], {cc: [] for cc in PEDAL_CCS.values()}
     for inst in pm.instruments:
         notes += [(n.pitch, n.start, n.end, n.velocity) for n in inst.notes]
@@ -39,8 +39,25 @@ def pedal_frames(times, values, t0, n_frames, hop, sr):
     return np.where(idx >= 0, values[np.clip(idx, 0, None)] if len(values) else 0.0, 0.0) / 127.0
 
 
-def prepare_piece(maestro_dir, row, out_dir, sr):
-    """Resample one MAESTRO recording to mono ``sr`` FLAC and cache its MIDI as npz."""
+def _open_member(source, rel):
+    """A MAESTRO file as a readable binary object: from the extracted directory or straight from the zip."""
+    import io
+    import zipfile
+
+    if os.path.isdir(source):
+        return open(os.path.join(source, rel), "rb")
+    with zipfile.ZipFile(source) as z:
+        name = next(n for n in z.namelist() if n.endswith("/" + rel) or n == rel)
+        return io.BytesIO(z.read(name))
+
+
+def prepare_piece(source, row, out_dir, sr, channels=2):
+    """Resample one MAESTRO recording to ``sr`` FLAC and cache its MIDI as npz.
+
+    ``source`` is the extracted MAESTRO directory or the zip itself. Both channels are kept
+    (``channels=2``): summing a spaced pair comb-filters the spectrum in a key-dependent way,
+    which per-key tables would otherwise learn as if it were the piano (review 3, F2).
+    """
     import soundfile as sf
     from scipy.signal import resample_poly
 
@@ -48,21 +65,30 @@ def prepare_piece(maestro_dir, row, out_dir, sr):
     audio_rel, midi_rel = f"audio/{stem}.flac", f"midi/{stem}.npz"
     audio_out, midi_out = os.path.join(out_dir, audio_rel), os.path.join(out_dir, midi_rel)
     if not os.path.exists(audio_out):
-        x, in_sr = sf.read(os.path.join(maestro_dir, row["audio_filename"]), dtype="float32", always_2d=True)
-        x = x.mean(1)
+        with _open_member(source, row["audio_filename"]) as f:
+            x, in_sr = sf.read(f, dtype="float32", always_2d=True)
+        x = x.mean(1, keepdims=True) if channels == 1 else np.repeat(x, 2, 1)[:, :2] if x.shape[1] == 1 else x[:, :2]
         g = gcd(int(in_sr), sr)
-        x = resample_poly(x, sr // g, int(in_sr) // g).astype(np.float32)
-        sf.write(audio_out, np.clip(x, -1, 1), sr, subtype="PCM_16")
+        x = resample_poly(x, sr // g, int(in_sr) // g, axis=0).astype(np.float32)
+        sf.write(audio_out + ".part.flac", np.clip(x, -1, 1), sr, subtype="PCM_16")
+        os.replace(audio_out + ".part.flac", audio_out)  # a killed run never leaves a truncated file behind
     if not os.path.exists(midi_out):
-        notes, pedals = load_midi(os.path.join(maestro_dir, row["midi_filename"]))
+        with _open_member(source, row["midi_filename"]) as f:
+            notes, pedals = load_midi(f)
         np.savez(midi_out, notes=notes, **pedals)
     info = sf.info(audio_out)
     return {"id": stem, "split": row["split"], "year": int(row["year"]), "duration": info.frames / info.samplerate,
-            "audio": audio_rel, "midi": midi_rel}
+            "channels": info.channels, "audio": audio_rel, "midi": midi_rel}
 
 
-def _perf_from_notes(notes, pedals, t0, window, lookback, n_frames, cfg):
-    """Build the model's per-example performance dict for a window starting at ``t0``."""
+def _perf_from_notes(notes, pedals, t0, window, lookback, n_frames, cfg, hist_frames=0):
+    """Build the model's per-example performance dict for a window starting at ``t0``.
+
+    Notes struck up to ``lookback`` s before the window are included (negative onsets). The
+    control curves start ``hist_frames`` frames before the window, so the dampers, sostenuto
+    latches and re-strikes of those notes are exact at the window start (review 3, F8);
+    ``n_frames`` is the number of frames of the window itself.
+    """
     sel = (notes[:, 1] >= t0 - lookback) & (notes[:, 1] < t0 + window)
     n = notes[sel]
     perf = {
@@ -70,12 +96,18 @@ def _perf_from_notes(notes, pedals, t0, window, lookback, n_frames, cfg):
         "onset": torch.as_tensor(n[:, 1] - t0, dtype=torch.float32),
         "offset": torch.as_tensor(n[:, 2] - t0, dtype=torch.float32),
         "velocity": torch.as_tensor(n[:, 3], dtype=torch.float32),
+        "hist_frames": torch.tensor(hist_frames),
     }
+    t_start = t0 - hist_frames * cfg.hop / cfg.sample_rate
     for name in PEDAL_CCS:
         perf[name] = torch.as_tensor(
-            pedal_frames(pedals[name + "_t"], pedals[name + "_v"], t0, n_frames, cfg.hop, cfg.sample_rate),
+            pedal_frames(pedals[name + "_t"], pedals[name + "_v"], t_start, hist_frames + n_frames, cfg.hop, cfg.sample_rate),
             dtype=torch.float32)
     return perf
+
+
+def history_frames(lookback, cfg):
+    return int(round(lookback * cfg.sample_rate / cfg.hop))
 
 
 class MaestroSegments(Dataset):
@@ -85,18 +117,21 @@ class MaestroSegments(Dataset):
     the whole window but the loss only sees the last ``segment`` seconds, so
     reverb, sympathetic resonance and notes struck before the window have time
     to build up. Notes up to ``lookback`` seconds before the window are included
-    (with negative onsets); the closed-form string model renders them exactly.
+    (with negative onsets); the closed-form string model renders them exactly, and the
+    control curves cover the lookback too. 12 s lets the loss see bass aftersound.
+
+    ``audio`` is ``[channels, samples]``.
     """
 
-    def __init__(self, root, split, cfg: PianoConfig, segment=2.0, warmup=1.0, lookback=4.0, length=10000,
-                 deterministic=False):
+    def __init__(self, root, split, cfg: PianoConfig, segment=2.0, warmup=1.0, lookback=12.0, length=10000,
+                 deterministic=False, years=None, seed=0):
         with open(os.path.join(root, "index.json")) as f:
-            self.pieces = [p for p in json.load(f) if p["split"] == split]
+            self.pieces = [p for p in json.load(f) if p["split"] == split and (not years or p["year"] in years)]
         if not self.pieces:
             raise ValueError(f"no pieces for split {split!r} in {root}")
         self.root, self.cfg = root, cfg
         self.segment, self.warmup, self.lookback = segment, warmup, lookback
-        self.length, self.deterministic = length, deterministic
+        self.length, self.deterministic, self.seed = length, deterministic, seed
         dur = np.array([p["duration"] for p in self.pieces])
         self.weights = dur / dur.sum()
         self._midi = {}
@@ -114,19 +149,24 @@ class MaestroSegments(Dataset):
         import soundfile as sf
 
         cfg, sr = self.cfg, self.cfg.sample_rate
-        rng = np.random.default_rng(i if self.deterministic else None)
+        rng = np.random.default_rng(self.seed * 1_000_003 + i if self.deterministic else None)
         piece = self.pieces[rng.choice(len(self.pieces), p=self.weights)]
         n_samples = int(round((self.warmup + self.segment) * sr))
         path = os.path.join(self.root, piece["audio"])
         total = sf.info(path).frames
         start = int(rng.integers(0, max(1, total - n_samples)))
-        audio, _ = sf.read(path, start=start, frames=n_samples, dtype="float32")
-        audio = np.pad(audio, (0, n_samples - len(audio)))
+        audio, _ = sf.read(path, start=start, frames=n_samples, dtype="float32", always_2d=True)
+        audio = np.pad(audio, ((0, n_samples - len(audio)), (0, 0))).T
+        if audio.shape[0] != cfg.channels:
+            audio = audio.mean(0, keepdims=True).repeat(cfg.channels, 0)
         z = self._notes(piece)
         t0 = start / sr
-        perf = _perf_from_notes(z["notes"], z, t0, n_samples / sr, self.lookback, n_samples // cfg.hop + 2, cfg)
+        perf = _perf_from_notes(z["notes"], z, t0, n_samples / sr, self.lookback, n_samples // cfg.hop + 2, cfg,
+                                history_frames(self.lookback, cfg))
         perf["condition"] = torch.tensor(year_to_condition(piece["year"]))
-        perf["audio"] = torch.from_numpy(audio)
+        perf["audio"] = torch.from_numpy(np.ascontiguousarray(audio))
+        perf["piece"] = torch.tensor(self.pieces.index(piece))
+        perf["start"] = torch.tensor(start)
         perf["loss_start"] = torch.tensor(int(self.warmup * sr))
         return perf
 

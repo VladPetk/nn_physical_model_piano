@@ -13,7 +13,7 @@ from .synth import NeuralPhysicalPiano
 def load_model(ckpt=None, device="cpu", **overrides):
     if ckpt:
         state = torch.load(ckpt, map_location=device)
-        model = NeuralPhysicalPiano(PianoConfig(**{**state["cfg"], **overrides}))
+        model = NeuralPhysicalPiano(PianoConfig.from_dict({**state["cfg"], **overrides}))
         model.load_state_dict(state["model"])
     else:
         model = NeuralPhysicalPiano(PianoConfig(**overrides))
@@ -21,8 +21,10 @@ def load_model(ckpt=None, device="cpu", **overrides):
 
 
 @torch.no_grad()
-def render_notes(model, notes, pedals, condition=0, tail=3.0, block_seconds=2.0, seed=0):
-    """``notes[N, 4]`` = (pitch, onset, offset, velocity) in seconds; returns float32 audio."""
+def render_notes(model, notes, pedals, condition=0, tail=3.0, block_seconds=2.0, seed=0, residual=True, floor=False):
+    """``notes[N, 4]`` = (pitch, onset, offset, velocity) in seconds; returns float32 audio ``[channels, T]``.
+
+    ``residual``: include the learned residual (context net); ``floor``: add the recording's noise floor."""
     cfg = model.cfg
     device = next(model.parameters()).device
     duration = float(notes[:, 2].max()) + tail if len(notes) else tail
@@ -33,7 +35,8 @@ def render_notes(model, notes, pedals, condition=0, tail=3.0, block_seconds=2.0,
     perf["condition"] = torch.tensor([condition], device=device)
     # the noise generator must live on the model's device (a CPU generator with CUDA tensors raises)
     gen = torch.Generator(device=device).manual_seed(seed)
-    return model(perf, n_samples, block_seconds=block_seconds, generator=gen)["audio"][0].cpu().numpy()
+    out = model(perf, n_samples, block_seconds=block_seconds, generator=gen, residual=residual, floor=floor)
+    return out["audio"][0].cpu().numpy()
 
 
 def main(argv=None):
@@ -47,16 +50,18 @@ def main(argv=None):
     ap.add_argument("--sr", type=int, help="override sample rate (untrained model only)")
     ap.add_argument("--normalize", action="store_true", help="scale the output to a -1 dBFS peak")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--physics-only", action="store_true", help="switch the learned residual off")
+    ap.add_argument("--floor", action="store_true", help="add the recording's noise floor")
     args = ap.parse_args(argv)
 
     model = load_model(args.ckpt, device=args.device, **({"sample_rate": args.sr} if args.sr else {}))
     notes, pedals = load_midi(args.midi)
-    audio = render_notes(model, notes, pedals, year_to_condition(args.year))
+    audio = render_notes(model, notes, pedals, year_to_condition(args.year), residual=not args.physics_only, floor=args.floor)
     peak = np.abs(audio).max()
     if peak > 0.99 or args.normalize:
         audio = audio * (0.89 / peak)
-    sf.write(args.out, audio, model.cfg.sample_rate)
-    print(f"wrote {args.out}: {len(audio) / model.cfg.sample_rate:.1f}s, peak {peak:.3f}")
+    sf.write(args.out, audio.T, model.cfg.sample_rate)
+    print(f"wrote {args.out}: {audio.shape[-1] / model.cfg.sample_rate:.1f}s, {audio.shape[0]} channels, peak {peak:.3f}")
 
 
 if __name__ == "__main__":

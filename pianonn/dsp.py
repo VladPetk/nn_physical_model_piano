@@ -64,8 +64,8 @@ def frames_to_samples(x: torch.Tensor, start: int, length: int, hop: int) -> tor
 def sample_keyed(x: torch.Tensor, key: torch.Tensor, t: torch.Tensor, sr: int, hop: int) -> torch.Tensor:
     """Read per-key frame curves ``x[B, K, F]`` at per-note times ``t[B, N]`` (seconds) for keys ``key[B, N]``."""
     B, K, F = x.shape
-    pos = (t * sr / hop).clamp(0, F - 1 - 1e-4)
-    i0 = pos.floor().long()
+    pos = (t * sr / hop).clamp(0, F - 1)
+    i0 = pos.floor().long().clamp(max=F - 2)  # clamp the index, not pos: F - 1 - eps rounds to F - 1 in float32 for F > ~2000
     w = pos - i0
     flat = x.reshape(B, K * F)
     base = key * F + i0

@@ -12,6 +12,11 @@ One set per recording condition (MAESTRO year):
 The hall hears what the soundboard radiates, so the two are in series:
 ``ir = body * (delta + hall)`` (convolution). The radiation high-pass of the
 body therefore also shapes the reverberant field.
+
+Everything is per microphone channel: MAESTRO is a spaced stereo pair, and its two
+channels correlate at only 0.2-0.4. There are two body FIRs and two decorrelated hall
+tails per condition, a gain per channel, a per-key channel balance, and a learned
+stationary noise floor at the microphones.
 """
 
 import math
@@ -122,14 +127,18 @@ def band_carriers(sr, seconds, seed=1):
 
 
 class Room(nn.Module):
+    """Body, hall, microphone chain and noise floor, one set per recording condition and channel."""
+
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        sr, C = cfg.sample_rate, cfg.n_conditions
-        body = soundboard_body(sr, cfg.body_seconds)
-        self.body = nn.Parameter(body.repeat(C, 1))
+        sr, C, ch = cfg.sample_rate, cfg.n_conditions, cfg.channels
+        # one body FIR per microphone: each hears a different mixture of the soundboard's modes
+        bodies = torch.stack([soundboard_body(sr, cfg.body_seconds, seed=c) for c in range(ch)])
+        self.body = nn.Parameter(bodies.repeat(C, 1, 1))  # [C, ch, L]
         L = int(cfg.hall_seconds * sr)
-        self.register_buffer("carriers", band_carriers(sr, cfg.hall_seconds))
+        # decorrelated tails per channel (a diffuse field), same T60s and band levels
+        self.register_buffer("carriers", torch.stack([band_carriers(sr, cfg.hall_seconds, seed=1 + c) for c in range(ch)]))
         t = torch.arange(L) / sr
         self.register_buffer("t", t)
         # tail builds up between 10 and 40 ms after the direct sound
@@ -139,19 +148,52 @@ class Room(nn.Module):
         self.band_log_gain = nn.Parameter(torch.zeros(C, len(HALL_BANDS)))
         # initial direct-to-reverberant ratio ~0 dB: energy of body * hall = body energy
         with torch.no_grad():
-            hall = self._hall(torch.zeros(1, dtype=torch.long), gain=torch.zeros(1))
-            ratio = body.pow(2).sum() / fft_convolve(torch.cat([body, body.new_zeros(L)])[None], hall).pow(2).sum()
-        self.log_gain = nn.Parameter(torch.full((C,), 0.5 * math.log(ratio.item())))
+            hall = self._hall(torch.zeros(1, dtype=torch.long), gain=torch.zeros(1, ch))[:, 0]
+            ratio = bodies[0].pow(2).sum() / fft_convolve(torch.cat([bodies[0], bodies.new_zeros(L)])[None], hall).pow(2).sum()
+        self.log_gain = nn.Parameter(torch.full((C, ch), 0.5 * math.log(ratio.item())))
+        # microphone chain gain (dB, unbounded): initialised from the recordings' level before training
+        self.mic_gain_db = nn.Parameter(torch.zeros(C, ch))
+        # per-key level difference between the channels (dB, +-6): where along the bridge each key radiates
+        self.raw_pan = nn.Parameter(torch.zeros(C, 88))
+        # stationary noise floor at the microphones (hall, audience, preamps), white-equivalent dBFS per band:
+        # a model that renders digital silence is otherwise scored against the recordings' floor in every
+        # quiet bin (review 3, F1). Initialised from the recordings.
+        self.register_buffer("floor_log2_centers", torch.linspace(math.log2(40.0), math.log2(sr / 2), cfg.noise_bands))
+        self.floor_db = nn.Parameter(torch.full((C, ch, cfg.noise_bands), -90.0))
 
     def _hall(self, cond, gain=None):
+        """Hall impulse responses ``[B, ch, L]``."""
         t60 = torch.exp(self.prior_log_t60 + bounded(self.raw_log_t60[cond], 0.7))  # [B,7]
-        env = torch.exp(-6.91 * self.t / t60[..., None]) * torch.exp(self.band_log_gain[cond])[..., None]
-        gain = self.log_gain[cond] if gain is None else gain
-        return (self.carriers * env).sum(1) * self.ramp * torch.exp(gain)[:, None]
+        env = torch.exp(-6.91 * self.t / t60[..., None]) * torch.exp(self.band_log_gain[cond])[..., None]  # [B,7,L]
+        gain = self.log_gain[cond] if gain is None else gain  # [B, ch]
+        return (self.carriers[None] * env[:, None]).sum(2) * self.ramp * torch.exp(gain)[..., None]
 
     def forward(self, cond):
-        """Impulse responses ``[B, L]`` for conditions ``cond[B]``."""
+        """Impulse responses ``[B, ch, L]`` for conditions ``cond[B]``: mic gain x body * (delta + hall)."""
         hall = self._hall(cond)
-        hall = torch.cat([hall[:, :1] + 1.0, hall[:, 1:]], -1)  # + delta: the direct sound
-        body = self.body[cond]
-        return fft_convolve(torch.cat([body, body.new_zeros(body.shape[0], hall.shape[-1])], -1), hall)
+        hall = torch.cat([hall[..., :1] + 1.0, hall[..., 1:]], -1)  # + delta: the direct sound
+        body = self.body[cond] * torch.pow(10.0, self.mic_gain_db[cond] / 20)[..., None]
+        return fft_convolve(torch.cat([body, body.new_zeros(*body.shape[:2], hall.shape[-1])], -1), hall)
+
+    def pan_gains(self, ki, cond):
+        """Per-note channel gains ``[B, N, ch]`` (equal-power around 0 dB)."""
+        if self.cfg.channels == 1:
+            return torch.ones(*ki.shape, 1, device=ki.device)
+        p = bounded(self.raw_pan[cond[:, None], ki], 6.0)
+        return torch.stack([torch.pow(10.0, p / 40), torch.pow(10.0, -p / 40)], -1)
+
+    def floor_noise(self, cond, n, generator=None):
+        """Stationary noise ``[B, ch, n]`` with the condition's floor spectrum (raised-cosine interpolation of
+        the band levels in log f, the same partition of unity as the noise bank's bands)."""
+        B, ch = cond.shape[0], self.cfg.channels
+        dev = self.floor_db.device
+        white = torch.randn(B, ch, n, generator=generator, device=dev)
+        X = torch.fft.rfft(white)
+        f = torch.fft.rfftfreq(n, 1 / self.cfg.sample_rate).to(dev)
+        c = self.floor_log2_centers
+        pos = ((torch.log2(f.clamp(min=1.0)) - c[0]) / (c[1] - c[0])).clamp(0, len(c) - 1)
+        i0 = pos.floor().long().clamp(max=len(c) - 2)
+        w = torch.sin(0.5 * math.pi * (pos - i0)) ** 2
+        power = torch.pow(10.0, self.floor_db[cond] / 10)  # [B, ch, bands]
+        psd = power[..., i0] * (1 - w) + power[..., i0 + 1] * w
+        return torch.fft.irfft(X * psd.sqrt(), n)

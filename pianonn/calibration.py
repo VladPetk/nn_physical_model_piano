@@ -430,7 +430,7 @@ def render_note(model, pitch, velocity, seconds, body=False, snr_db=60.0, seed=0
         if body:
             saved = m.room.log_gain.clone()
             m.room.log_gain.fill_(-30.0)
-        x = m(_perf(model, n, [(pitch, pre / sr, n / sr, velocity)]), n)["audio"][0].double().numpy()
+        x = m(_perf(model, n, [(pitch, pre / sr, n / sr, velocity)]), n)["audio"][0, 0].double().numpy()
         if body:
             m.room.log_gain.copy_(saved)
     rng = np.random.default_rng(seed + pitch)

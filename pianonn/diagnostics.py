@@ -35,9 +35,20 @@ IOWA_PITCH = {"C1": 24, "C2": 36, "C3": 48, "C4": 60, "A4": 69, "C5": 72, "C6": 
 
 
 def _variant(model, **flags):
+    """A shallow copy with other feature flags: the physics only (no learned residual, no noise floor), first
+    microphone channel. The knock impulse is off unless asked for, as in the calibration of the prior."""
     m = copy.copy(model)
-    m.cfg = type(model.cfg)(**{**model.cfg.to_dict(), **flags})
-    return m
+    m.cfg = type(model.cfg)(**{**model.cfg.to_dict(), "use_context": False, "use_floor": False, "use_impulse": False, **flags})
+    return m  # the flags are read by the top-level forward only; submodules keep the shared config
+
+
+def _mono(v):
+    """First channel of ``[B, ch, T]`` outputs (``[B, T]`` ones pass through), example 0."""
+    return v[0, 0] if v.dim() == 3 else v[0]
+
+
+def _outputs(out):
+    return {k: _mono(v).double().numpy() for k, v in out.items() if torch.is_tensor(v)}
 
 
 def _perf(model, n, notes, sustain=0.0):
@@ -51,8 +62,7 @@ def _perf(model, n, notes, sustain=0.0):
 @torch.no_grad()
 def _render(model, seconds, notes, sustain=0.0):
     n = int(seconds * model.cfg.sample_rate)
-    return {k: v[0].double().numpy() for k, v in
-            model(_perf(model, n, notes, sustain), n, block_seconds=2.0, generator=torch.Generator().manual_seed(0)).items()}
+    return _outputs(model(_perf(model, n, notes, sustain), n, block_seconds=2.0, generator=torch.Generator().manual_seed(0)))
 
 
 def _partials(x, sr, freqs, t0=0.05, t1=2.0):
@@ -221,13 +231,13 @@ def run(model):
         lvl = _rms_db(out["noise"][w]) - _rms_db(out["strings"][w])
         check(f"knock re tone, first 60 ms, vel {v} (dB)", lvl, f"{target} +-3", abs(lvl - target) <= 3, "{:.0f}")
     out = _render(no_symp, 1.5, [(60, 0.0, 0.8, 64)])
-    rel = 0.8 + model.cfg.damper_delay
+    rel = 0.8 + float(model.physics.damper_delay(torch.tensor([9])))
     lvl = _rms_db(out["noise"][int(rel * sr): int((rel + 0.04) * sr)]) - _rms_db(out["strings"][int((rel - 0.1) * sr): int(rel * sr)])
     check("damper noise re released note (dB)", lvl, "-45..-35", -45 <= lvl <= -35, "{:.0f}")
     perf = _perf(model, 2 * sr, [(60, 0.0, 1.9, 64)])
     t = torch.arange(perf["sustain"].shape[-1]) * model.cfg.hop / sr
     perf["sustain"] = ((t > 0.5) & (t < 1.2)).float()[None]
-    out = {k: v[0].double().numpy() for k, v in no_symp(perf, 2 * sr, generator=torch.Generator().manual_seed(0)).items()}
+    out = _outputs(no_symp(perf, 2 * sr, generator=torch.Generator().manual_seed(0)))
     w = slice(int(0.5 * sr), int(0.6 * sr))
     lvl = _rms_db(out["noise"][w]) - _rms_db(out["strings"][w])
     check("pedal-press noise re mf note (dB)", lvl, "-35 +-5", abs(lvl + 35) <= 5, "{:.0f}")

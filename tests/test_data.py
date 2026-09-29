@@ -56,8 +56,10 @@ def test_prepare_and_sample_segments(tmp_path):
     ds = MaestroSegments(str(out), "train", cfg, segment=1.0, warmup=0.5, lookback=1.0, length=4, deterministic=True)
     batch = collate([ds[i] for i in range(4)])
     n = batch["audio"].shape[-1]
-    assert n == int(1.5 * cfg.sample_rate)
-    assert batch["sustain"].shape[-1] == n // cfg.hop + 2
+    assert n == int(1.5 * cfg.sample_rate) and batch["audio"].shape[1] == 2  # both channels kept
+    H = int(batch["hist_frames"][0])
+    assert H == int(1.0 * cfg.sample_rate / cfg.hop)
+    assert batch["sustain"].shape[-1] == H + n // cfg.hop + 2
     assert batch["condition"].tolist() == [9] * 4
     model = NeuralPhysicalPiano(cfg)
     assert model(batch, n)["audio"].shape == batch["audio"].shape
@@ -68,5 +70,22 @@ def test_render_notes_untrained():
     notes = np.array([[60, 0.0, 0.5, 80], [67, 0.25, 0.75, 70]], dtype=np.float64)
     pedals = {f"{k}_{s}": np.zeros(0) for k in ("sustain", "sostenuto", "soft") for s in "tv"}
     audio = render_notes(model, notes, pedals, tail=0.5)
-    assert audio.shape == (int(1.25 * model.cfg.sample_rate),) and np.isfinite(audio).all()
+    assert audio.shape == (2, int(1.25 * model.cfg.sample_rate)) and np.isfinite(audio).all()
     assert torch.tensor(audio).abs().max() > 1e-3
+
+
+def test_prepare_from_zip(tmp_path):
+    """The MAESTRO archive can be read without unpacking it."""
+    import zipfile
+
+    root, row = _fake_maestro(tmp_path)
+    zpath = tmp_path / "maestro-v3.0.0.zip"
+    with zipfile.ZipFile(zpath, "w") as z:
+        for f in root.rglob("*"):
+            if f.is_file():
+                z.write(f, "maestro-v3.0.0/" + f.relative_to(root).as_posix())
+    out = tmp_path / "prepared"
+    (out / "audio").mkdir(parents=True)
+    (out / "midi").mkdir()
+    info = prepare_piece(str(zpath), row, str(out), 8000)
+    assert info["channels"] == 2 and abs(info["duration"] - 3.0) < 1e-3
