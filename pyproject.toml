@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pianonn"
+version = "0.1.0"
+description = "Physically-modelled piano whose parameters are fitted to MAESTRO by gradient descent"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.1", "numpy", "scipy", "soundfile", "pretty_midi"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["pianonn*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
