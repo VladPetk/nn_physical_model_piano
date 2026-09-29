@@ -121,7 +121,10 @@ recording calibration is in [`docs/calibration_iowa.md`](docs/calibration_iowa.m
 [`docs/diagnostics_prior.md`](docs/diagnostics_prior.md).
 `samples/` has renders of `samples/demo.mid`: `physics_prior_v1.wav` is the first guess and
 `physics_prior_v2.wav` is the first literature pass, `v3` has the review fixes, `v4` is the v2
-calibration, and `v5` is the corrected v3 calibration (fast three-string prompt decay).
+calibration, and `v5` is the corrected v3 calibration (fast three-string prompt decay). `v6` is the v4
+per-partial calibration (steeper hammer top, high partials that sustain, frequency-dependent bridge loss), and
+`ab_bass_notes_v5_v6.wav` plays A1, C2 and C3 at mf three times each: the Iowa Steinway recording, v5, then v6
+(each through the soundboard body only, no hall, loudness-matched).
 
 ## Status
 

@@ -350,6 +350,70 @@ def analyze_dir(root, workers=None):
     return results
 
 
+PARTIAL_TIMES = (0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 16.0)
+
+
+def partial_table(x, sr, pitch, times=PARTIAL_TIMES, max_freq=10000.0, n_max=60):
+    """Per-partial early level and decay of one note: for n = 1.. (frequencies from the stiff-string fit),
+    noise from the silence before the onset, or from the last 2 s of the file,
+    ``early_db`` is the peak power in the first 0.15 s (dB, noise-compensated; nan below 10 dB SNR) and
+    ``level_db[i]`` the mean power over +-0.1 s around ``times[i]`` re that peak (nan below 3 dB SNR);
+    ``noise_db`` is the noise power in the partial's band re the loudest partial's early peak."""
+    x = _as_2d(x)
+    onset = find_onset(x, sr)
+    pre = x[: max(0, onset - int(0.05 * sr))]
+    f_nom = 440.0 * 2 ** ((pitch - 69) / 12)
+    Br = rigaud_B(pitch)
+    tr = track_partials(x, sr, onset, f_nom, (Br / 4, Br * 4))
+    if tr is None:
+        return None
+    if len(pre) < int(0.1 * sr):  # noise from the end of the file instead (the note has been released by then)
+        pre = x[-int(2 * sr):]
+    f0, B = tr["f0"], tr["B"]
+    seg = x[: onset + int((max(times) + 0.5) * sr)]
+    step = sr // 100
+    out = {"pitch": pitch, "f0": f0, "B": B, "n": [], "f": [], "early_db": [], "level_db": [], "noise_db": []}
+    for n in range(1, n_max + 1):
+        f = n * f0 * math.sqrt(1 + B * n * n)
+        if f > min(max_freq, 0.45 * sr):
+            break
+        P = partial_power(seg, sr, f, f0)[onset::step]
+        noise = float(np.median(partial_power(pre, sr, f, f0)[len(pre) // 4: -len(pre) // 4 or None]))
+        t = np.arange(len(P)) / 100
+        e = float(P[t < 0.15].max())
+        out["n"].append(n)
+        out["f"].append(f)
+        out["early_db"].append(10 * math.log10(e - noise) if e > 10 * noise else float("nan"))
+        lv = []
+        for tt in times:
+            v = float(P[(t > tt - 0.1) & (t < tt + 0.1)].mean()) - noise
+            lv.append(10 * math.log10(v / e) if v > noise and e > 10 * noise else float("nan"))
+        out["level_db"].append(lv)
+        out["noise_db"].append(10 * math.log10(max(noise, 1e-30)))
+    peak = np.nanmax(out["early_db"]) if np.isfinite(out["early_db"]).any() else 0.0
+    out["noise_db"] = [v - peak for v in out["noise_db"]]
+    return out
+
+
+def _partial_file(path):
+    import soundfile as sf
+
+    _, dyn, note = os.path.basename(path).rsplit(".", 1)[0].split(".")
+    x, sr = sf.read(path, always_2d=True)
+    r = partial_table(x, sr, note_to_midi(note))
+    if r is not None:
+        r.update(file=os.path.basename(path), dynamic=dyn)
+    return r
+
+
+def partial_tables(root, workers=None):
+    from multiprocessing import Pool
+
+    paths = sorted(glob.glob(os.path.join(root, "*.aif*")))
+    with Pool(workers or os.cpu_count()) as pool:
+        return [r for r in pool.map(_partial_file, paths) if r is not None]
+
+
 def render_note(model, pitch, velocity, seconds, body=False, snr_db=60.0, seed=0):
     """Render one isolated note like a recording: 0.3 s of silence first, dry strings (or strings through
     the soundboard body, no hall), and a white noise floor ``snr_db`` below the peak so that low-level

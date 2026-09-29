@@ -1,9 +1,21 @@
-# Physical parameters: requirements (v3)
+# Physical parameters: requirements (v4)
 
 This is the spec the physics prior (`pianonn/physics.py`, `pianonn/synth.py`, `pianonn/room.py`)
 must meet before any MAESTRO fitting.
 
-v3 fixes what the second review ([`reviews/review_2_calibration.md`](reviews/review_2_calibration.md)) showed was wrong in v2:
+v4 fixes a harpsichord-like colour in the bass and tenor. Measuring every partial below 10 kHz (not only
+n = 1..5) against the recordings (`scripts/compare_partials.py`) showed three faults in v3:
+- The attack was 15–25 dB too loud above 3.5 kHz in the bass and tenor: one power-law hammer roll-off cannot be
+  flat enough in the middle and steep enough on top. The hammer now has a second, steeper corner.
+- High partials died far too early (b3 f² loss): at 3 s the 1.7–3.5 kHz partials of bass notes were 15–50 dB
+  below the recording. The aftersound loss now grows ~linearly with frequency (fitted exponent 1.09).
+- Every partial had the same prompt-stage (bridge) loss, so notes faded as one block. It now follows one
+  bridge-conductance curve over frequency.
+The bass inharmonicity prior was also ~2× the Steinway's (Rigaud's curve); it now carries the measured ratio.
+These are fitted to the Iowa recordings in one pass (`scripts/fit_spectra.py`, `scripts/fit_decays.py`) and
+are meant as a better starting point for the MAESTRO fit, not a final calibration.
+
+v3 fixed what the second review ([`reviews/review_2_calibration.md`](reviews/review_2_calibration.md)) showed was wrong in v2:
 - The v2 "prompt T60" metric misread the recordings. Real mid-range notes lose about 20 dB in their first
   second, three strings' worth of bridge loss, as the literature predicted; v2's model lost 5 dB. Decays are
   now fitted to measured decay profiles.
@@ -40,14 +52,16 @@ C5 = 51, C6 = 63, C7 = 75, C8 = 87. Point lists are `key_curve` inputs, `(k, val
 
 | parameter | prior | evidence |
 |---|---|---|
-| Inharmonicity B | B(m) = exp(0.0926 m − 13.64) + exp(−0.0847 m − 5.82), m = MIDI pitch: 5.1e-4 at A0, minimum 1.4e-4 near k = 23, 3.3e-4 at C4, 2.85e-3 at C6, 2.6e-2 at C8 | **L**, second-hand: Rigaud, David & Daudet (DAFx 2011), as quoted and used by DDSP-Piano (Zenodo 8386706, eq. 4); the original paper was not read. **I** agrees within 5 % from C4 to C5 (C4 0 %, A4 +5 %, C5 +1 %) and is 34 % lower at C6 (1.9e-3 vs 2.85e-3; treble fits are less reliable). The Iowa bass is 1.3–2× lower, and the bass asymptote is piano-specific per Rigaud. The treble tracker is constrained to ×/÷4 of this curve. |
+| Inharmonicity B | B(m) = exp(0.0926 m − 13.64) + exp(−0.0847 m − 5.82), m = MIDI pitch: 5.1e-4 at A0, minimum 1.4e-4 near k = 23, 3.3e-4 at C4, 2.85e-3 at C6, 2.6e-2 at C8; **times the Iowa/Rigaud ratio** `(0,0.48) (9,0.46) (15,0.7) (21,0.88) (39,0.9) (45,1.0) (87,1.0)` (v4) | Ratio **I** (median over ±2 keys of reliable fits). A concert grand's longer bass strings are less inharmonic still, so it is the right direction for MAESTRO too. Curve **L**, second-hand: Rigaud, David & Daudet (DAFx 2011), as quoted and used by DDSP-Piano (Zenodo 8386706, eq. 4); the original paper was not read. **I** agrees within 5 % from C4 to C5 (C4 0 %, A4 +5 %, C5 +1 %) and is 34 % lower at C6 (1.9e-3 vs 2.85e-3; treble fits are less reliable). The Iowa bass is 1.3–2× lower, and the bass asymptote is piano-specific per Rigaud. The treble tracker is constrained to ×/÷4 of this curve. |
 | Stretch (cents re A4, of the *sounding* fundamental f₁ = f₀√(1+B)) | `(0,-16) (3,-15) (15,-4) (27,0) (39,-1) (48,0) (51,0) (63,6) (75,14) (87,25)` | **I** (C8 extrapolated). v1's memory-based Railsback curve (−30 / +25 at A0 / A7) was about twice as wide. Tuners tune what sounds, so the model computes f₀ = f₁/√(1+B). |
 | Strings per key | 1 for k < 8, 2 for k < 26, 3 above | **L** only "except the lowest octave" (Bank et al.); break points M |
 | Unison mistuning | 0.2–2 cents per aftersound mode, same in cents for all partials, with sign and size drawn at random per key (seeded) | **L**: Weinreich, *mistuned.html*, Fig. 8. Tuners' mistuning "varied randomly from note to note" (Kirk 1959, as quoted). A shared pattern lines up the beat nulls of neighbouring keys. |
-| Aftersound loss b1 (1/s) | `(0,0.101) (3,0.101) (15,0.126) (27,0.171) (39,0.23) (48,0.248) (51,0.332) (63,0.6) (75,0.583) (87,1.5)` | **I**: fitted with R and the aftersound amplitude to the measured decay profiles (`scripts/fit_decays.py`). A0 rests on 3 notes (partly mislabelled), so it takes C1's values. |
-| Loss b3 (per Hz²) | `(0,2.5e-7) (20,2.5e-7) (30,1.2e-7) (55,1.0e-7) (63,5e-8) (87,2.5e-8)` | M. The treble values are low confidence: the treble recordings' "partials" are partly non-string components. |
-| Prompt (in-phase) mode | **Additive** bridge loss: α_prompt,n = α_after,n + (R − 1)·b1. R = `(0,6.15) (3,6.15) (15,7.67) (27,8.26) (39,12.2) (48,14.7) (51,17.3) (63,5.1) (75,7.1) (87,5.4)` | Form **L**: Weinreich (in-phase motion of N strings loads the bridge N× harder; one string decays at 8 dB/s, so a trichord's prompt stage is about 24 dB/s); Ege & Boutillon (mean bridge mobility roughly frequency-independent, so the loss does not depend on n). R is **I** (fitted). |
-| Aftersound amplitude per mode | `(0,0.11) (3,0.11) (15,0.154) (27,0.076) (39,0.042) (48,0.025) (51,0.04) (63,0.04) (75,0.006) (87,0.007)` | **I** (fitted). The treble aftersound almost vanishes: C7 decays nearly single-slope. |
+| Aftersound loss | α_after,n = b1 + b3·(1 kHz)²·(f_n / 1 kHz)^p, p = 1.09 (global, learnable ×/÷1.28) | **I** (v4): fitted, with everything below, to the level of every partial below 10 kHz at 0.5–16 s (`scripts/fit_decays.py`, 154 mf/ff notes, loud partials weighted up). The textbook b1 + b3 f² (p = 2) killed the high partials of bass notes 15–50 dB too early. |
+| b1 (1/s) | `(0,0.129) (12,0.143) (20,0.174) (27,0.193) (34,0.204) (39,0.211) (45,0.228) (51,0.261) (57,0.318) (63,0.405) (75,0.562) (87,0.687)` | **I** (fitted) |
+| b3 (at 1 kHz, per Hz²) | `(0,2.33e-7) (12,1.51e-7) (20,1.29e-7) (27,1.34e-7) (34,1.43e-7) (39,1.4e-7) (45,1.35e-7) (51,1.23e-7) (57,9.43e-8) (63,5.79e-8) (75,3.18e-8) (87,1.65e-8)` | **I** (fitted). Treble low confidence: the treble recordings' "partials" are partly non-string components. |
+| Prompt (in-phase) mode | **Additive** bridge loss: α_prompt,n = α_after,n + (R − 1)·b1·g(f_n). R = `(0,9.66) (12,11.0) (20,12.1) (27,13.0) (34,14.0) (39,15.3) (45,15.6) (51,13.5) (57,10.9) (63,9.43) (75,10.1) (87,12.3)` | Form **L**: Weinreich (in-phase motion of N strings loads the bridge N× harder; the loss rate is ∝ f₀·Z₀·G(f_n), a per-key factor times the bridge conductance at the partial). R is **I** (fitted). |
+| Bridge conductance g(f) | one curve for all keys, log-f interpolated, geometric mean 1: 55 Hz 0.72, 110 0.81, 220 0.88, 440 0.92, 880 0.79, 1760 0.76, 3520 1.01, 7040 1.53 (14 kHz repeats 7 kHz); learnable per knot ×/÷2.7 | **I** (v4, fitted). Only the smooth trend: the resonance-scale detail of a real soundboard is piano-specific (the Steinway's C2–B2 partials at 110–220 Hz decay far faster than the model's) and is left to MAESTRO. With the trend alone, the spread of partial decays within a note matches the recordings except in the lowest octave (3.4 vs 5.3 dB). |
+| Aftersound amplitude per mode | `(0,0.317) (12,0.226) (20,0.144) (27,0.0954) (34,0.0669) (39,0.0487) (45,0.0368) (51,0.0279) (57,0.0194) (63,0.0106) (75,0.00473) (87,0.00225)` | **I** (fitted). The treble aftersound almost vanishes: C7 decays nearly single-slope. |
 
 Measured decay profile the prior must reproduce (**I**). Values are the level, in dB re peak, of the power-summed decay
 partials, both channels, medians over mf and ff and ±3 semitones. The decay partials are n = 2..5 below C3 (the
@@ -87,8 +101,8 @@ Phase 2 (not implemented; there are no data to check against yet):
 | Contact time T_c at mf (2.8 m/s), ms | `(0,3.7) (15,3.0) (27,2.8) (39,2.1) (51,1.45) (63,1.1) (75,0.6) (87,0.5)` | **L**: Askenfelt & Jansson, *stricont.html*, Fig. 7 |
 | Hammer speed vs MIDI velocity | v_h = 2.8·exp(0.023·(vel − 64)) m/s, so p ≈ 40 → 1.6, mf = 64 → 2.8, f ≈ 90 → 5.1, ff ≈ 115 → 9.0 | M, anchored on the dynamic labels of **L** (Askenfelt Fig. 6). It makes "mf" mean the same thing (MIDI 64 = 2.8 m/s) in contact time, roll-off order, key-bottom timing and calibration. |
 | T_c vs hammer speed | T_c = T_c,mf·(v_h/2.8)^−0.2 | **L**: slope −0.19 at C4 (Askenfelt Fig. 6) |
-| Force spectrum | Smooth envelope \|F̂\| = (1 + (fT_c/0.59)^(2q))^−½, computed in the log domain (softplus) so partials far above Nyquist cannot overflow. −3 dB at 0.59/T_c, then −6q dB/oct. The ideal half-sine's nulls are not modelled: they slide across partials with T_c and made treble brightness fall with velocity. | D; pulse shape **L** (Hall Fig. 18: smooth, slightly skewed bells) |
-| Roll-off order q at mf | `(0,1.3) (27,1.3) (39,2.35) (48,3.2) (51,4.0) (63,4.7) (75,5.3) (87,5.3)`, learnable ×0.4–2.5 | C4 = 2.35 is **L**: Hall Fig. 15, C4 slopes −18 / −15 / −11 dB/oct at vel 30 / 64 / 110; the model gives −18.0 / −14.8 / −11.3. It also reproduces the Iowa C4 near-field slope within 1 dB/oct, independently. The rest is a smooth curve rising from bass to treble, through orders fitted to the Iowa slopes (**I**, both channels, through the body). Because it is microphone- and instrument-specific, it has a wide bound. |
+| Force spectrum | Smooth envelope \|F̂\| = (1 + (fT_c/0.59)^(2q))^−½ · (1 + (fT_c/x₂)^(2q₂))^−½ with x₂ = 3.98 (learnable ×/÷2), q₂ = 2.58, computed in the log domain (softplus) so partials far above Nyquist cannot overflow. −3 dB at 0.59/T_c, then −6q dB/oct, steepening by −6q₂ dB/oct above fT_c = x₂ (v4, **I**: `scripts/fit_spectra.py`, every partial below 10 kHz of 159 mf/ff notes through the body; rms error 15 → 9.8 dB, the bass/tenor excess above 3.5 kHz +24 → +1 dB). The ideal half-sine's nulls are not modelled: they slide across partials with T_c and made treble brightness fall with velocity. | D; pulse shape **L** (Hall Fig. 18: smooth, slightly skewed bells) |
+| Roll-off order q at mf | `(0,0.99) (15,1.2) (27,1.15) (39,1.42) (51,2.24) (63,4.26) (75,5.3) (87,5.3)`, learnable ×0.4–2.5 | **I** (v4), fitted with the second corner; the top two knots (1–4 partials below 10 kHz) keep v3's values. With the second corner, C4's slope over partials 1–10 is −14.3 / −11.3 / −8.1 dB/oct at vel 30 / 64 / 110: ~3.5 dB/oct flatter than Hall's piano (−18 / −15 / −11, **L** Fig. 15), which v3 copied. The velocity steps still follow Hall. Microphone- and instrument-specific, hence the wide bound. |
 | q vs hammer speed | q = q_mf·(v_h/2.8)^−0.225: harder blows drive the felt into its stiff, nonlinear range and sharpen the pulse | **L**: Hall (felt exponent p = 2.2 bass → 3 treble, Fig. 20). Fitted jointly with the C4 order. **I**: mf→ff centroid ×1.20–1.25 at C4/A4 (model ×1.24–1.27). |
 | Level vs velocity | learned dB slope, about 40 dB across the MIDI range | **L**: 33 dB pp→ff on the pianist-accessible scale (Askenfelt, *keybott.html*, Fig. 5). Iowa's dynamics carry no MIDI velocities, so MAESTRO calibrates this. |
 | Attack | Partials ramp in over T_c, with phases referenced to the pulse centre | D. The slower rise measured in the recordings (8–16 ms mid-range) comes mainly from soundboard build-up: the model with its body gives 20 ms at C4 and 11 ms at C6, against 13 and 9 ms measured. |
@@ -149,7 +163,8 @@ Against the literature and physics:
 
 4. Effective B vs Rigaud at C4 and C6. *Regression check*: the prior is this curve.
 5. Effective B vs Iowa (×2) at C2 and C4. Independent of the prior.
-6. C4 slope over partials 1–10 at vel 30/64/110 vs Hall's −18/−15/−11 ±2 dB/oct. *Regression*: fitted to it.
+6. C4 slope over partials 1–10 at vel 64 vs Hall's −15 ±5 dB/oct (another piano; the tolerance of check 2), and the
+   slope steps vel 30→64→110 vs Hall's +3/+4 ±1.5 dB/oct (*regression*: the velocity law is Hall's).
 7. Brightness rises monotonically with velocity at C2, C4, C6 and C7.
 8. C4 partials 2–6 in −30..+3 dB and partial 10 ≤ −30 dB. v1's memory-based sanity range (M), kept.
 9. A0 and C2 radiated fundamentals are ≥ 10 dB below the strongest partial.
@@ -162,9 +177,18 @@ Removed since v2:
 - v1's "C4 centroid vel 120/vel 40 in 1.1–2" (M). It is replaced by check 6 (sourced). With Hall's slopes, the
   ratio is 2.1.
 
-Current status: **47/50**. The failures are the C5, C6 and C7 decay profiles, off by 7–11 dB at 1–4 s. These
-treble targets are low confidence, and fitting single-note beat patterns to them would overfit, so they are left
-failing.
+Changed in v4: check 6 was three absolute slopes ±2 dB/oct (a regression check on v3's copy of Hall). The
+absolute order now comes from the Iowa spectra, so Hall's absolute slope is checked with the ±5 dB/oct of the
+other slope checks, and the velocity steps (still Hall's) stay tight.
+
+Current status: **45/50** (v3: 47/50). Failing:
+- C2 and C3 decay profiles: 6–7 dB faster than recorded at 1–2 s (C3 also at 16 s). The per-partial fit trades
+  these few loud low partials against all the others; the C2–B2 region also has piano-specific soundboard
+  resonances (see g(f)). Left for MAESTRO.
+- C5 and C6 decay profiles (failing in v3 as well): low-confidence treble targets.
+- C7 early spectral slope: the model's partials 2+ now fall under the 60 dB analysis floor, so no slope is measured.
+
+These were not tuned further by hand: the next calibration is a proper fit to MAESTRO.
 
 ## 7. Open items
 

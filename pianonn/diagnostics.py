@@ -165,14 +165,21 @@ def run(model):
     check("C4 vel 80 partials 2-6 re p1 (dB) [M]", " ".join(f"{d:+.0f}" for d in lev[1:6]), "-30..+3",
           bool(np.all((lev[1:6] >= -30) & (lev[1:6] <= 3))))
     check("C4 vel 80 partial 10 re p1 (dB) [M]", lev[9], "<= -30", lev[9] <= -30, "{:+.0f}")
-    # Hall, Five Lectures, Fig. 15: C4 spectral slope over partials 1-10 at pp / mf / ff (the roll-off law was
-    # fitted to these, so this is a regression check of the rendering path)
+    # Hall, Five Lectures, Fig. 15: C4 spectral slope over partials 1-10 at pp / mf / ff = -18 / -15 / -11 dB/oct.
+    # The velocity law (HAMMER_ORDER_VEL) is still Hall's, so its steps are a regression check. The absolute
+    # slope now comes from the Iowa attack spectra (fit_spectra.py), which make C4 ~3-4 dB/oct flatter than
+    # Hall's piano: checked against Hall with the tolerance of the Iowa slope checks.
     ki = torch.tensor([[39]])
-    for vel, target in ((30, -18.0), (64, -15.0), (110, -11.0)):
+    slopes = {}
+    for vel in (30, 64, 110):
         a = model.physics.modes(ki, torch.tensor([[vel / 127]]), torch.zeros(1, 1), torch.tensor([9]))["amp"][0, 0, :10, 0].abs().numpy()
-        s_ = np.polyfit(np.log2(np.arange(1, 11)), 20 * np.log10(a / a[0] + 1e-12), 1)[0]
-        check(f"C4 spectral slope, partials 1-10, vel {vel} (dB/oct) [regression: fitted to Hall]", s_, f"{target:+.0f} +-2",
-              abs(s_ - target) <= 2, "{:.1f}")
+        slopes[vel] = np.polyfit(np.log2(np.arange(1, 11)), 20 * np.log10(a / a[0] + 1e-12), 1)[0]
+    check("C4 spectral slope, partials 1-10, vel 64 (dB/oct) vs Hall (another piano)", slopes[64], "-15 +-5",
+          abs(slopes[64] + 15) <= 5, "{:.1f}")
+    for (v0, v1), target in (((30, 64), 3.0), ((64, 110), 4.0)):
+        d = slopes[v1] - slopes[v0]
+        check(f"C4 slope step vel {v0} -> {v1} (dB/oct) [regression: velocity law from Hall]", d, f"+{target:.0f} +-1.5",
+              abs(d - target) <= 1.5, "{:+.1f}")
     for name in ("C2", "C4", "C6", "C7"):
         cs = [_centroid(_render(dry, 0.5, [(KEYS[name], 0.0, 0.5, v)])["audio"], sr) for v in (30, 60, 90, 120)]
         check(f"{name} brightness rises with velocity (centroid Hz, vel 30/60/90/120)", " ".join(f"{c:.0f}" for c in cs),

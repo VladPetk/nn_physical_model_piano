@@ -93,6 +93,30 @@ Rendered notes are then checked against the targets, with the model aggregated l
 neighbouring keys and velocities. They pass at C1–C4, A4 and C7. C5–C7 were less reliable to begin with (see
 `physical_parameters.md`, section 6).
 
+## Per-partial fit (v4)
+
+v3 calibrated decays on partials 2–5 (bass) or 1–4 only, and the spectrum on the slope of the first 12 partials.
+Listening showed a harpsichord-like bass. `pianonn.calibration.partial_tables` now measures every partial below
+10 kHz: its attack level and its level at 0.5/1/2/3/5/8/12/16 s (noise-compensated; below the noise it becomes
+an upper bound), stored in `data/iowa_partials.json` (254 notes). `scripts/compare_partials.py` renders the
+model at the same keys and dynamics and measures it with the same code. It showed, for v3, in the bass and tenor:
+
+- attack spectrum 15–25 dB too loud above 3.5 kHz (with 4–8 dB too little at 0.4–1.8 kHz);
+- partials above ~1 kHz decaying far too fast (1.7–3.5 kHz: −48 dB at 3 s against −35 dB recorded);
+- the same prompt-stage loss for every partial.
+
+Two one-pass fits followed (analytic, seconds each):
+- `scripts/fit_spectra.py`: hammer roll-off order per key plus a second corner (x₂, q₂). Error 15.0 → 9.8 dB rms.
+  A smooth body-EQ correction was fitted too; it came out below 2 dB to 7 kHz, so the body prior is unchanged.
+- `scripts/fit_decays.py`: b1, b3, R, aftersound amplitude per key, a global exponent p for the aftersound loss
+  over frequency, and one bridge-conductance curve g(f). Per-partial level error 18 → 11 dB rms (median 6.4 → 4.9).
+
+After the fit, rendered and measured (`compare_partials.py`), the bass/tenor attack above 3.5 kHz is within ~5 dB
+and the partial decays track the recordings to within a few dB up to 8 s in most bands. Known misses: the C2–B2
+partials at 110–220 Hz decay much faster on this Steinway (a soundboard feature), and the mid-register low
+partials still fall ~5 dB too fast in the first second. These fits are a starting point for MAESTRO, not a
+final calibration.
+
 ## Review history
 
 - **Review 2** ([`reviews/review_2_calibration.md`](reviews/review_2_calibration.md)) found that v2's per-partial
