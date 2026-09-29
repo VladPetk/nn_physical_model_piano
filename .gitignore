@@ -6,3 +6,4 @@ data/
 *.wav
 *.flac
 *.pt
+!samples/*.wav
