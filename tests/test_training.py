@@ -36,6 +36,32 @@ def test_student_moves_towards_teacher():
     assert eval_loss() < 0.9 * before
 
 
+def test_gradients_finite_with_noise():
+    """A full step with the noise bank on must not produce NaN/Inf gradients.
+
+    sqrt(power) has an infinite gradient where the band power is exactly 0 (silent
+    bands/samples), which used to poison the whole backward pass with NaNs after the
+    first step. The student-vs-teacher test runs with use_noise=False, so this path
+    needs its own guard.
+    """
+    cfg = small_cfg(use_noise=True)
+    teacher = perturb_physics(NeuralPhysicalPiano(cfg), scale=0.3, seed=1).eval()
+    student = NeuralPhysicalPiano(cfg)
+    data = SyntheticPerformances(cfg, seconds=0.5, max_notes=4, length=8)
+    loss_fn = MultiResolutionSTFTLoss(fft_sizes=(1024, 256, 64))
+    n = int(0.5 * cfg.sample_rate)
+    batch = collate([data[i] for i in range(4)])
+
+    with torch.no_grad():
+        target = teacher(batch, n)["audio"]
+    loss = loss_fn(student(batch, n)["audio"], target) + student.physics.regularizer()
+    loss.backward()
+    assert torch.isfinite(loss)
+    bad = [name for name, p in student.named_parameters()
+           if p.grad is not None and not torch.isfinite(p.grad).all()]
+    assert not bad, f"non-finite gradients in: {bad}"
+
+
 def test_adversarial_losses_run():
     disc = MultiResolutionDiscriminator(fft_sizes=(256, 512))
     real, fake = torch.randn(2, 4000), torch.randn(2, 4000, requires_grad=True)

@@ -331,7 +331,9 @@ class NeuralPhysicalPiano(nn.Module):
             if sel.numel():
                 power = power + self.noise.event_power(ki[:, sel], u[:, sel], onset[:, sel], release[:, sel],
                                                        w_on[:, sel], w_off[:, sel], log_knock[:, sel], s0, L)
-            out.append((self.noise.band_noise(white, s0, L) * power.clamp(min=0).sqrt()).sum(1))
+            # sqrt has an infinite gradient at 0 (and power is exactly 0 in silent bands/samples),
+            # which would poison the backward pass with NaNs; the floor keeps the amplitude gradient finite.
+            out.append((self.noise.band_noise(white, s0, L) * (power.clamp(min=0) + 1e-12).sqrt()).sum(1))
         return torch.cat(out, -1)
 
     def forward(self, perf, n_samples, block_seconds=None, generator=None):
