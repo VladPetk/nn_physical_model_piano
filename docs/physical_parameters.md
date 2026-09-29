@@ -1,4 +1,9 @@
-# Physical parameters: requirements (v4)
+# Physical parameters: requirements (v5)
+
+v5 adds what review 3 found missing for loud, pedalled music and for fitting real recordings
+(details and status in [`plan_phase0_1.md`](plan_phase0_1.md)); section 8 lists the new rows. The Iowa
+values below are unchanged: from now on the values are refitted on MAESTRO, per year where the
+instrument differs.
 
 This is the spec the physics prior (`pianonn/physics.py`, `pianonn/synth.py`, `pianonn/room.py`)
 must meet before any MAESTRO fitting.
@@ -198,3 +203,21 @@ These were not tuned further by hand: the next calibration is a proper fit to MA
   is fitted on MAESTRO.
 - **Treble decays** (C5–C7): low-confidence targets; re-derive on MAESTRO with a treble-aware tracker.
 - **To calibrate on MAESTRO:** damper delay and damper boundary key, hall T60 per year, bass inharmonicity per year.
+
+## 8. Added in v5 (review 3)
+
+| parameter | prior | evidence |
+|---|---|---|
+| Re-strike | every later strike of the same key multiplies the earlier instance's vibration by e^−r over 2 ms; r = `(0,0.35) (39,0.7) (87,1.0)` nats, learnable ×/÷e per key | M. Physics: the contact is short against the period of low partials in the bass and outlasts it in the treble. Measured on the model: an 8-strike tremolo under the pedal builds up +1 to +5 dB without it, ≤ +1.3 dB with it |
+| Phantom partials | components at 2f_j and f_j + f_(j+1), j ≤ 16, from the prompt × prompt and first aftersound × aftersound modes; amplitude a_j a_k / a_mf × 10^(L/20), L = `(0,-26) (27,-30) (51,-38) (63,-50) (87,-60)` dB, ±20 dB learnable; none above C6; emphasis +6 dB (0–12 learnable) around the longitudinal resonance f_L = 15 f1 (×/÷1.35) with a 0.5-octave half-width | Mechanism **L** (tension modulation; Conklin, *longitudinal.html*: E1 longitudinal ~600 Hz = 14.6 f1; plain steel c_L/2L ≈ 15.7 f1 at C4). Levels M |
+| Knock impulse | a raised-cosine force pulse of the contact time at every strike, into the body FIR; level `(0,-18) (39,-15) (87,-12)` dB re the note gain, ±20 dB per key, velocity slope ±20 dB | M: the knock is deterministic and has the soundboard's modes; the band-noise knock stays for the rest |
+| Bridge conductance | per recording condition, knots every 1/6 octave from 27.5 Hz to 14 kHz; prior = the v4 curve; ×/÷e per knot; second-difference smoothness (weight 0.1) | Review 3 item 3: resonance-scale variation is per instrument |
+| Per-key colouration | per condition, a (key, log f) table: 23 key knots (every 4 keys) × 36 frequency knots (every 1/4 octave from A0), bilinear, ±8 dB, smooth in both directions, zero mean over keys; stage 2 | Review 3 item 6 |
+| `partial_gain` | ±8 dB (was ±26 dB), L2 and smoothness across keys at equal partial number; stage 2 | Review 3 F3 |
+| Damper delay | per condition, 15 ms ± 50 ms, learnable (the release edge is fractional in frames) | Spec §4 asked for it; review 1 m3 |
+| Pedal mechanics | θ = 0.42 ± 0.3, width 0.06 ×/÷e, power 2.5 in [1.6, 4] | bounded (review 1 nit) |
+| Noise decay times | knock, thump, release and pedal τ bounded ×/÷e around their priors | review 1 m5, review 3 F1 |
+| Stereo | two body FIRs (different random modal mixtures), decorrelated hall tails with shared T60s and band levels, a gain per channel, a per-key channel balance ±6 dB (smooth over keys) | MAESTRO 2018 channels correlate at 0.2–0.4 (measured); review 3 F2 |
+| Noise floor | stationary, per condition and channel, 32 log-spaced bands (white-equivalent dBFS), initialised 6 dB under the 1st percentile of the recordings' band energy | Review 3 F1. MAESTRO 2018 quiet frames: about −60 dBFS broadband |
+| Per-year priors | inharmonicity and stretch per register from isolated notes of that year (`scripts/mine_notes.py`); latency, tuning, level, long-term spectrum and floor from renders vs recordings (`pianonn/fit_init.py`) | **I-M** (measured on MAESTRO). 2018: bass B ≈ 0.47 × the prior, stretch within ±3.5 cents of it, latency −0.6 ms, the recordings ~8 dB brighter above 4 kHz than the prior's body |
+| Loudness prior | equal energy over the first 0.3 s at mf (was total energy) | review 1 m1 |

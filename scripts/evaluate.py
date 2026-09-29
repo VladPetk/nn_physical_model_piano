@@ -25,7 +25,7 @@ import torch  # noqa: E402
 from pianonn.config import PianoConfig, year_to_condition  # noqa: E402
 from pianonn.data import MaestroSegments  # noqa: E402
 from pianonn.dsp import bounded  # noqa: E402
-from pianonn.fit_init import initialise_from_data  # noqa: E402
+from pianonn.fit_init import apply_mined_priors, initialise_from_data  # noqa: E402
 from pianonn.losses import MultiResolutionSTFTLoss, _mag  # noqa: E402
 from pianonn.physics import LOWEST_MIDI, N_KEYS  # noqa: E402
 from pianonn.synth import NeuralPhysicalPiano  # noqa: E402
@@ -64,6 +64,53 @@ def distances(model, batches, residual, M):
     return float(np.mean(mr)), float(np.mean(lm))
 
 
+@torch.no_grad()
+def read_residual(model, batches):
+    """What the residual does on held-out audio (review 3, 9.2, safeguard 5): per-note corrections by register
+    (mean and rms, in their own units), the band gains and noise per band, and the residual noise's share of the
+    band energy of the physical dry signal."""
+    from pianonn.losses import band_energies
+    from pianonn.synth import ContextNet
+
+    regs = ((21, 48), (48, 72), (72, 109))
+    note = {name: {r: [] for r in regs} for name in ContextNet.NOTE}
+    gains, noise, share = [], [], []
+    M = model.noise.band_masks(512)
+    for b in batches:
+        n = b["audio"].shape[-1]
+        out = model(b, n, residual=True, generator=torch.Generator(device=b["audio"].device).manual_seed(0))
+        mask = b["mask"] & (b["onset"] >= 0)  # notes struck inside the rendered window
+        for name, v in out["ctx"].items():
+            v = v.mean(-1) if v.dim() == 3 else v
+            for lo, hi in regs:
+                sel = mask & (b["pitch"] >= lo) & (b["pitch"] < hi)
+                note[name][(lo, hi)].append(v[sel].cpu())
+        gains.append(out["frame_ctx"]["band_gain"].mean((0, 2)).cpu())
+        noise.append(out["frame_ctx"]["noise_level"].mean((0, 2)).cpu())
+        if "noise_res" in out:
+            e_res = band_energies(out["noise_res"], M).mean((0, 2))
+            e_dry = band_energies(out["dry_phys"].mean(1), M).mean((0, 2))
+            share.append((e_res / (e_res + e_dry + 1e-20)).cpu())
+    lines = ["| per-note output (bound) | " + " | ".join(f"MIDI {lo}-{hi - 1} mean / rms" for lo, hi in regs) + " |",
+             "|---|" + "---|" * len(regs)]
+    for name, (k, s) in ContextNet.NOTE.items():
+        cells = []
+        for r in regs:
+            v = torch.cat(note[name][r]) if note[name][r] else torch.zeros(0)
+            cells.append(f"{float(v.mean()):+.3f} / {float(v.pow(2).mean().sqrt()):.3f}" if v.numel() else "-")
+        lines.append(f"| {name} (+-{s}) | " + " | ".join(cells) + " |")
+    g, nz = torch.stack(gains).mean(0), torch.stack(noise).mean(0)
+    lines += ["", "R3 band gains, mean over time (dB, 16 bands 40 Hz - 12 kHz): "
+              + " ".join(f"{20 * float(x) / math.log(10):+.1f}" for x in g),
+              "", "R3 noise level re its base (dB): " + " ".join(f"{20 * float(x) / math.log(10):+.0f}" for x in nz)]
+    if share:
+        sh = torch.stack(share).mean(0)
+        lines += ["", "Residual noise share of band energy (32 bands 40 Hz - 12 kHz, %): "
+                  + " ".join(f"{100 * float(x):.1f}" for x in sh)]
+    return lines
+
+
+@torch.no_grad()
 def fitted_table(model, cond):
     ph = model.physics
     c = torch.tensor([cond], device=ph.gain_db.device)
@@ -108,9 +155,11 @@ def main():
     ap.add_argument("--examples", type=int, default=48)
     ap.add_argument("--mined", help="scripts/mine_notes.py output for the identifiability check")
     ap.add_argument("--render-seconds", type=float, default=20.0)
+    ap.add_argument("--init-examples", type=int, default=32)
+    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dev = torch.device(args.device)
     if dev.type == "cuda":
         torch.cuda.set_per_process_memory_fraction(0.6)
     os.makedirs(args.out, exist_ok=True)
@@ -128,10 +177,16 @@ def main():
 
     torch.manual_seed(0)
     raw = NeuralPhysicalPiano(cfg).to(dev).eval()
-    init = copy.deepcopy(raw)
-    init_set = MaestroSegments(args.data, "train", cfg, 2.0, 1.0, 12.0, length=32, deterministic=True,
+    init = copy.deepcopy(raw)  # the trained model's starting point: mined priors + data init, as in pianonn.train
+    mined = None
+    if args.mined:
+        with open(args.mined) as f:
+            mined = json.load(f)
+        apply_mined_priors(init, mined, log=lambda *a: None)
+    init_set = MaestroSegments(args.data, "train", cfg, 2.0, 1.0, 12.0, length=args.init_examples, deterministic=True,
                                years=args.years, seed=3)
-    initialise_from_data(init, fixed_batches(init_set, 32, 8, dev), log=lambda *a: None)
+    initialise_from_data(init, fixed_batches(init_set, args.init_examples, 8, dev), log=lambda *a: None,
+                         tuning=mined is None)
     rows = {
         "untrained prior": distances(raw, batches, False, M),
         "prior + data init": distances(init, batches, False, M),
@@ -142,8 +197,11 @@ def main():
              f"Step {state.get('step')}, stage {state.get('stage')}. 2 s excerpts after 1 s warm-up and 12 s lookback, both channels.", "",
              "| model | MR-STFT loss | log-mel L1 (dB) |", "|---|---|---|"]
     lines += [f"| {k} | {a:.4f} | {b:.2f} |" for k, (a, b) in rows.items()]
+    if state.get("stage", 1) >= 2:
+        lines += ["", "## What the residual does (held-out)", ""] + read_residual(trained, batches)
     fitted, per_key, B, cents = fitted_table(trained, cond)
-    prior_fitted, _, B0, cents0 = fitted_table(raw, cond)
+    _, _, B0, cents0 = fitted_table(raw, cond)
+    _, _, Bi, centsi = fitted_table(init, cond)
     lines += ["", "## Fitted recording condition", "", "```", json.dumps(fitted, indent=1), "```"]
     lines += ["", "## Per key (every third key)", "",
               "| MIDI | B | cents re ET | re-strike (nats) | phantom dB re prior | impulse dB re prior | b1 x | T_c x | R x | gain dB |",
@@ -156,9 +214,11 @@ def main():
             mined = {int(k): v for k, v in json.load(f)["per_key"].items()}
         a4 = mined.get(69, {}).get("cents")
         lines += ["", "## Identifiability: fitted vs tracked on isolated notes of the same recordings", "",
-                  "Tracked with `pianonn.calibration` on notes with nothing else sounding (scripts/mine_notes.py). "
-                  "Registers pool keys; B uses reliable fits only.", "",
-                  "| register | notes | B tracked | B prior | B fitted | cents tracked | cents prior | cents fitted |", "|---|---|---|---|---|---|---|---|"]
+                  "Tracked with `pianonn.calibration` on notes with a clear first second (scripts/mine_notes.py). "
+                  "Registers pool keys; B uses reliable fits only. 'start' is the trained model's starting point "
+                  "(prior + mined + data init).", "",
+                  "| register | notes | B tracked | B prior | B start | B fitted | cents tracked | cents prior | cents start | cents fitted |",
+                  "|---|---|---|---|---|---|---|---|---|---|"]
         for lo, hi in ((21, 36), (36, 48), (48, 60), (60, 72), (72, 84), (84, 96), (96, 109)):
             ks = [p for p in range(lo, hi) if p in mined]
             if not ks:
@@ -168,8 +228,8 @@ def main():
             n = sum(mined[p]["n"] for p in ks)
             idx = [p - LOWEST_MIDI for p in ks]
             med = lambda v: float(np.median(v)) if len(v) else float("nan")
-            lines.append(f"| {lo}-{hi - 1} | {n} | {med(bt):.2e} | {med(B0[idx]):.2e} | {med(B[idx]):.2e} | "
-                         f"{med(ct):+.1f} | {med(cents0[idx]):+.1f} | {med(cents[idx]):+.1f} |")
+            lines.append(f"| {lo}-{hi - 1} | {n} | {med(bt):.2e} | {med(B0[idx]):.2e} | {med(Bi[idx]):.2e} | {med(B[idx]):.2e} | "
+                         f"{med(ct):+.1f} | {med(cents0[idx]):+.1f} | {med(centsi[idx]):+.1f} | {med(cents[idx]):+.1f} |")
         if a4 is not None:
             lines.append(f"\nA4 tracked {a4:+.1f} cents re 440 Hz.")
 

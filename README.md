@@ -1,14 +1,18 @@
 # nn_physical_model_piano
 
-A piano built like Pianoteq (strings, hammer, dampers, pedal, sympathetic resonance,
-soundboard) whose parameters are **fitted to MAESTRO by gradient descent** instead of by
-a person tuning them by ear. MAESTRO gives about 200 h of Disklavier recordings with
-note- and pedal-level MIDI aligned to about 3 ms, which is exactly the supervision this
-needs.
+A physically parametrised piano whose parameters are **fitted to MAESTRO by gradient descent** instead of
+by a person tuning them by ear. It is a *parametric modal synthesizer*: every note is a sum of closed-form
+damped sinusoids whose frequencies, decays and amplitudes come from per-key tables with physically
+motivated shapes (stiff strings, coupled unisons, hammer, dampers, pedals, soundboard, hall). Nothing
+interacts at run time, so every effect that would emerge from interaction in a simulation like
+Pianoteq's (re-strike, phantom partials, sympathetic resonance) is added by hand as a parametrised
+feature (review 3, section 2). MAESTRO gives about 200 h of Disklavier recordings with note- and
+pedal-level MIDI aligned to about 3 ms, which is exactly the supervision this needs.
 
-The core is about 7k interpretable physical parameters. A small causal context network
-(about 145k params) predicts bounded corrections, and a soundboard body plus a parametric
-hall is kept for each recording condition. Synthesis is closed-form or a linear
+The core is about 10k interpretable physical parameters plus a recording chain per MAESTRO year (two body
+FIRs, a parametric hall, mic gains, a noise floor). A small causal context network is the learned
+residual: bounded, zero-initialised corrections per note and per frame that absorb what the physics
+omits, switched on only after the physics has been fitted. Synthesis is closed-form or a linear
 recurrence, and nothing is autoregressive.
 
 ## Honest assessment
@@ -62,35 +66,38 @@ What is new here is how far the physics goes:
 ## Signal flow
 
 ```
-MIDI notes + pedals (+ year)
+MIDI notes + pedals (+ year), with 12 s of history before the rendered window
    │
-   ├─ ContextNet (causal GRU over piano roll/pedals) ─► bounded per-note corrections
-   │                                                    (gain, brightness, decay, knock)
+   ├─ ContextNet (causal GRU over piano roll/pedals) ─► the residual, only in stage 2:
+   │      R1 per-note corrections (gain, brightness, decay + tilt, spectral shape)
+   │      R2 attack noise (knock spectrum, a slower learned attack component)
+   │      R3 per-frame band gains on the dry signal + a filtered-noise path
    ▼
-PianoPhysics: per-key params = literature prior + bounded learned offset (docs/physical_parameters.md)
+PianoPhysics: per-key params = prior (literature, Iowa, isolated MAESTRO notes) + bounded learned offset
    │   f_n = n f0 √(1+Bn²) · stretch · unison detune          (inharmonic, beating)
-   │   α_n = b1 + b3 f_n²  (+ bridge loss for the prompt mode)  (two-stage decay)
-   │   a_n = gain(v) · half-sine pulse(f; T_c(v)) · sin(nπx0)   (bridge force; velocity, strike point)
-   │   damper decay α_d,n × (key up) · (1-lift(sustain))^2.5 · (not sostenuto-latched)
+   │   α_n = b1 + b3 f_n^p (+ bridge loss g_year(f) for the prompt mode, 1/6-octave detail)
+   │   a_n = gain(v) · hammer(f; T_c(v)) · sin(nπx0) · colouration_year(key, f)
+   │   phantom partials at 2f_j, f_j + f_j+1 (~a_j a_k, longitudinal emphasis near 15 f1)
+   │   damper decay after note-off + delay_year · (1-lift(sustain))^p · (not sostenuto-latched)
+   │   re-strike: a new blow takes part of the ringing vibration out
    ▼
-Strings: closed-form damped-sinusoid bank, attack ramp over the contact time,
-   │     chunked + checkpointed (exact for pedalling; notes can start before the window)
-   │ bridge force
-   ├─► SympatheticBank (off by default, see roadmap): 88 keys × S partials as resonators with time-varying poles
-   │                    (dampers), driven by the bridge minus the key's own strings
-   ├─► NoiseBank: hammer knock, key-bottom thump, damper noise, pedal noise
+Strings: closed-form damped-sinusoid bank (float64 phase, analytic backward), per-oscillator activity
+   │ bridge force, panned per key into two channels
+   ├─► knock impulse (the contact pulse into the body)
+   ├─► SympatheticBank (off by default): 88 keys × 4 partials as resonators with time-varying poles
+   ├─► NoiseBank: hammer knock, key-bottom thump, damper noise, pedal noise (bounded decay times)
    ▼
-Soundboard body FIR (modal, 60-70 Hz high-pass) ⊛ (direct + parametric octave-band hall), per year
+per channel: mic gain · body FIR ⊛ (direct + parametric octave-band hall), per year
    ▼
-audio
++ stationary noise floor per year and channel ─► stereo audio
 ```
 
 | component | params | learned from data |
 |---|---|---|
-| `physics` | ~7k | inharmonicity, tuning, unison detune, loss curves, prompt/aftersound, strike point, hammer cutoff/rolloff/velocity response, damper strength, pedal curve, una corda, per-partial residual |
-| `context` | ~145k | per-note corrections (zero-initialised, so training starts from pure physics) |
-| `symp` / `noise` | ~6k | coupling gains; knock and release spectra and envelopes |
-| `room` | 7.2k body taps + 15 hall params per condition | soundboard body; hall T60 and level per octave band, for each MAESTRO year |
+| `physics` | ~10k (+ per-condition tables) | inharmonicity, tuning, unison detune, loss curves, prompt/aftersound, strike point, hammer cutoff/rolloff/velocity response, damper strength and delay, pedal curve, una corda, re-strike, phantoms, knock impulse; per year: bridge conductance, colouration, scalars; `partial_gain` (±8 dB, stage 2) |
+| `context` | ~200k | the residual R1–R3 (zero-initialised, stage 2) |
+| `symp` / `noise` | ~9k | coupling gains; knock, attack and release spectra and envelopes |
+| `room` | 2 × 7.2k body taps + hall, gains, pan, 2 × 32 floor bands per condition | soundboard body per mic; hall T60 and level per octave band; noise floor |
 
 ## Usage
 
@@ -103,22 +110,29 @@ pip install torch --index-url https://download.pytorch.org/whl/cu124  # CUDA bui
 pip install -e .[dev]
 pytest
 
-# 1. prepare MAESTRO v3 (about 100 GB download; writes mono FLAC at 24 kHz plus cached MIDI)
-python scripts/prepare_maestro.py /path/to/maestro-v3.0.0 data/maestro24k
+# 1. prepare MAESTRO v3 straight from the zip (stereo FLAC at 24 kHz plus cached MIDI); one year takes a minute
+python scripts/prepare_maestro.py data/maestro-v3.0.0.zip data/maestro24k --years 2018
 
-# 2. train (picks CUDA automatically; --adv-start N switches on the GAN loss after N steps)
-python -m pianonn.train --data data/maestro24k --out runs/v0
-#   --amp autocasts the forward pass to bfloat16 (GPU only, off by default: the delicate
-#   physics stays fp32, so the speedup is modest -- see the flag's help)
+# 2. measure inharmonicity and stretch on isolated notes of that year (CPU)
+python scripts/mine_notes.py data/maestro24k --years 2018 --out runs/mined_2018.json
+
+# 3. go/no-go: overfit one excerpt with growing parameter sets
+python scripts/overfit_excerpt.py data/maestro24k --years 2018 --out runs/overfit
+
+# 4. train (stage 1 physics + recording chain, stage 2 + residual after 60 %; --minutes caps the time)
+python -m pianonn.train --data data/maestro24k --years 2018 --mined runs/mined_2018.json --out runs/trial --minutes 120 --batch 8
+
+# 5. evaluate on the test split, with the identifiability table
+python scripts/evaluate.py runs/trial/best.pt data/maestro24k --years 2018 --mined runs/mined_2018.json --out runs/trial/eval
+
+# render (stereo; without --ckpt you hear the untrained prior; --physics-only switches the residual off)
+python -m pianonn.render some.mid out.wav --ckpt runs/trial/best.pt --year 2018
 
 # sanity check without data: fit a randomly perturbed copy of the model
 python -m pianonn.train --synthetic --out runs/synthetic
 
-# 3. render (without --ckpt you hear the untrained physics prior; --device cuda to render on GPU)
-python -m pianonn.render some.mid out.wav --ckpt runs/v0/last.pt --year 2018
-
 # check a model against the literature targets in docs/physical_parameters.md
-python -m pianonn.diagnostics [--ckpt runs/v0/last.pt]
+python -m pianonn.diagnostics [--ckpt runs/trial/best.pt]
 ```
 
 The physics prior is specified in [`docs/physical_parameters.md`](docs/physical_parameters.md), with
@@ -135,24 +149,23 @@ per-partial calibration (steeper hammer top, high partials that sustain, frequen
 
 ## Status
 
-The package runs end to end and has tests. The prior is calibrated against the literature (the KTH
-*Five Lectures on the Acoustics of the Piano*, arXiv and Zenodo papers) and against 260 recorded
-notes of a Steinway B, which are analysed with the same code as the model's renders
-([`docs/calibration_iowa.md`](docs/calibration_iowa.md)). It passes 47 of 50 acceptance checks.
-The three failures are treble decay profiles, whose targets are low-confidence. Reviews are in
-[`docs/reviews/`](docs/reviews/); review 2 found real errors in the v2 calibration, all fixed in v3. Gradients reach every
-physical parameter, block-wise rendering matches single-pass rendering, dampers, sustain,
-una corda and sympathetic resonance all behave as expected, and a student fitted to a
-perturbed teacher moves towards it. **It has not been trained on MAESTRO yet.**
+The plan that took the project from the reviews to its first fit on real audio is in
+[`docs/plan_phase0_1.md`](docs/plan_phase0_1.md), and the first trial on MAESTRO 2018 is reported in
+[`docs/trial_2018.md`](docs/trial_2018.md).
+
+The prior is calibrated against the literature (the KTH *Five Lectures on the Acoustics of the Piano*,
+arXiv and Zenodo papers) and against 260 recorded notes of a Steinway B, analysed with the same code as the
+model's renders ([`docs/calibration_iowa.md`](docs/calibration_iowa.md)); per-year inharmonicity and
+stretch now come from isolated MAESTRO notes. Reviews are in [`docs/reviews/`](docs/reviews/); every open
+finding of reviews 1–3 is either fixed or explicitly deferred in the plan.
 
 Next steps:
-- [ ] Estimate B, tuning and decays from MAESTRO directly (partial tracking at known pitches) and use them as the prior.
-- [ ] First real training run on a single year, then all years.
-- [ ] Weinreich coupled-string eigenmodes instead of the mode-space shortcut.
-- [ ] Initial pitch glide at *ff* (tension modulation), longitudinal modes and phantom partials.
-- [ ] Re-strike interaction on a string that is still vibrating.
-- [ ] Calibrate the damper delay, the damper boundary key and hall T60s per year from MAESTRO.
-- [ ] Stereo output.
-- [ ] Speed up the sympathetic bank's scan (about 90% of a CPU training step; profile on GPU first), then re-enable it (`use_sympathetic=True`).
-- [ ] Real-time C++/JUCE engine: recursive two-pole resonators replace the training-time closed form.
+- [ ] Longer training on one year; then all years (per-condition tables are in place; the per-key stretch
+      offset is still shared across conditions).
+- [ ] Mine isolated notes for every year: per-year B, stretch, velocity curve, damper delay.
+- [ ] Switch the sympathetic bank on in a later stage; then the GAN, after listening.
+- [ ] Felt model at note-on instead of the hammer spectrum table (review 3, 9.1); Weinreich eigenmodes if
+      the fitted aftersound tables look unphysical; pitch glide at *ff*.
 - [ ] Evaluation suite (FAD, transcription F1, listening tests).
+- [ ] 48 kHz stage and more bass partials; real-time C++/JUCE engine (recursive oscillators, online damper
+      integral, partitioned convolution, the context GRU at 200 Hz).
