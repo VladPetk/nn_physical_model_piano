@@ -185,6 +185,7 @@ def main(argv=None):
     ap.add_argument("--budget", type=float, nargs=3, default=(0.05, 0.05, 0.1), metavar=("NOTE", "FRAME", "ADD"),
                     help="residual budget weights: per-note corrections, band gains, residual noise share")
     ap.add_argument("--no-init", action="store_true", help="skip the data-driven initialisation of the recording chain")
+    ap.add_argument("--mined", help="scripts/mine_notes.py output: start B and stretch from isolated-note measurements")
     ap.add_argument("--init-examples", type=int, default=32)
     ap.add_argument("--val-examples", type=int, default=24)
     ap.add_argument("--val-every", type=int, default=250)
@@ -263,12 +264,19 @@ def main(argv=None):
     if val_batches and not args.resume:
         v_raw, _ = validate(model, val_batches, recon, residual=False)
         log(f"val (untrained prior, before init): {v_raw:.4f}", kind="val", step=0, val_physics=v_raw, tag="raw_prior")
+        if args.mined:
+            from .fit_init import apply_mined_priors
+
+            with open(args.mined) as f:
+                est = apply_mined_priors(model, json.load(f), log=log)
+            log("mined priors", kind="init", **est)
         if not args.no_init:
             from .fit_init import initialise_from_data
 
             init_set = MaestroSegments(args.data, "train", cfg, args.segment, args.warmup, args.lookback,
                                        length=args.init_examples, deterministic=True, years=args.years, seed=3)
-            est = initialise_from_data(model, fixed_batches(init_set, args.init_examples, args.batch, device), log=log)
+            est = initialise_from_data(model, fixed_batches(init_set, args.init_examples, args.batch, device), log=log,
+                                       tuning=not args.mined)
             log("init estimates", kind="init", **{k: v for k, v in est.items()})
             v0, per0 = validate(model, val_batches, recon, residual=False)
             log(f"val (prior after init): {v0:.4f}", kind="val", step=0, val_physics=v0, per_res=per0, tag="init_prior")

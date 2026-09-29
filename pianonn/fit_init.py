@@ -67,8 +67,9 @@ def _band_matrix(model, n_fft):
 
 
 @torch.no_grad()
-def initialise_from_data(model, batches, log=print, max_latency=0.06, max_cents=60):
-    """``batches``: collated examples of one condition, on the model's device. Returns a dict of estimates."""
+def initialise_from_data(model, batches, log=print, max_latency=0.06, max_cents=60, tuning=True):
+    """``batches``: collated examples of one condition, on the model's device. Returns a dict of estimates.
+    ``tuning=False`` keeps the tuning (e.g. when it came from :func:`apply_mined_priors`)."""
     cfg = model.cfg
     sr = cfg.sample_rate
     cond = int(batches[0]["condition"][0])
@@ -97,10 +98,14 @@ def initialise_from_data(model, batches, log=print, max_latency=0.06, max_cents=
     lt, lm = _log_f_spectrum(mono(targets), sr), _log_f_spectrum(mono(render()), sr)
     cents, _ = _xcorr_lag(lt, lm, max_cents)
     cur = float(bounded(model.physics.cond_cents.data[cond], 30.0))
-    new = max(-29.0, min(29.0, cur + cents))
-    model.physics.cond_cents.data[cond] = 30.0 * math.atanh(new / 30.0)
-    est["tuning_cents"] = new
-    log(f"init: tuning {new:+.1f} cents re the prior's A440 stretch")
+    if tuning:
+        new = max(-29.0, min(29.0, cur + cents))
+        model.physics.cond_cents.data[cond] = 30.0 * math.atanh(new / 30.0)
+        est["tuning_cents"] = new
+        log(f"init: tuning {new:+.1f} cents re the prior's A440 stretch")
+    else:
+        est["tuning_residual_cents"] = cents
+        log(f"init: tuning kept (spectra agree within {cents:+.1f} cents)")
 
     # 3. level and long-term spectrum per channel -> mic gain + body EQ
     n_fft = 2048
@@ -140,3 +145,51 @@ def initialise_from_data(model, batches, log=print, max_latency=0.06, max_cents=
     est["floor_db"] = [round(float(v), 1) for v in fl[:: max(1, len(fl) // 8)]]
     log(f"init: noise floor (white-equivalent dBFS, every 4th band) {est['floor_db']}")
     return est
+
+
+REGISTERS = ((21, 36), (36, 48), (48, 60), (60, 72), (72, 84), (84, 96), (96, 109))
+
+
+@torch.no_grad()
+def apply_mined_priors(model, mined, log=print, min_notes=5, min_reliable=3):
+    """Start inharmonicity and stretch from values tracked on isolated notes of the same recordings
+    (``scripts/mine_notes.py``): per-register medians, interpolated over the keys, flat beyond the measured
+    registers. Frequencies are what spectral gradients cannot find from far away (an error in B of 2x puts
+    the high bass partials tens of Hz off), so they come from measurement and are then only refined.
+
+    The stretch goes into the per-key cents offsets (shared by all conditions: right for a single-year fit).
+    """
+    from .physics import LOWEST_MIDI, N_KEYS, key_curve
+
+    ph = model.physics
+    per_key = {int(k): v for k, v in mined["per_key"].items()}
+    notes = [n for n in mined["notes"] if not n["suspect"]]
+    b_pts, c_pts = [], []
+    for lo, hi in REGISTERS:
+        ns = [n for n in notes if lo <= n["pitch"] < hi]
+        if len(ns) >= min_notes:
+            centre = float(np.median([n["pitch"] for n in ns])) - LOWEST_MIDI
+            prior_c = float(np.interp(centre, np.arange(N_KEYS), ph.prior_cents.cpu().numpy()))
+            c_pts.append((centre, float(np.median([n["cents"] for n in ns])) - prior_c))  # offset from the prior
+            rel = [n for n in ns if n["B_reliable"]]
+            if len(rel) >= min_reliable:
+                centre_b = float(np.median([n["pitch"] for n in rel])) - LOWEST_MIDI
+                k = int(round(centre_b))
+                prior = float(torch.exp(ph.prior_log_B[k]))
+                b_pts.append((centre_b, math.log(float(np.median([n["B"] for n in rel])) / prior)))
+
+    def curve(pts):
+        pts = sorted(pts)
+        pts = [(0.0, pts[0][1])] + pts + [(float(N_KEYS - 1), pts[-1][1])]
+        return key_curve(pts).to(ph.raw_log_B.device)
+
+    if b_pts:
+        log_ratio = curve(b_pts).clamp(-1.4, 1.4)
+        ph.raw_log_B.copy_(1.5 * torch.atanh(log_ratio / 1.5))
+    if c_pts:  # offsets interpolated, held beyond the measured registers: the prior's curvature at the ends stays
+        off = curve(c_pts).clamp(-29, 29)
+        ph.raw_cents.copy_(30.0 * torch.atanh(off / 30.0))
+    log(f"mined priors from {len(notes)} notes: B x " + " ".join(f"{LOWEST_MIDI + k:.0f}:{math.exp(v):.2f}" for k, v in b_pts)
+        + " | cents re prior " + " ".join(f"{LOWEST_MIDI + k:.0f}:{v:+.1f}" for k, v in c_pts))
+    return {"B_ratio": [(LOWEST_MIDI + k, math.exp(v)) for k, v in b_pts],
+            "cents_re_prior": [(LOWEST_MIDI + k, v) for k, v in c_pts]}
