@@ -9,8 +9,9 @@ One set per recording condition (MAESTRO year):
   learnable T60 and gain per band, which is far more identifiable than tens of
   thousands of free FIR taps.
 
-The two responses are summed (the hall is excited by the same bridge force), so
-the full impulse response is ``body + hall``.
+The hall hears what the soundboard radiates, so the two are in series:
+``ir = body * (delta + hall)`` (convolution). The radiation high-pass of the
+body therefore also shapes the reverberant field.
 """
 
 import math
@@ -18,7 +19,7 @@ import math
 import torch
 from torch import nn
 
-from .dsp import bounded
+from .dsp import bounded, fft_convolve
 
 BODY_TARGET_DB = [(20, -40), (30, -30), (40, -20), (55, -10), (70, -4), (100, 0), (1000, 0), (2000, -1),
                   (4000, -3), (8000, -7), (11000, -12)]
@@ -131,10 +132,10 @@ class Room(nn.Module):
         self.register_buffer("prior_log_t60", torch.log(torch.tensor(HALL_T60)))
         self.raw_log_t60 = nn.Parameter(torch.zeros(C, len(HALL_BANDS)))
         self.band_log_gain = nn.Parameter(torch.zeros(C, len(HALL_BANDS)))
-        # initial direct-to-reverberant ratio ~0 dB: hall energy = body energy
+        # initial direct-to-reverberant ratio ~0 dB: energy of body * hall = body energy
         with torch.no_grad():
             hall = self._hall(torch.zeros(1, dtype=torch.long), gain=torch.zeros(1))
-            ratio = body.pow(2).sum() / hall.pow(2).sum()
+            ratio = body.pow(2).sum() / fft_convolve(torch.cat([body, body.new_zeros(L)])[None], hall).pow(2).sum()
         self.log_gain = nn.Parameter(torch.full((C,), 0.5 * math.log(ratio.item())))
 
     def _hall(self, cond, gain=None):
@@ -146,5 +147,6 @@ class Room(nn.Module):
     def forward(self, cond):
         """Impulse responses ``[B, L]`` for conditions ``cond[B]``."""
         hall = self._hall(cond)
+        hall = torch.cat([hall[:, :1] + 1.0, hall[:, 1:]], -1)  # + delta: the direct sound
         body = self.body[cond]
-        return torch.cat([body + hall[:, : body.shape[-1]], hall[:, body.shape[-1]:]], -1)
+        return fft_convolve(torch.cat([body, body.new_zeros(body.shape[0], hall.shape[-1])], -1), hall)

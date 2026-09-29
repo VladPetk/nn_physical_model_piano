@@ -80,7 +80,7 @@ Strings: closed-form damped-sinusoid bank, attack ramp over the contact time,
    │                    (dampers), driven by the bridge minus the key's own strings
    ├─► NoiseBank: hammer knock, key-bottom thump, damper noise, pedal noise
    ▼
-Soundboard body FIR (modal, 60-70 Hz high-pass) + parametric octave-band hall, per year
+Soundboard body FIR (modal, 60-70 Hz high-pass) ⊛ (direct + parametric octave-band hall), per year
    ▼
 audio
 ```
@@ -122,9 +122,10 @@ prior's current acceptance report is [`docs/diagnostics_prior.md`](docs/diagnost
 
 ## Status
 
-The package runs end to end and has tests. The untrained prior passes all 23 literature
+The package runs end to end and has tests. The untrained prior passes all 33 literature
 acceptance checks (decay times, inharmonicity, partial spectra, velocity brightness, bass
-radiation, damper release, pedal halo, noise levels). Gradients reach every
+radiation, damper release, pedal halo, noise levels and timing). An independent review of how
+the spec was applied is in [`docs/reviews/`](docs/reviews/); its findings are fixed. Gradients reach every
 physical parameter, block-wise rendering matches single-pass rendering, dampers, sustain,
 una corda and sympathetic resonance all behave as expected, and a student fitted to a
 perturbed teacher moves towards it. **It has not been trained on MAESTRO yet.**
@@ -137,5 +138,6 @@ Next steps:
 - [ ] Re-strike interaction on a string that is still vibrating.
 - [ ] Calibrate the damper delay, the damper boundary key and hall T60s per year from MAESTRO.
 - [ ] Stereo output.
+- [ ] Speed up the sympathetic bank's scan (about 90% of a CPU training step; profile on GPU first).
 - [ ] Real-time C++/JUCE engine: recursive two-pole resonators replace the training-time closed form.
 - [ ] Evaluation suite (FAD, transcription F1, listening tests).

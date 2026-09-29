@@ -20,7 +20,6 @@ class PianoConfig:
     body_seconds: float = 0.3  # learnable soundboard/case FIR (bridge force -> pressure)
     hall_seconds: float = 2.5  # parametric per-year hall tail
     damper_delay: float = 0.015  # damper touches the string this long after MIDI note-off (to calibrate on data)
-    noise_fft: int = 512
     noise_bands: int = 32
     ctx_hidden: int = 128
     synth_chunk: int = 1024  # samples per checkpointed oscillator-bank chunk

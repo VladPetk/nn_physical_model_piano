@@ -15,7 +15,7 @@ String model (per key k, partial n, coupled mode m), evaluated in closed form:
     mode 0 (in-phase, "prompt sound") adds the bridge loss of all strings of the
     unison, alpha_n + (R - 1) b1, the same for every partial; modes 1.. are the
     weakly radiating aftersound (Weinreich's coupled strings in mode space).
-    a_n      = gain(v) F(f_n; T_c(v)) sin(pi n x0/L)       bridge force: half-sine hammer pulse x strike comb
+    a_n      = gain(v) F(f_n; T_c(v)) sin(pi n x0/L)       bridge force: hammer pulse envelope x strike comb
     damper:  extra decay alpha_d,n whenever the key is up and neither pedal holds the damper off.
 """
 
@@ -52,18 +52,16 @@ def hammer_velocity(u):
     return 5.5 * u.clamp(min=1e-3) ** 1.4
 
 
-def half_sine_spectrum(f, tc, fill=0.5):
-    """Normalised magnitude spectrum of a half-sine force pulse of length ``tc``.
+def hammer_spectrum(f, tc):
+    """Smooth magnitude envelope of the hammer force pulse of duration ``tc``.
 
-    -3 dB at 0.59/tc, then -12 dB/oct; the nulls of the ideal pulse are filled
-    to ``fill`` of the envelope, as measured pulses are skewed and have no nulls.
+    A half-sine pulse is -3 dB at 0.59/tc and falls at -12 dB/oct; its ideal
+    nulls are replaced by the smooth second-order envelope with the same corner
+    and slope. Measured pulses are skewed and have filled nulls, and the ideal
+    nulls would make brightness non-monotonic in velocity (a null sliding over
+    a partial as the contact time changes). See docs/physical_parameters.md.
     """
-    x = f * tc
-    den = 1 - 4 * x**2
-    near = den.abs() < 1e-3
-    ideal = torch.where(near, torch.full_like(x, math.pi / 4), torch.cos(math.pi * x) / torch.where(near, torch.ones_like(den), den))
-    envelope = 1 / (1 + 4 * x**2)
-    return torch.sqrt(ideal**2 + (fill * envelope) ** 2) / math.sqrt(1 + fill**2)
+    return torch.rsqrt(1 + (f * tc / 0.59) ** 4)
 
 
 class PianoPhysics(nn.Module):
@@ -80,11 +78,11 @@ class PianoPhysics(nn.Module):
         self.register_buffer("prior_cents", key_curve(
             [(0, -30), (12, -18), (24, -8), (36, -3), (48, 0), (60, 5), (72, 13), (84, 25), (87, 30)]))
         self.register_buffer("prior_log_b1", torch.log(key_curve(
-            [(0, 0.20), (15, 0.25), (27, 0.22), (39, 0.25), (48, 0.30), (63, 0.55), (75, 1.0), (87, 2.0)])))
+            [(0, 0.17), (15, 0.25), (27, 0.22), (39, 0.25), (48, 0.30), (63, 0.55), (75, 0.70), (87, 1.3)])))
         self.register_buffer("prior_log_b3", torch.log(key_curve([(0, 2.5e-7), (20, 2.5e-7), (30, 1.2e-7), (87, 1.2e-7)])))
         self.register_buffer("n_strings", torch.where(k < 8, 1, torch.where(k < 26, 2, 3)))
-        # prompt/aftersound decay ratio at the fundamental (R): 1.5 mono, 2 bi, 2.5 -> 4 tri
-        self.register_buffer("prior_prompt_ratio", key_curve([(0, 1.5), (7, 1.5), (8, 2.0), (25, 2.0), (26, 2.5), (39, 4.0), (87, 4.0)]))
+        # prompt/aftersound decay ratio at the fundamental (R): 1.5 mono, 1.7 bi, 2.5 -> 4 tri
+        self.register_buffer("prior_prompt_ratio", key_curve([(0, 1.5), (7, 1.5), (8, 1.7), (25, 1.7), (26, 2.5), (39, 4.0), (87, 4.0)]))
         self.register_buffer("prior_log_after", torch.log(key_curve([(0, 0.10), (39, 0.06), (87, 0.06)])))
         self.register_buffer("prior_log_tc", torch.log(1e-3 * key_curve(
             [(0, 3.5), (15, 3.0), (27, 2.4), (39, 1.9), (51, 1.5), (63, 1.1), (75, 0.8), (87, 0.6)])))
@@ -131,10 +129,11 @@ class PianoPhysics(nn.Module):
         self.soft_log_after = _p()
 
         # loudness prior: equal string energy per key at mf (u = 0.6) -- the treble hammer's contact
-        # outlasts the string period and the strike point moves, which alone would make C8 ~35 dB quieter
+        # outlasts the string period and the strike point moves, which alone would make C8 ~45 dB quieter.
+        # Keys with no partial below Nyquist (tiny test sample rates) are left alone.
         with torch.no_grad():
             e = self._mf_energy_db()
-            self.gain_db -= (e - e[39]).nan_to_num(0.0, 0.0, 0.0).clamp(-30, 30)
+            self.gain_db -= (e - e[39]).nan_to_num(0.0, 0.0, 0.0).clamp(-60, 60)
 
     def _mf_energy_db(self):
         ki = torch.arange(N_KEYS)[None]
@@ -190,7 +189,7 @@ class PianoPhysics(nn.Module):
 
         # excitation: bridge force = gain(v) * half-sine pulse spectrum * signed strike-position comb
         tc = self.contact_time(ki, u, soft, cond, ctx.get("log_fc"))
-        hammer = half_sine_spectrum(fn, tc[..., None])
+        hammer = hammer_spectrum(fn, tc[..., None])
         x0 = self.prior_strike[ki] * torch.exp(bounded(self.raw_strike[ki], 0.5))
         comb = torch.sin(math.pi * n * x0[..., None])
         u0 = u - 0.6

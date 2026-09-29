@@ -30,6 +30,12 @@ def _osc_bank(freq, alpha, amp, alpha_damp, tc, onset, c_note, c_onset, t):
     return (amp[..., None] * torch.exp(log_env) * torch.sin(phase)).sum((2, 3)) * ramp
 
 
+def _partial_groups(P):
+    """(lo, hi] partial-count buckets, so treble notes don't pay for the bass's partials."""
+    edges = sorted({0, P // 6, P // 3, 2 * P // 3, P})
+    return list(zip(edges[:-1], edges[1:]))
+
+
 class ContextNet(nn.Module):
     """Causal GRU over the performance (piano roll + pedals) that predicts small,
     bounded per-note corrections to the physical model. Zero-initialised, so
@@ -72,9 +78,11 @@ class SympatheticBank(nn.Module):
     time-varying, so this is a linear recurrence with time-varying poles, solved
     by the chunked parallel scan in :func:`linear_recurrence`.
 
-    Drive coupling follows reciprocity: a string that loses energy to the
-    bridge at rate ``alpha`` also receives it at a rate ~ sqrt(alpha), so the
-    slowly decaying bass strings are not starved.
+    Drive coupling follows reciprocity: a string receives energy through the
+    bridge at the rate it loses energy to it, ``kappa = alpha_prompt -
+    alpha_after`` (the bridge part of its decay). The resonant gain is then
+    ``G * kappa / alpha``: the fraction of the string's losses that go through
+    the bridge, not an accident of the register.
     """
 
     def __init__(self, cfg: PianoConfig):
@@ -97,9 +105,10 @@ class SympatheticBank(nn.Module):
         S = cfg.symp_partials
         freq = key_modes["freq"][..., :S, 0]
         alpha = key_modes["alpha"][..., :S, 0]
+        kappa = (alpha - key_modes["alpha"][..., :S, 1]).clamp(min=0)
         alpha_damp = key_modes["alpha_damp"][..., :S]
         valid = (freq < 0.45 * cfg.sample_rate).to(freq.dtype)
-        gin = self.log_gain.exp()[None, :, None] * alpha.sqrt() / cfg.sample_rate * valid
+        gin = self.log_gain.exp()[None, :, None] * kappa / cfg.sample_rate * valid
         drive = bridge[:, None, :] - own
         es = frames_to_samples(engagement, start, bridge.shape[-1], cfg.hop)
         args = (drive, es, freq, alpha, alpha_damp, gin, state)
@@ -114,70 +123,87 @@ def _dark_bands(centers, corner, base):
 
 
 class NoiseBank(nn.Module):
-    """Mechanical noises as band-shaped noise with per-key spectra and exponential envelopes:
-    hammer/soundboard knock at note-on, key-bottom thump (velocity-dependent timing),
-    damper noise at release, and pedal-mechanism noise when the dampers move."""
+    """Mechanical noises: hammer/soundboard knock at note-on, key-bottom thump
+    (velocity-dependent timing), damper noise at release, and pedal-mechanism
+    noise when the dampers move. Initial levels (docs/physical_parameters.md, section 6): knock
+    -25 dB (ff) to -12 dB (pp) re the tone, damper noise ~-40 dB and pedal noise ~-35 dB re an mf note.
+
+    Rendered in the time domain: white noise is split into log-spaced bands
+    (overlap-save, so long pieces render blockwise without seams) and each band
+    is scaled by a sample-accurate envelope, so a 5 ms knock really lasts 5 ms
+    and nothing sounds before the hammer. Band levels are spectral densities
+    (log amplitude): equal values give white noise.
+    """
+
+    MARGIN = 4096  # overlap-save context; longer than the lowest band filter's ringing
 
     def __init__(self, cfg: PianoConfig):
         super().__init__()
         self.cfg = cfg
-        nb, n_bins = cfg.noise_bands, cfg.noise_fft // 2 + 1
+        nb = cfg.noise_bands
         centers = torch.logspace(math.log10(40), math.log10(cfg.sample_rate / 2), nb)
-        self.knock = nn.Parameter(_dark_bands(centers, 600.0, -2.0).repeat(N_KEYS, 1))
-        self.knock_vel = nn.Parameter(torch.full((N_KEYS,), 2.0))
+        self.register_buffer("centers", centers)
+        self.knock = nn.Parameter(_dark_bands(centers, 600.0, -4.73).repeat(N_KEYS, 1))
+        self.knock_vel = nn.Parameter(torch.full((N_KEYS,), 3.9))  # noise grows ~13 dB less than the tone pp -> ff
         self.knock_log_tau = nn.Parameter(torch.log(key_curve([(0, 0.010), (40, 0.007), (87, 0.005)])))
         self.thump_log_gain = nn.Parameter(torch.tensor(math.log(0.7)))
         self.thump_log_tau = nn.Parameter(torch.tensor(math.log(0.008)))
-        self.release = nn.Parameter(_dark_bands(centers, 1500.0, -3.0).repeat(N_KEYS, 1))
+        self.release = nn.Parameter(_dark_bands(centers, 1500.0, -8.63).repeat(N_KEYS, 1))
         self.release_log_tau = nn.Parameter(torch.full((N_KEYS,), math.log(0.005)))
-        self.pedal = nn.Parameter(_dark_bands(centers, 800.0, -1.0))
+        self.pedal = nn.Parameter(_dark_bands(centers, 800.0, -8.09))
         self.pedal_log_tau = nn.Parameter(torch.tensor(math.log(0.03)))
-        lc = torch.log(centers)
-        bins = torch.log(torch.linspace(0, cfg.sample_rate / 2, n_bins).clamp(min=40))
-        idx = torch.searchsorted(lc, bins).clamp(1, nb - 1)
-        w = ((bins - lc[idx - 1]) / (lc[idx] - lc[idx - 1])).clamp(0, 1)
-        W = torch.zeros(nb, n_bins)
-        W[idx - 1, torch.arange(n_bins)] = 1 - w
-        W[idx, torch.arange(n_bins)] += w
-        self.register_buffer("band_to_bin", W)
-        self.register_buffer("window", torch.hann_window(cfg.noise_fft))
+        self._masks = {}
 
-    def _env(self, tf, t_event, tau):
-        """Power envelope of an exponentially decaying event, aligned to the first frame at/after it."""
-        hop_s = self.cfg.hop / self.cfg.sample_rate
-        start = torch.ceil(t_event / hop_s) * hop_s
-        d = tf - start[..., None]
-        return torch.exp(-2 * d.clamp(min=0) / tau[..., None]) * (d >= -1e-6)
+    def band_masks(self, n):
+        """Raised-cosine (in log f) band-split masks for an ``n``-point rFFT; they sum to one."""
+        if n not in self._masks:
+            lf = torch.log2(torch.fft.rfftfreq(n, 1 / self.cfg.sample_rate).clamp(min=1.0))
+            c = torch.log2(self.centers.cpu())
+            masks = []
+            for i in range(len(c)):
+                m = torch.ones_like(lf)
+                if i > 0:
+                    m = torch.where(lf < c[i], torch.sin(0.5 * math.pi * ((lf - c[i - 1]) / (c[i] - c[i - 1])).clamp(0, 1)) ** 2, m)
+                if i < len(c) - 1:
+                    m = torch.where(lf > c[i], torch.cos(0.5 * math.pi * ((lf - c[i]) / (c[i + 1] - c[i])).clamp(0, 1)) ** 2, m)
+                masks.append(m)
+            self._masks[n] = torch.stack(masks)
+        return self._masks[n].to(self.centers.device)
 
-    def magnitude(self, ki, u, onset, offset, weight_on, weight_off, log_knock, f_start, n_frames):
+    def band_noise(self, white, start, length):
+        """Band-split white noise ``[B, bands, length]`` for samples ``[start, start+length)``."""
+        lo, hi = max(0, start - self.MARGIN), min(white.shape[-1], start + length + self.MARGIN)
+        seg = white[:, lo:hi]
+        n = seg.shape[-1]
+        bands = torch.fft.irfft(torch.fft.rfft(seg, n)[:, None] * self.band_masks(n), n)
+        return bands[..., start - lo: start - lo + length]
+
+    def _env(self, t, t_event, tau):
+        """Power envelope ``[B,N,L]`` of exponentially decaying events at ``t_event``."""
+        d = t - t_event[..., None]
+        return torch.exp(-2 * d.clamp(min=0) / tau[..., None]) * (d >= 0)
+
+    def event_power(self, ki, u, onset, release, weight_on, weight_off, log_knock, start, length):
+        """Per-band power ``[B, bands, L]`` of note events."""
         cfg = self.cfg
-        tf = (f_start + torch.arange(n_frames, device=ki.device)) * cfg.hop / cfg.sample_rate
-        v = hammer_velocity(u)
-        thump_at = onset + (0.012 - 0.00375 * (v - 1)).clamp(-0.003, 0.012)
+        t = (start + torch.arange(length, device=ki.device, dtype=torch.float64)).to(u.dtype) / cfg.sample_rate
+        thump_at = onset + (0.012 - 0.00375 * (hammer_velocity(u) - 1)).clamp(-0.003, 0.012)
         p_on = torch.exp(2 * (self.knock[ki] + (self.knock_vel[ki] * (u - 0.6) + log_knock)[..., None]))
-        env_on = (self._env(tf, onset, self.knock_log_tau[ki].exp())
-                  + self.thump_log_gain.exp() ** 2 * self._env(tf, thump_at, self.thump_log_tau.exp().expand_as(onset)))
-        env_off = self._env(tf, offset, self.release_log_tau[ki].exp())
+        env_on = (self._env(t, onset, self.knock_log_tau[ki].exp())
+                  + self.thump_log_gain.exp() ** 2 * self._env(t, thump_at, self.thump_log_tau.exp().expand_as(onset)))
+        env_off = self._env(t, release, self.release_log_tau[ki].exp())
         p_off = torch.exp(2 * self.release[ki])
-        power = (torch.einsum("bnk,bnf->bkf", p_on * weight_on[..., None], env_on)
-                 + torch.einsum("bnk,bnf->bkf", p_off * weight_off[..., None], env_off))
-        return power
+        return (torch.einsum("bnk,bnl->bkl", p_on * weight_on[..., None], env_on)
+                + torch.einsum("bnk,bnl->bkl", p_off * weight_off[..., None], env_off))
 
-    def pedal_power(self, lift):
-        """Pedal-mechanism noise power ``[B, bands, F]`` driven by how fast the damper rail moves."""
+    def pedal_envelope(self, lift):
+        """Frame-rate power envelope ``[B, F]`` of the pedal mechanism, driven by how fast the damper rail moves."""
         cfg = self.cfg
         rate = torch.cat([lift.new_zeros(lift.shape[0], 1), (lift[:, 1:] - lift[:, :-1]).abs()], 1) * cfg.sample_rate / cfg.hop
         drive = (rate / 20.0).clamp(max=1.0) ** 2  # a full press in ~50 ms saturates
         n = torch.arange(lift.shape[-1], device=lift.device) * cfg.hop / cfg.sample_rate
         kernel = torch.exp(-2 * n / self.pedal_log_tau.exp())
-        env = fft_convolve(drive, kernel).clamp(min=0)  # FFT round-off can go slightly negative
-        return torch.exp(2 * self.pedal)[None, :, None] * env[:, None, :]
-
-    def synth(self, power_bands, n_samples, generator=None):
-        mag = torch.sqrt(torch.einsum("bkf,kq->bqf", power_bands, self.band_to_bin).clamp(min=0) + 1e-12)
-        phase = 2 * math.pi * torch.rand(mag.shape, generator=generator, device=mag.device)
-        return torch.istft(torch.polar(mag, phase), self.cfg.noise_fft, self.cfg.hop,
-                           window=self.window, length=n_samples)
+        return fft_convolve(drive, kernel).clamp(min=0)  # FFT round-off can go slightly negative
 
 
 class NeuralPhysicalPiano(nn.Module):
@@ -255,36 +281,48 @@ class NeuralPhysicalPiano(nn.Module):
             c_note = frames_to_samples(C, s0, L, cfg.hop).gather(1, k_sel[..., None].expand(-1, -1, L))
             c_onset = sample_keyed(C, k_sel, on.clamp(min=0), sr, cfg.hop)
             t = (s0 + torch.arange(L, device=ki.device, dtype=torch.float64)) / sr
-            args = (m["freq"], m["alpha"], m["amp"], m["alpha_damp"], m["tc"], on, c_note, c_onset, t.to(C.dtype))
-            if cfg.checkpoint and torch.is_grad_enabled():
-                notes = checkpoint(_osc_bank, *args, use_reentrant=False)
-            else:
-                notes = _osc_bank(*args)
+            # partials above Nyquist carry zero amplitude: only compute as many as each group of notes needs
+            n_valid = (m["amp"] != 0).any(-1).any(0).flip(-1).int().argmax(-1)  # trailing zero partials per note
+            n_valid = torch.where((m["amp"] != 0).any(-1).any(0).any(-1), m["amp"].shape[2] - n_valid, 0)
+            notes = C.new_zeros(B, sel.numel(), L)
+            for lo, hi in _partial_groups(m["amp"].shape[2]):
+                grp = ((n_valid > lo) & (n_valid <= hi)).nonzero().squeeze(1)
+                if grp.numel() == 0:
+                    continue
+                args = (m["freq"][:, grp, :hi], m["alpha"][:, grp, :hi], m["amp"][:, grp, :hi],
+                        m["alpha_damp"][:, grp, :hi], m["tc"][:, grp], on[:, grp], c_note[:, grp], c_onset[:, grp],
+                        t.to(C.dtype))
+                if cfg.checkpoint and torch.is_grad_enabled():
+                    y = checkpoint(_osc_bank, *args, use_reentrant=False)
+                else:
+                    y = _osc_bank(*args)
+                notes = notes.index_add(1, grp, y)
             out.append(notes.sum(1))
             if per_key:
                 keys.append(notes.new_zeros(B, N_KEYS, L).scatter_add(1, k_sel[..., None].expand(-1, -1, L), notes))
         return torch.cat(out, -1), (torch.cat(keys, -1) if per_key else None)
 
-    def render_noise(self, ki, u, onset, offset, mask, lift, pedal_damping, log_knock, F, n_samples, block_frames,
-                     generator):
+    def render_noise(self, ki, u, onset, offset, mask, lift, pedal_damping, log_knock, n_samples, block, generator):
         cfg = self.cfg
         sr, hop = cfg.sample_rate, cfg.hop
         release = offset + cfg.damper_delay
         damp_at_release = sample_curve(pedal_damping, release.clamp(min=0), sr, hop)
         w_on = mask.float()
         w_off = mask.float() * self.physics.damper_strength[ki] * damp_at_release
-        powers = []
-        for f0 in range(0, F, block_frames):
-            nf = min(block_frames, F - f0)
-            t0, t1 = f0 * hop / sr, (f0 + nf) * hop / sr
-            sel = ((onset < t1) & (torch.maximum(onset, release) + 1.0 > t0) & mask).any(0).nonzero().squeeze(1)
-            if sel.numel() == 0:
-                powers.append(u.new_zeros(ki.shape[0], cfg.noise_bands, nf))
-                continue
-            powers.append(self.noise.magnitude(ki[:, sel], u[:, sel], onset[:, sel], release[:, sel], w_on[:, sel],
-                                               w_off[:, sel], log_knock[:, sel], f0, nf))
-        power = torch.cat(powers, -1) + self.noise.pedal_power(lift)
-        return self.noise.synth(power, n_samples, generator)
+        white = torch.randn(ki.shape[0], n_samples, generator=generator, device=ki.device)
+        pedal_env = self.noise.pedal_envelope(lift)
+        pedal_bands = torch.exp(2 * self.noise.pedal)[None, :, None]
+        out = []
+        for s0 in range(0, n_samples, block):
+            L = min(block, n_samples - s0)
+            t0, t1 = s0 / sr, (s0 + L) / sr
+            power = pedal_bands * frames_to_samples(pedal_env, s0, L, hop)[:, None]
+            sel = ((onset < t1) & (torch.maximum(onset, release) + 0.5 > t0) & mask).any(0).nonzero().squeeze(1)
+            if sel.numel():
+                power = power + self.noise.event_power(ki[:, sel], u[:, sel], onset[:, sel], release[:, sel],
+                                                       w_on[:, sel], w_off[:, sel], log_knock[:, sel], s0, L)
+            out.append((self.noise.band_noise(white, s0, L) * power.clamp(min=0).sqrt()).sum(1))
+        return torch.cat(out, -1)
 
     def forward(self, perf, n_samples, block_seconds=None, generator=None):
         cfg = self.cfg
@@ -333,8 +371,8 @@ class NeuralPhysicalPiano(nn.Module):
             out["symp"] = torch.cat(symp, -1)
             dry = dry + out["symp"]
         if cfg.use_noise:
-            out["noise"] = self.render_noise(ki, u, onset, offset, mask, lift, pedal_damping, ctx["log_knock"], F,
-                                             n_samples, block // hop, generator)
+            out["noise"] = self.render_noise(ki, u, onset, offset, mask, lift, pedal_damping, ctx["log_knock"],
+                                             n_samples, block, generator)
             dry = dry + out["noise"]
         out["dry"] = dry
         out["audio"] = fft_convolve(dry, self.room(cond)) if cfg.use_room else dry

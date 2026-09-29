@@ -17,8 +17,9 @@ import torch
 from .render import load_model
 
 KEYS = {"A0": 21, "C2": 36, "C4": 60, "A4": 69, "C6": 84, "C7": 96, "C8": 108}
-T60_TARGETS = {"A0": ((20, 40), None), "C4": ((6, 8), (20, 35)), "A4": ((5, 6.5), (15, 30)),
-               "C6": ((2.5, 3.5), (8, 15)), "C7": ((1.2, 2.0), (3, 6))}
+# fundamental T60 (prompt, aftersound) ranges exactly as in docs/physical_parameters.md, section 2
+T60_TARGETS = {"A0": ((25, 40), None), "C2": ((15, 20), (20, 30)), "C4": ((6, 8), (20, 35)), "A4": ((5, 6), (15, 30)),
+               "C6": ((2.5, 3.5), (8, 15)), "C7": ((1.5, 2.0), (3, 6)), "C8": ((0.7, 1.2), None)}
 
 
 def _variant(model, **flags):
@@ -145,6 +146,10 @@ def run(model):
     check("C4 mf partial 10 re p1 (dB)", lev[9], "<= -30", lev[9] <= -30, "{:+.0f}")
     ratio = notes[("C4", 120)]["centroid"] / notes[("C4", 40)]["centroid"]
     check("C4 centroid vel120 / vel40", ratio, "1.1-2", 1.1 <= ratio <= 2.0, "{:.2f}")
+    for name in ("C2", "C4", "C6", "C7"):
+        cs = [_centroid(_render(dry, 0.5, [(KEYS[name], 0.0, 0.5, v)])["audio"], sr) for v in (30, 60, 90, 120)]
+        check(f"{name} brightness rises with velocity (centroid Hz, vel 30/60/90/120)", " ".join(f"{c:.0f}" for c in cs),
+              "increasing", bool(np.all(np.diff(cs) > 0)))
 
     # --- radiated bass fundamentals (body high-pass) ---
     for name in ("A0", "C2"):
@@ -173,11 +178,26 @@ def run(model):
     check("pedal halo, symp re strings (dB)", halo, "-40..-25", -40 <= halo <= -25, "{:.0f}")
     diff = _rms_db(ped["symp"][: 2 * sr]) - _rms_db(noped["symp"][: 2 * sr])
     check("halo with vs without pedal (dB)", diff, ">= 10", diff >= 10, "{:.0f}")
+    no_symp = _variant(model, use_room=False, use_sympathetic=False)
     for v, target in ((120, -25), (25, -12)):
-        out = _render(full, 1.0, [(60, 0.1, 0.8, v)])
+        out = _render(no_symp, 1.0, [(60, 0.1, 0.8, v)])
         w = slice(int(0.1 * sr), int(0.16 * sr))
         lvl = _rms_db(out["noise"][w]) - _rms_db(out["strings"][w])
-        check(f"knock re tone, first 60 ms, vel {v} (dB)", lvl, f"{target} +-8", abs(lvl - target) <= 8, "{:.0f}")
+        check(f"knock re tone, first 60 ms, vel {v} (dB)", lvl, f"{target} +-3", abs(lvl - target) <= 3, "{:.0f}")
+    out = _render(no_symp, 1.5, [(60, 0.0, 0.8, 64)])
+    rel = 0.8 + model.cfg.damper_delay
+    lvl = _rms_db(out["noise"][int(rel * sr): int((rel + 0.04) * sr)]) - _rms_db(out["strings"][int((rel - 0.1) * sr): int(rel * sr)])
+    check("damper noise re released note (dB)", lvl, "-45..-35", -45 <= lvl <= -35, "{:.0f}")
+    perf = _perf(model, 2 * sr, [(60, 0.0, 1.9, 64)])
+    t = torch.arange(perf["sustain"].shape[-1]) * model.cfg.hop / sr
+    perf["sustain"] = ((t > 0.5) & (t < 1.2)).float()[None]
+    out = {k: v[0].double().numpy() for k, v in no_symp(perf, 2 * sr, generator=torch.Generator().manual_seed(0)).items()}
+    w = slice(int(0.5 * sr), int(0.6 * sr))
+    lvl = _rms_db(out["noise"][w]) - _rms_db(out["strings"][w])
+    check("pedal-press noise re mf note (dB)", lvl, "-35 +-5", abs(lvl + 35) <= 5, "{:.0f}")
+    x = _render(no_symp, 1.0, [(60, 0.2, 0.8, 100)])["noise"]
+    pre = float((x[: int(0.2 * sr)] ** 2).sum() / ((x**2).sum() + 1e-30))
+    check("noise energy before the hammer strikes (fraction)", pre, "< 0.01", pre < 0.01, "{:.3f}")
 
     table = ["| key | vel | f1 Hz | B_eff | partials 2..6 dB re f1 | T60 prompt s (EDC) | T60 after s (model) | centroid Hz | peak dBFS |",
              "|---|---|---|---|---|---|---|---|---|"] + rows

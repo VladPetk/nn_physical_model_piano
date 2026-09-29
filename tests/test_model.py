@@ -75,14 +75,15 @@ def test_sympathetic_resonance_needs_pedal():
 
 
 def test_block_rendering_matches_single_pass():
-    cfg = small_cfg(use_noise=False)
+    cfg = small_cfg()
     m = NeuralPhysicalPiano(cfg)
     n = 16000
     perf = make_perf(m, n, [(60, 0.1, 0.5, 80), (36, 0.3, 1.5, 100), (72, 1.2, 1.4, 60)],
                      sustain=lambda t: (t > 0.8).float())
+    perf["sostenuto"] = perf["sustain"].flip(-1)
     with torch.no_grad():
-        a = m(perf, n)["audio"]
-        b = m(perf, n, block_seconds=0.37)["audio"]
+        a = m(perf, n, generator=torch.Generator().manual_seed(0))["audio"]
+        b = m(perf, n, block_seconds=0.37, generator=torch.Generator().manual_seed(0))["audio"]
     assert torch.allclose(a, b, atol=1e-5)
 
 
@@ -140,10 +141,12 @@ def test_per_key_strings_sum_to_total():
 
 
 def test_decay_times_match_literature():
-    """Fundamental T60 (prompt / aftersound) inside the ranges of docs/physical_parameters.md."""
+    """Fundamental T60 (prompt / aftersound) from the mode parameters inside the ranges of
+    docs/physical_parameters.md. Bass and mid only: in the treble the spec targets the *measured*
+    decay, which beating makes shorter than the prompt mode's own rate (see pianonn.diagnostics)."""
     phys = PianoPhysics(small_cfg(sample_rate=24000, n_partials=12))
-    targets = {0: ((20, 40), None), 39: ((6, 8), (20, 35)), 48: ((5, 6.5), (15, 30)), 63: ((2.5, 3.5), (8, 15)),
-               75: ((1.2, 2.0), (3, 6))}
+    targets = {0: ((25, 40), None), 15: ((15, 20), (20, 30)), 39: ((6, 8), (20, 35)), 48: ((5, 6), (15, 30)),
+               63: ((2.5, 3.5), (8, 15))}
     ki = torch.tensor([list(targets)])
     m = phys.modes(ki, torch.full(ki.shape, 0.6), torch.zeros(ki.shape), torch.tensor([0]))
     t60 = 6.91 / m["alpha"][0, :, 0]  # [keys, modes] at the fundamental
