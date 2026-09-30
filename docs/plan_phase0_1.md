@@ -100,3 +100,5 @@ The first real-data step took 3.5–15 s (batch 4). Two fixes brought it to abou
 - Evaluation on the test split: MR-STFT loss and log-mel L1 for the untrained prior, the initialised
   prior, the fitted physics, and the fitted physics with the residual; fitted vs tracked inharmonicity
   and stretch; resyntheses.
+- Follow-ups, run in the same night: the main run continued to 220 minutes; a 40-minute identifiability
+  ablation without the measured frequencies; a 40-minute run with the log-mel loss term.

@@ -155,6 +155,22 @@ The plan that took the project from the reviews to its first fit on real audio i
 [`docs/plan_phase0_1.md`](docs/plan_phase0_1.md), and the first trial on MAESTRO 2018 is reported in
 [`docs/trial_2018.md`](docs/trial_2018.md).
 
+In short, two hours on one year (RTX 3090):
+- On held-out test audio the log-mel distance fell from 15.1 dB for the untrained prior to 6.7 dB with
+  per-year measurements alone, to 4.0 dB after fitting, and to 3.84 dB with the residual after 220 minutes.
+- The physics carries the fit, and the learned residual stays neutral.
+- The fit found that this piano's middle register has much stronger phantom partials than the prior
+  assumed, which the recordings confirm.
+- The remaining errors are named in the report: bass fundamentals under-fitted by the per-bin loss, soft
+  playing ~2 dB quiet, and the attack's texture.
+
+Renders of `samples/demo.mid`:
+- `samples/trained_2018_2h.wav`: the trained model, with the residual;
+- `samples/trained_2018_2h_physics.wav`: physics only;
+- `samples/trained_2018_4h.wav`: after 220 minutes.
+
+Both are stereo, at MAESTRO's recorded level.
+
 The prior is calibrated against the literature (the KTH *Five Lectures on the Acoustics of the Piano*,
 arXiv and Zenodo papers) and against 260 recorded notes of a Steinway B, analysed with the same code as the
 model's renders ([`docs/calibration_iowa.md`](docs/calibration_iowa.md)); per-year inharmonicity and
