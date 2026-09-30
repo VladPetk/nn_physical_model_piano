@@ -18,7 +18,7 @@ steps), and two 40-minute follow-up experiments.
 - **Frequencies are not identifiable from this loss.** Started from a bass inharmonicity 2.4× too high, the fit stayed there, and the validation loss did not notice. Measured per-year frequencies (isolated-note mining) are necessary.
 - **Open errors, named:**
   - 60–125 Hz drifts 6 dB under the recordings (per-bin loss hedging; a log-mel term halves the early deficit but does not stop the drift);
-  - soft playing is ~2 dB quiet (one velocity slope per year is not enough);
+  - soft, pedalled playing is ~2 dB quiet (a per-year velocity curve does not fix it; decay under the pedal is the next suspect);
   - the attack is the worst resolution: its level relative to the note is right, but it is ~3 dB too bright above 4 kHz.
 - Next steps are in section 12.
 
@@ -290,6 +290,24 @@ The term helps (about 1 dB less bass deficit, better band balance everywhere, a 
 but the 60–125 Hz deficit still grows with training. It is a partial fix. The bass needs the frequency-resolving
 term of the identifiability section as well: the same blindness shows in both results.
 
+### A velocity curve per year
+
+The report above blamed the soft-playing deficit on the single velocity slope, so a per-year correction curve
+was added: 6 knots over the velocity range, ±12 dB, zero-initialised (`cond_vel_curve`). It was trained for the
+same 40 minutes as the log-mel run and with the same settings, so the curve is the only difference
+(`runs/velcurve_2018`).
+
+- The curve learned a compressive shape: +1.9, +1.7, +1.4, +0.6, −0.9 and −2.4 dB at velocity 0, 25, 51, 76,
+  102 and 127, on top of a slope of −2.1 dB.
+- Validation came out slightly better than the log-mel run (best 1.064 vs 1.072).
+- **The soft-versus-loud level error did not flatten.** Regressing each excerpt's broadband level error on its
+  mean velocity (92 excerpts) gives +6.3 dB across the velocity range, against +5.5 dB without the curve.
+
+So the deficit is not (only) the velocity law. Soft excerpts get more of their energy from sustained, pedalled,
+decaying sound. That points at the decay under the pedal and at the aftersound: the Iowa decay-profile checks at
+C2/C3 also fail, 6–7 dB too fast at 1–2 s, and the residual's biggest correction is per-note loudness in
+context. The curve stays in the model: it is harmless at zero and learns a plausible shape.
+
 ## 11. Assessment
 
 Against the phase-1 success criterion of review 3 ("a clear reduction of the held-out distance, fitted
@@ -315,7 +333,8 @@ What worked:
 What did not, or not yet:
 - The per-bin loss lets the **60–125 Hz octave drift 6 dB under** the recordings. The fix is a
   misalignment-insensitive term (tested in section 10) and a longer window for the bass.
-- **Soft playing is ~2 dB too quiet**: one slope per year is not a velocity curve.
+- **Soft playing is ~2 dB too quiet**. A per-year velocity curve learns a compressive shape but does not
+  remove the deficit (section 10), so the decay under the pedal is the next suspect.
 - The **attack** is the largest remaining error by resolution. Its level relative to the note is right, but it is ~3 dB too bright
   above 4 kHz and its fine texture is not captured.
 - The **residual needed time**: neutral at two hours, −0.23 dB log-mel at 220 minutes, mostly through per-note
@@ -328,8 +347,9 @@ What did not, or not yet:
    partial frequencies (an 8192–16384-point resolution below ~1 kHz, or partials compared on mined notes),
    because the current loss is blind to a 2× error in bass inharmonicity. Consider a mild weight on the first
    30 ms after each onset.
-2. **Velocity**: replace the per-year slope by a smooth monotone curve (5–6 knots over the velocity range,
-   per year), initialised by regressing the recordings' level on velocity.
+2. **Soft, pedalled passages**: the per-year velocity curve is in, but it does not remove the ~2 dB deficit.
+   Next, check the decay under the pedal and the aftersound level on mined notes that have the pedal down
+   (the Iowa C2/C3 decay profiles also run 6–7 dB fast), and switch the sympathetic bank on (item 6).
 3. **Attack**: make the knock impulse's spectrum a learnable smooth curve per register (the residual says it is a little
    loud and bright), then try the felt model at note-on (review 3, 9.1) for the texture.
 4. **Longer runs**: a full day on 2018 (several passes). Stage 1 had flattened after ~2,500 steps (~55 min) at

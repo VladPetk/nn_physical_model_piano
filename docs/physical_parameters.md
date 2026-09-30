@@ -215,6 +215,7 @@ These were not tuned further by hand: the next calibration is a proper fit to MA
 | Per-key colouration | per condition, a (key, log f) table: 23 key knots (every 4 keys) × 36 frequency knots (every 1/4 octave from A0), bilinear, ±8 dB, smooth in both directions, zero mean over keys; stage 2 | Review 3 item 6 |
 | `partial_gain` | ±8 dB (was ±26 dB), L2 and smoothness across keys at equal partial number; stage 2 | Review 3 F3 |
 | Damper delay | per condition, 15 ms ± 50 ms, learnable (the release edge is fractional in frames) | Spec §4 asked for it; review 1 m3 |
+| Velocity curve | per condition, a correction of the level-vs-velocity law: 6 knots over the velocity range, ±12 dB, zero at start, on top of the per-key and per-condition slopes | A Disklavier's velocity map is not a straight line in dB. On MAESTRO 2018 it learns a compressive shape (+1.9 dB at the softest, −2.4 dB at the loudest) |
 | Pedal mechanics | θ = 0.42 ± 0.3, width 0.06 ×/÷e, power 2.5 in [1.6, 4] | bounded (review 1 nit) |
 | Noise decay times | knock, thump, release and pedal τ bounded ×/÷e around their priors | review 1 m5, review 3 F1 |
 | Stereo | two body FIRs (different random modal mixtures), decorrelated hall tails with shared T60s and band levels, a gain per channel, a per-key channel balance ±6 dB (smooth over keys) | MAESTRO 2018 channels correlate at 0.2–0.4 (measured); review 3 F2 |

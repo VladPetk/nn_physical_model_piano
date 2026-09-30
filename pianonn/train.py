@@ -36,7 +36,7 @@ from .losses import (LogMelLoss, MultiResolutionDiscriminator, MultiResolutionST
 from .synth import ContextNet, NeuralPhysicalPiano
 
 STAGE2_ONLY = ("context.", "noise.att", "physics.partial_gain", "physics.color")
-DB_PARAMS = ("physics.gain_db", "physics.cond_gain_db", "physics.cond_vel_slope", "physics.soft_gain_db",
+DB_PARAMS = ("physics.gain_db", "physics.cond_gain_db", "physics.cond_vel_slope", "physics.cond_vel_curve", "physics.soft_gain_db",
              "physics.raw_phantom_db", "physics.raw_impulse_db", "physics.raw_impulse_vel", "room.mic_gain_db",
              "room.floor_db", "room.raw_pan")
 CENTS_PARAMS = ("physics.raw_cents", "physics.cond_cents")

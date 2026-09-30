@@ -95,6 +95,9 @@ COLOR_N_F = 36
 COLOR_BOUND = 0.92  # nats, 8 dB
 PARTIAL_GAIN_BOUND = 0.92  # nats, 8 dB (was 3 nats: enough to replace the hammer model outright)
 F_REF = 27.5  # A0: origin of the log-frequency knot grids
+# per-condition correction of the level-vs-velocity law, dB at u = 0, 0.2, ..., 1 (linear in between, +-12 dB):
+# a Disklavier's velocity map is not a straight line in dB, and one slope per year left soft playing ~2 dB quiet
+VEL_KNOTS = 6
 
 
 def hammer_velocity(u):
@@ -259,6 +262,7 @@ class PianoPhysics(nn.Module):
         self.cond_vel_slope = _p(C)
         self.cond_log_tc = _p(C)
         self.cond_damper_delay = _p(C)  # damper contact after MIDI note-off: 15 ms + [-50, +50] ms (spec: per year)
+        self.cond_vel_curve = _p(C, VEL_KNOTS)  # dB correction of the velocity law (zero: the slope alone)
 
         # --- pedal mechanics (bounded: review 1 nit, the power was free to run off) ---
         self.raw_pedal_theta = _p()  # sustain value at which dampers lift half-way: 0.42 +- 0.3
@@ -340,6 +344,7 @@ class PianoPhysics(nn.Module):
         u0 = u - 0.6
         db = (self.gain_db[ki] + bounded(self.cond_gain_db[cond_k], 12.0)
               + (40.0 * torch.exp(bounded(self.raw_vel_slope[ki], 0.7)) + bounded(self.cond_vel_slope[cond_k], 10.0)) * u0
+              + interp_knots(bounded(self.cond_vel_curve[cond], 12.0), u * (VEL_KNOTS - 1))
               + soft * (self.soft_gain_prior[ki] + bounded(self.soft_gain_db, 3.0)))
         return db if ctx_gain_db is None else db + ctx_gain_db
 
@@ -462,6 +467,7 @@ class PianoPhysics(nn.Module):
         reg = reg + 0.1 * smooth(g, 1)  # 1/6-octave detail is allowed; wiggles at the knot scale are not
         pg = bounded(self.partial_gain, PARTIAL_GAIN_BOUND)
         reg = reg + 1e-2 * (pg**2).mean() + smooth(pg, 0)  # smooth across keys at equal partial number
+        reg = reg + smooth(bounded(self.cond_vel_curve[conds], 12.0) / 20, 1)
         col = bounded(self.color[conds], COLOR_BOUND)
         reg = reg + 1e-2 * (col**2).mean() + smooth(col, 1) + smooth(col, 2) + (col.mean(1) ** 2).mean()
         return reg

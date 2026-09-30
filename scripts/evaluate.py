@@ -128,6 +128,8 @@ def fitted_table(model, cond):
         "hall_t60_s": [round(float(v), 2) for v in torch.exp(room.prior_log_t60 + bounded(room.raw_log_t60[cond], 0.7))],
         "hall_log_gain": [round(float(v), 2) for v in room.log_gain[cond]],
         "vel_slope_db(cond)": float(bounded(ph.cond_vel_slope[cond], 10.0)),
+        "vel_curve_db(cond, u=0..1)": [round(float(v), 2) for v in bounded(ph.cond_vel_curve[cond], 12.0)]
+        if hasattr(ph, "cond_vel_curve") else None,
         "gain_db(cond)": float(bounded(ph.cond_gain_db[cond], 12.0)),
         "pedal_theta": float(0.42 + bounded(ph.raw_pedal_theta, 0.3)),
         "pedal_power": float(2.5 * torch.exp(bounded(ph.raw_pedal_power, 0.47))),
