@@ -145,6 +145,25 @@ class MaestroSegments(Dataset):
                 self._midi[piece["id"]] = {k: z[k] for k in z.files}
         return self._midi[piece["id"]]
 
+    def silence_clips(self, year=None, min_seconds=0.3, margin=0.1, max_seconds=2.0):
+        """The recorded silence before each piece's first note (MAESTRO has about a second of it): ``[ch, n]``
+        float tensors, from ``margin`` s after the start to ``margin`` s before the first onset."""
+        import soundfile as sf
+
+        sr, clips = self.cfg.sample_rate, []
+        for piece in self.pieces:
+            if year is not None and piece["year"] != year:
+                continue
+            first = float(self._notes(piece)["notes"][:, 1].min())
+            a, b = margin, min(first - margin, margin + max_seconds)
+            if b - a < min_seconds:
+                continue
+            x, _ = sf.read(os.path.join(self.root, piece["audio"]), start=int(a * sr), frames=int((b - a) * sr),
+                           dtype="float32", always_2d=True)
+            x = x.T if x.shape[1] == self.cfg.channels else x.mean(1, keepdims=True).T.repeat(self.cfg.channels, 0)
+            clips.append(torch.from_numpy(np.ascontiguousarray(x)))
+        return clips
+
     def __getitem__(self, i):
         import soundfile as sf
 

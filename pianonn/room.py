@@ -8,6 +8,8 @@ One set per recording condition (MAESTRO year):
 * ``hall``: a parametric tail. Fixed octave-band noise carriers are shaped by a
   learnable T60 and gain per band, which is far more identifiable than tens of
   thousands of free FIR taps.
+* ``floor``: the stationary noise at the microphones (hall, audience, preamps) plus mains-hum lines,
+  measured on the silence before each piece's first note and refined within +-3 dB.
 
 The hall hears what the soundboard radiates, so the two are in series:
 ``ir = body * (delta + hall)`` (convolution). The radiation high-pass of the
@@ -31,6 +33,9 @@ BODY_TARGET_DB = [(20, -40), (30, -30), (40, -20), (55, -10), (70, -4), (100, 0)
 GRAND_LOW_MODES = [62.0, 90.0, 105.0, 127.0, 187.0, 222.0, 245.0, 325.0]  # 2.90 m concert grand (Wogram, modal.html)
 HALL_BANDS = [125, 250, 500, 1000, 2000, 4000, 8000]
 HALL_T60 = [2.0, 1.8, 1.7, 1.6, 1.45, 1.2, 0.8]
+FLOOR_BOUND_DB = 3.0  # the floor is a measurement (leading silence); training may refine it by this much
+MAINS_HZ = 60.0  # MAESTRO: the Piano-e-Competition, Minneapolis (US mains); hum at 60, 120, 180 Hz
+HUM_LINES = 3
 
 
 def _interp_log_f(points, f):
@@ -157,9 +162,31 @@ class Room(nn.Module):
         self.raw_pan = nn.Parameter(torch.zeros(C, 88))
         # stationary noise floor at the microphones (hall, audience, preamps), white-equivalent dBFS per band:
         # a model that renders digital silence is otherwise scored against the recordings' floor in every
-        # quiet bin (review 3, F1). Initialised from the recordings.
+        # quiet bin (review 3, F1). The reference is measured on the recordings' leading silence
+        # (fit_init.floor_from_silence); training refines it within +-FLOOR_BOUND_DB. Unbounded, the trial's
+        # floor was the fastest-moving parameter of the recording chain (review 4, section 4).
         self.register_buffer("floor_log2_centers", torch.linspace(math.log2(40.0), math.log2(sr / 2), cfg.noise_bands))
-        self.floor_db = nn.Parameter(torch.full((C, ch, cfg.noise_bands), -90.0))
+        self.register_buffer("floor_ref_db", torch.full((C, ch, cfg.noise_bands), -90.0))
+        self.raw_floor = nn.Parameter(torch.zeros(C, ch, cfg.noise_bands))
+        # mains hum: sinusoids at MAINS_HZ x (1, 2, 3), RMS dBFS per channel (-200 = none until measured)
+        self.register_buffer("hum_ref_db", torch.full((C, ch, HUM_LINES), -200.0))
+        self.raw_hum = nn.Parameter(torch.zeros(C, ch, HUM_LINES))
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        old = prefix + "floor_db"  # checkpoints before round 2: an unbounded learned floor
+        if old in state_dict and prefix + "floor_ref_db" not in state_dict:
+            v = state_dict.pop(old)
+            state_dict[prefix + "floor_ref_db"] = v
+            state_dict[prefix + "raw_floor"] = torch.zeros_like(v)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    def floor_db(self, cond):
+        """Floor band levels ``[B, ch, bands]`` (white-equivalent dBFS)."""
+        return self.floor_ref_db[cond] + bounded(self.raw_floor[cond], FLOOR_BOUND_DB)
+
+    def hum_db(self, cond):
+        """Hum line levels ``[B, ch, lines]`` (RMS dBFS)."""
+        return self.hum_ref_db[cond] + bounded(self.raw_hum[cond], FLOOR_BOUND_DB)
 
     def _hall(self, cond, gain=None):
         """Hall impulse responses ``[B, ch, L]``."""
@@ -184,16 +211,23 @@ class Room(nn.Module):
 
     def floor_noise(self, cond, n, generator=None):
         """Stationary noise ``[B, ch, n]`` with the condition's floor spectrum (raised-cosine interpolation of
-        the band levels in log f, the same partition of unity as the noise bank's bands)."""
+        the band levels in log f, the same partition of unity as the noise bank's bands), plus the hum lines
+        (random phase)."""
         B, ch = cond.shape[0], self.cfg.channels
-        dev = self.floor_db.device
+        dev = self.floor_ref_db.device
         white = torch.randn(B, ch, n, generator=generator, device=dev)
+        phase = 2 * math.pi * torch.rand(B, ch, HUM_LINES, 1, generator=generator, device=dev)
         X = torch.fft.rfft(white)
         f = torch.fft.rfftfreq(n, 1 / self.cfg.sample_rate).to(dev)
         c = self.floor_log2_centers
         pos = ((torch.log2(f.clamp(min=1.0)) - c[0]) / (c[1] - c[0])).clamp(0, len(c) - 1)
         i0 = pos.floor().long().clamp(max=len(c) - 2)
         w = torch.sin(0.5 * math.pi * (pos - i0)) ** 2
-        power = torch.pow(10.0, self.floor_db[cond] / 10)  # [B, ch, bands]
+        power = torch.pow(10.0, self.floor_db(cond) / 10)  # [B, ch, bands]
         psd = power[..., i0] * (1 - w) + power[..., i0 + 1] * w
-        return torch.fft.irfft(X * psd.sqrt(), n)
+        t = torch.arange(n, device=dev, dtype=torch.float64) / self.cfg.sample_rate
+        k = torch.arange(1, HUM_LINES + 1, device=dev, dtype=torch.float64)
+        cyc = torch.frac(MAINS_HZ * k[:, None] * t).float()  # float64 cycle count: exact at any length
+        amp = (2 * torch.pow(10.0, self.hum_db(cond) / 10)).sqrt()[..., None]  # [B, ch, lines, 1]
+        hum = (amp * torch.sin(2 * math.pi * cyc + phase)).sum(2)
+        return torch.fft.irfft(X * psd.sqrt(), n) + hum

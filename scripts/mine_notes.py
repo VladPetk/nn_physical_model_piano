@@ -11,7 +11,7 @@ tuning (cents re equal temperament at A440).
 The per-key medians are the measured side of the identifiability check: after fitting, the
 model's B and stretch should agree with them. They are also per-year priors.
 
-    python scripts/mine_notes.py data/maestro24k --years 2018 --out runs/mined_2018.json
+    python scripts/mine_notes.py data/maestro24k --years 2018 --out runs/measurements/mined_2018.json
 """
 
 import argparse

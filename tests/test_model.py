@@ -29,7 +29,7 @@ def test_forward_backward():
                  "context.frame_head.2.weight", "noise.att", "physics.raw_pedal_theta", "physics.raw_pedal_power",
                  "physics.raw_order", "physics.raw_order_vel", "physics.raw_restrike", "physics.raw_phantom_db",
                  "physics.raw_impulse_db", "physics.raw_bridge_g", "physics.cond_damper_delay", "physics.color",
-                 "room.floor_db", "room.raw_pan", "room.mic_gain_db", "noise.raw_knock_tau", "physics.cond_vel_curve"]:
+                 "room.raw_floor", "room.raw_pan", "room.mic_gain_db", "noise.raw_knock_tau", "physics.cond_vel_curve"]:
         g = dict(m.named_parameters())[name].grad
         assert g is not None and torch.isfinite(g).all() and g.abs().sum() > 0, name
 

@@ -12,6 +12,12 @@ Staged, so the physics keeps first claim on the data (review 3, sections 4.3 and
 Validation reports the held-out loss with the residual on and off: the gap is what the physics
 still leaves unexplained. Audio of fixed validation excerpts is written at every dump.
 
+The loss is :class:`pianonn.losses.PianoLoss` (round 2: log band energies, a fine term below 2 kHz and an
+onset-window term; the trial's spectral-convergence term set the level ~1.8 dB low). ``--no-residual`` runs
+stage 2 without the residual (the control for its gain), and ``--adv-with-stage2`` adds the GAN in stage 2:
+the discriminator judges the audio, but its gradients reach only the noise bank and the residual
+(``GAN_PARAMS``), through a view of the output in which everything else is detached.
+
     python -m pianonn.train --data data/maestro24k --years 2018 --out runs/trial --minutes 120
 """
 
@@ -31,14 +37,16 @@ from torch.utils.data import DataLoader  # noqa: E402
 from .config import PianoConfig  # noqa: E402
 from .data import MaestroSegments, SyntheticPerformances, collate
 from .dsp import bounded
-from .losses import (LogMelLoss, MultiResolutionDiscriminator, MultiResolutionSTFTLoss, band_energies,
-                     discriminator_loss, generator_adv_loss)
+from .losses import (LogMelLoss, MultiResolutionDiscriminator, MultiResolutionSTFTLoss, PianoLoss, band_energies,
+                     discriminator_loss, generator_adv_loss, highpass)
 from .synth import ContextNet, NeuralPhysicalPiano
 
 STAGE2_ONLY = ("context.", "noise.att", "physics.partial_gain", "physics.color")
 DB_PARAMS = ("physics.gain_db", "physics.cond_gain_db", "physics.cond_vel_slope", "physics.cond_vel_curve", "physics.soft_gain_db",
              "physics.raw_phantom_db", "physics.raw_impulse_db", "physics.raw_impulse_vel", "room.mic_gain_db",
-             "room.floor_db", "room.raw_pan")
+             "room.raw_pan")  # the floor and hum (bounded +-3 dB around a measurement) learn at the base rate
+GAN_PARAMS = ("noise.", "context.")  # what the critic may change (enforced by the texture view, see synth.forward)
+MODULES = ("physics", "room", "noise", "context")
 CENTS_PARAMS = ("physics.raw_cents", "physics.cond_cents")
 
 
@@ -98,7 +106,9 @@ def to_device(batch, device, non_blocking=False):
 
 def residual_budget(model, out, mask):
     """What the residual explains, as penalties: per-note corrections and band gains (normalised by their bounds),
-    and the residual noise's share of the band energy of the dry signal."""
+    and the residual noise's share of the output's band energy at the microphones (floor included). Measured
+    against the physics alone, as in the trial, the share was 1 wherever the physics is silent, whatever the
+    residual added, and those cells made up three quarters of the penalty (review 4, section 5)."""
     terms = {}
     ctx, frame = out.get("ctx") or {}, out.get("frame_ctx")
     if ctx:
@@ -111,11 +121,11 @@ def residual_budget(model, out, mask):
         terms["note"] = tot / len(ContextNet.NOTE)
     if frame is not None:
         terms["frame"] = ((frame["band_gain"] / ContextNet.FRAME["band_gain"][1]) ** 2).mean()
-    if "noise_res" in out:
+    if "noise_res_out" in out:
         M = model.noise.band_masks(512)
-        e_res = band_energies(out["noise_res"], M)
-        e_dry = band_energies(out.get("dry_phys", out["dry"]).mean(1), M).detach()
-        terms["additive"] = (e_res / (e_res + e_dry + 1e-12)).mean()
+        e_res = band_energies(out["noise_res_out"], M)
+        e_out = band_energies(out["audio"], M).detach()
+        terms["additive"] = (e_res / (e_res.detach() + e_out + 1e-12)).clamp(max=1.0).mean()
     return terms
 
 
@@ -124,18 +134,27 @@ def pan_smoothness(model, cond):
     return ((x[:, 2:] - 2 * x[:, 1:-1] + x[:, :-2]) ** 2).mean()
 
 
+def onsets_of(batch, s, sr):
+    """Onsets re the loss window's first sample, and their mask (for the attack term)."""
+    return batch["onset"] - s / sr, batch["mask"]
+
+
 @torch.no_grad()
-def validate(model, batches, recon, residual):
+def validate(model, batches, loss_fn, residual, old=None):
+    """Mean loss and terms over fixed batches; with ``old``, also the trial's MR-STFT loss (``terms["mrstft"]``)."""
     model.eval()
     tot, per = 0.0, {}
     for b in batches:
         n, s = b["audio"].shape[-1], int(b["loss_start"][0])
         g = torch.Generator(device=b["audio"].device).manual_seed(0)
-        pred = model(b, n, residual=residual, generator=g)["audio"][..., s:]
-        loss, terms = recon(pred, b["audio"][..., s:], per_resolution=True)
+        pred, tgt = model(b, n, residual=residual, generator=g)["audio"][..., s:], b["audio"][..., s:]
+        loss, terms = loss_fn(pred, tgt, *onsets_of(b, s, model.cfg.sample_rate))
+        terms = {k: float(v) for k, v in terms.items()}
+        if old is not None:
+            terms["mrstft"] = float(old(pred, tgt))
         tot += float(loss)
         for k, v in terms.items():
-            per[k] = per.get(k, 0.0) + float(v)
+            per[k] = per.get(k, 0.0) + v
     model.train()
     return tot / len(batches), {k: v / len(batches) for k, v in per.items()}
 
@@ -198,7 +217,13 @@ def main(argv=None):
     ap.add_argument("--dump-every", type=int, default=1000)
     ap.add_argument("--dump-seconds", type=float, default=8.0)
     ap.add_argument("--adv-start", type=int, default=-1, help="step to switch on the GAN loss (-1: never)")
+    ap.add_argument("--adv-with-stage2", action="store_true", help="switch the GAN on together with stage 2")
     ap.add_argument("--adv-weight", type=float, default=0.1)
+    ap.add_argument("--no-residual", action="store_true",
+                    help="stage 2 without the residual: the control run for what the residual adds")
+    ap.add_argument("--loss-weights", type=float, nargs=3, default=(1.0, 0.25, 0.5), metavar=("BAND", "FINE", "ATTACK"))
+    ap.add_argument("--clip", type=float, default=4.0,
+                    help="clip each module's gradient norm at this multiple of its running typical norm")
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -248,11 +273,12 @@ def main(argv=None):
                         persistent_workers=args.workers > 0, pin_memory=device.type == "cuda",
                         prefetch_factor=4 if args.workers > 0 else None)
 
-    recon = MultiResolutionSTFTLoss()
+    recon = PianoLoss(cfg.sample_rate, weights=args.loss_weights).to(device)
+    old_loss = MultiResolutionSTFTLoss()  # the trial's loss, reported for continuity
     mel_loss = LogMelLoss(cfg.sample_rate).to(device) if args.mel_weight > 0 else None
     opt = torch.optim.Adam(param_groups(model, args.lr))
     disc = disc_opt = None
-    if args.adv_start >= 0:
+    if args.adv_start >= 0 or args.adv_with_stage2:
         disc = MultiResolutionDiscriminator().to(device)
         disc_opt = torch.optim.Adam(disc.parameters(), lr=2e-4, betas=(0.5, 0.9))
 
@@ -277,7 +303,7 @@ def main(argv=None):
     val_batches = fixed_batches(val_set, args.val_examples, args.batch, device) if val_set else None
     dump_examples = fixed_batches(dump_set, 3, 1, device) if val_set else None
     if val_batches and not args.resume:
-        v_raw, _ = validate(model, val_batches, recon, residual=False)
+        v_raw, _ = validate(model, val_batches, recon, residual=False, old=old_loss)
         log(f"val (untrained prior, before init): {v_raw:.4f}", kind="val", step=0, val_physics=v_raw, tag="raw_prior")
         if args.mined:
             from .fit_init import apply_mined_priors
@@ -292,9 +318,9 @@ def main(argv=None):
                 init_set = MaestroSegments(args.data, "train", cfg, args.segment, args.warmup, args.lookback,
                                            length=args.init_examples, deterministic=True, years=[year], seed=3)
                 est = initialise_from_data(model, fixed_batches(init_set, args.init_examples, args.batch, device),
-                                           log=log, tuning=not args.mined)
+                                           log=log, tuning=not args.mined, silence=dataset.silence_clips(year))
                 log(f"init estimates {year}", kind="init", year=year, **{k: v for k, v in est.items()})
-            v0, per0 = validate(model, val_batches, recon, residual=False)
+            v0, per0 = validate(model, val_batches, recon, residual=False, old=old_loss)
             log(f"val (prior after init): {v0:.4f}", kind="val", step=0, val_physics=v0, per_res=per0, tag="init_prior")
         dump_audio(model, dump_examples, os.path.join(args.out, "audio"), "prior", residual_too=False)
 
@@ -310,24 +336,27 @@ def main(argv=None):
             return step >= args.stage2_at
         return (elapsed() >= args.stage2_at * budget_s) if budget_s else step >= args.stage2_at * n_steps
 
-    set_stage(model, opt, stage, args.stage2_physics_lr, frozen=args.freeze)
+    frozen = tuple(args.freeze) + (("context.", "noise.att") if args.no_residual else ())
+    set_stage(model, opt, stage, args.stage2_physics_lr, frozen=frozen)
     amp_ctx = lambda: torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp)
 
     def save(tag):
         torch.save({"cfg": cfg.to_dict(), "model": model.state_dict(), "opt": opt.state_dict(), "step": step,
                     "stage": stage, "best": best, "elapsed": elapsed(), "args": vars(args)}, os.path.join(args.out, f"{tag}.pt"))
 
+    use_residual = lambda: stage >= 2 and not args.no_residual
+
     def run_validation():
         nonlocal best
         if not val_batches:
             return
-        v_phys, per = validate(model, val_batches, recon, residual=False)
+        v_phys, per = validate(model, val_batches, recon, residual=False, old=old_loss)
         rec = {"kind": "val", "step": step, "stage": stage, "val_physics": v_phys, "per_res": per}
-        msg = f"val step {step}: physics {v_phys:.4f}"
+        msg = f"val step {step}: physics {v_phys:.4f} (" + " ".join(f"{k} {v:.4f}" for k, v in per.items()) + ")"
         v = v_phys
-        if stage >= 2:
-            v_res, _ = validate(model, val_batches, recon, residual=True)
-            rec["val_residual"] = v_res
+        if use_residual():
+            v_res, per_res = validate(model, val_batches, recon, residual=True, old=old_loss)
+            rec["val_residual"], rec["per_res_residual"] = v_res, per_res
             msg += f"  with residual {v_res:.4f}  (unexplained by physics: {v_phys - v_res:+.4f})"
             v = v_res
         log(msg, **rec)
@@ -338,11 +367,19 @@ def main(argv=None):
     model.train()
     t_last = time.time()
     it = iter(loader)
+    clip_state = {}  # per module: running typical gradient norm (the trial's global clip at 1.0 scaled every step)
+    adv_from = args.adv_start if args.adv_start >= 0 else math.inf
+    if args.adv_with_stage2 and stage >= 2:
+        adv_from = step
     while step < n_steps:
         if stage == 1 and stage2_due():
             stage = 2
-            set_stage(model, opt, stage, args.stage2_physics_lr, frozen=args.freeze)
-            log(f"step {step}: stage 2 (partial_gain, colouration and the residual unfrozen; physics lr x{args.stage2_physics_lr})")
+            set_stage(model, opt, stage, args.stage2_physics_lr, frozen=frozen)
+            log(f"step {step}: stage 2 (partial_gain, colouration{'' if args.no_residual else ' and the residual'} unfrozen; "
+                f"physics lr x{args.stage2_physics_lr})")
+            if args.adv_with_stage2 and disc is not None:
+                adv_from = step
+                log(f"step {step}: GAN on (critic gradients reach only {', '.join(GAN_PARAMS)})")
             run_validation()
         batch = to_device(next(it), device, non_blocking=device.type == "cuda")
         t0 = time.time()
@@ -354,12 +391,17 @@ def main(argv=None):
             s = int(args.warmup * cfg.sample_rate)
         else:
             target, n, s = batch["audio"], batch["audio"].shape[-1], int(batch["loss_start"][0])
-        residual = stage >= 2
+        residual = use_residual()
+        gan = disc is not None and step >= adv_from
+        extras = (("residual_out",) if residual else ()) + (("texture_view",) if gan else ())
         with amp_ctx():
-            out = model(batch, n, residual=residual)
+            out = model(batch, n, residual=residual, extras=extras)
         pred, tgt = out["audio"][..., s:].float(), target[..., s:].float()
 
-        logs = {"recon": recon(pred, tgt), "reg": model.physics.regularizer(batch["condition"]) + pan_smoothness(model, batch["condition"])}
+        logs = {}
+        logs["recon"], parts = recon(pred, tgt, *onsets_of(batch, s, cfg.sample_rate))
+        logs.update(parts)
+        logs["reg"] = model.physics.regularizer(batch["condition"]) + pan_smoothness(model, batch["condition"])
         loss = logs["recon"] + args.reg * logs["reg"]
         if mel_loss is not None:
             logs["mel"] = mel_loss(pred, tgt)
@@ -369,22 +411,38 @@ def main(argv=None):
             for k, v in residual_budget(model, out, batch["mask"]).items():
                 logs["budget_" + k] = v
                 loss = loss + weights[k] * v
-        if disc is not None and step >= args.adv_start:
+        if gan:
+            real = highpass(tgt, cfg.sample_rate)  # no infrasound giveaway: the loss ignores it too
+            fake = highpass(out["audio_texture"][..., s:].float(), cfg.sample_rate)
+            disc.requires_grad_(True)
             disc_opt.zero_grad()
-            logs["disc"] = discriminator_loss(disc, tgt, pred)
+            logs["disc"] = discriminator_loss(disc, real, fake)
             logs["disc"].backward()
             disc_opt.step()
-            logs["adv"], logs["fm"] = generator_adv_loss(disc, tgt, pred)
-            loss = loss + args.adv_weight * (logs["adv"] + 2.0 * logs["fm"])
+            disc.requires_grad_(False)
+            logs["adv"], logs["fm"] = generator_adv_loss(disc, real, fake)
+            loss = loss + args.adv_weight * (logs["adv"] + 2.0 * logs["fm"])  # reaches GAN_PARAMS only
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        gnorm = {}
-        for mod in ("physics", "room", "noise", "context"):
-            gs = [p.grad.norm() for name, p in model.named_parameters() if name.startswith(mod + ".") and p.grad is not None]
-            gnorm[mod] = float(torch.stack(gs).norm()) if gs else 0.0
-        total = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        if not torch.isfinite(total):
+        gnorm, finite = {}, True
+        for mod in MODULES:
+            ps = [p for name, p in model.named_parameters() if name.startswith(mod + ".") and p.grad is not None]
+            if not ps:
+                gnorm[mod] = 0.0
+                continue
+            norm = float(torch.stack([p.grad.norm() for p in ps]).norm())
+            gnorm[mod] = norm
+            if not math.isfinite(norm):
+                finite = False
+                continue
+            typical = clip_state.get(mod)
+            limit = args.clip * typical if typical else math.inf
+            if norm > limit:  # a spike in this module: scale it back, leave the others alone
+                for p in ps:
+                    p.grad.mul_(limit / norm)
+            clip_state[mod] = norm if typical is None else 0.98 * typical + 0.02 * min(norm, limit)
+        if not finite:
             log(f"step {step}: non-finite gradient norm, step skipped", kind="warn", step=step)
             opt.zero_grad(set_to_none=True)
             continue
@@ -406,7 +464,7 @@ def main(argv=None):
         if step % args.val_every == 0:
             run_validation()
         if dump_examples and step % args.dump_every == 0:
-            dump_audio(model, dump_examples, os.path.join(args.out, "audio"), f"step{step}", residual_too=stage >= 2)
+            dump_audio(model, dump_examples, os.path.join(args.out, "audio"), f"step{step}", residual_too=use_residual())
         if step % args.save_every == 0:
             save("last")
         if budget_s and elapsed() >= budget_s:
@@ -415,7 +473,7 @@ def main(argv=None):
 
     run_validation()
     if dump_examples:
-        dump_audio(model, dump_examples, os.path.join(args.out, "audio"), f"step{step}", residual_too=stage >= 2)
+        dump_audio(model, dump_examples, os.path.join(args.out, "audio"), f"step{step}", residual_too=use_residual())
     save("last")
     log(f"done: {step} steps, best val {best:.4f}")
 

@@ -116,26 +116,38 @@ pytest
 python scripts/prepare_maestro.py data/maestro-v3.0.0.zip data/maestro24k --years 2018
 
 # 2. measure inharmonicity and stretch on isolated notes of that year (CPU)
-python scripts/mine_notes.py data/maestro24k --years 2018 --out runs/mined_2018.json
+python scripts/mine_notes.py data/maestro24k --years 2018 --out runs/measurements/mined_2018.json
 
 # 3. go/no-go: overfit one excerpt with growing parameter sets
-python scripts/overfit_excerpt.py data/maestro24k --years 2018 --out runs/overfit
+python scripts/overfit_excerpt.py data/maestro24k --years 2018 --out runs/exp1/overfit
 
 # 4. train (stage 1 physics + recording chain, stage 2 + residual after 60 %; --minutes caps the time)
-python -m pianonn.train --data data/maestro24k --years 2018 --mined runs/mined_2018.json --out runs/trial --minutes 120 --batch 8
+python -m pianonn.train --data data/maestro24k --years 2018 --mined runs/measurements/mined_2018.json --out runs/exp1/train --minutes 120 --batch 8
 
 # 5. evaluate on the test split, with the identifiability table
-python scripts/evaluate.py runs/trial/best.pt data/maestro24k --years 2018 --mined runs/mined_2018.json --out runs/trial/eval
+python scripts/evaluate.py runs/exp1/train/best.pt data/maestro24k --years 2018 --mined runs/measurements/mined_2018.json --out runs/exp1/train/eval
+
+# the note bench: isolated notes of the recordings vs each model, by register, velocity and pedal (docs/tone_measures.md)
+python scripts/note_bench.py data/maestro24k --years 2018 --out runs/exp1/bench --validate --music 24 --model a=runs/exp1/train/best.pt:physics
+
+# compare checkpoints excerpt by excerpt over several noise seeds, and render them in turn for listening
+python scripts/compare_runs.py data/maestro24k --out runs/exp1/compare.md --model a=runs/exp1/a/last.pt:residual --model b=runs/exp1/b/last.pt:physics
+python scripts/ab_render.py data/maestro24k --out runs/exp1/listen --model a=runs/exp1/a/last.pt:residual --model b=runs/exp1/b/last.pt:physics
 
 # render (stereo; without --ckpt you hear the untrained prior; --physics-only switches the residual off)
-python -m pianonn.render some.mid out.wav --ckpt runs/trial/best.pt --year 2018
+python -m pianonn.render some.mid out.wav --ckpt runs/exp1/train/best.pt --year 2018
 
 # sanity check without data: fit a randomly perturbed copy of the model
-python -m pianonn.train --synthetic --out runs/synthetic
+python -m pianonn.train --synthetic --out runs/scratch/synthetic
 
 # check a model against the literature targets in docs/physical_parameters.md
-python -m pianonn.diagnostics [--ckpt runs/trial/best.pt]
+python -m pianonn.diagnostics [--ckpt runs/exp1/train/best.pt]
 ```
+
+Outputs go under `runs/` (not in git except its index, [`runs/README.md`](runs/README.md)): one folder per
+experiment, one subfolder per run, each holding its checkpoints, `log.jsonl` (every log line), `train.log` (the
+console, if redirected) and `eval/`. Measurements taken from the recordings go in `runs/measurements/`, throwaway
+runs in `runs/scratch/`.
 
 The physics prior is specified in [`docs/physical_parameters.md`](docs/physical_parameters.md), with
 a source for every value. The literature reviews are in [`docs/literature/`](docs/literature/), the
@@ -151,18 +163,28 @@ per-partial calibration (steeper hammer top, high partials that sustain, frequen
 
 ## Status
 
-The plan that took the project from the reviews to its first fit on real audio is in
-[`docs/plan_phase0_1.md`](docs/plan_phase0_1.md), and the first trial on MAESTRO 2018 is reported in
-[`docs/trial_2018.md`](docs/trial_2018.md).
+The documents, in order:
+- [`docs/plan_phase0_1.md`](docs/plan_phase0_1.md): the plan that took the project from the reviews to its
+  first fit on real audio;
+- [`docs/trial_2018.md`](docs/trial_2018.md): the first trial on MAESTRO 2018, corrected after review 4;
+- [`docs/plan_round2.md`](docs/plan_round2.md): the response to review 4, with a new loss, floor, budget and
+  evaluation scale;
+- [`docs/round2_results.md`](docs/round2_results.md): the re-fit with a control branch and a GAN branch.
+- [`docs/tone_measures.md`](docs/tone_measures.md): what a piano note is made of, the measures that follow,
+  and what each loss term can see (the design for round 3).
 
-In short, two hours on one year (RTX 3090):
-- On held-out test audio the log-mel distance fell from 15.1 dB for the untrained prior to 6.7 dB with
-  per-year measurements alone, to 4.0 dB after fitting, and to 3.84 dB with the residual after 220 minutes.
-- The physics carries the fit, and the learned residual stays neutral.
-- The fit found that this piano's middle register has much stronger phantom partials than the prior
-  assumed, which the recordings confirm.
-- The remaining errors are named in the report: bass fundamentals under-fitted by the per-bin loss, soft
-  playing ~2 dB quiet, and the attack's texture.
+In short, on one year (RTX 3090):
+- **Distance.** On 96 held-out test excerpts, the round-2 loss (log band energies, fine and attack terms, no
+  spectral convergence) matches in 50 minutes the trial's 220-minute log-mel distance: 3.27 vs 3.25 dB, from
+  5.88 dB at the measured starting point.
+- **Level.** The level is right to within 0.5 dB broadband and 1 dB per octave band, except 4 kHz (−1.8 dB). The
+  trial's model was 2.4 dB low, because of its loss.
+- **The residual.** It beats a physics-only control by more than the noise-seed spread, but the physics leans
+  on it (it takes over turning the knock down). Its noise path stays silent: the per-frame loss shuts it.
+- **Frequencies.** Inharmonicity and tuning are measured on isolated notes and frozen: no loss term sees them
+  well enough to fit them.
+- **Open:** the knock's spectrum (too much low-middle, too little at 4 kHz), texture (a GAN branch had no
+  measurable effect in 500 steps), and listening.
 
 Renders of `samples/demo.mid`:
 - `samples/trained_2018_2h.wav`: the trained model, with the residual;
@@ -177,11 +199,14 @@ model's renders ([`docs/calibration_iowa.md`](docs/calibration_iowa.md)); per-ye
 stretch now come from isolated MAESTRO notes. Reviews are in [`docs/reviews/`](docs/reviews/); every open
 finding of reviews 1–3 is either fixed or explicitly deferred in the plan.
 
-Next steps:
-- [ ] Longer training on one year; then all years (per-condition tables are in place; the per-key stretch
-      offset is still shared across conditions).
+Next steps (discussed in [`docs/round2_results.md`](docs/round2_results.md), section 8):
+- [ ] A whole-excerpt band-level term, unbiased by construction, for the 4 kHz gap.
+- [ ] The attack: the knock spectrum per register, then the felt model at note-on.
+- [ ] Texture: open the residual's noise path to the critic, or match band-energy variance and modulation.
+- [ ] Longer training on one year with the residual after the physics; then all years (per-condition tables
+      are in place; the per-key stretch offset is still shared across conditions).
 - [ ] Mine isolated notes for every year: per-year B, stretch, velocity curve, damper delay.
-- [ ] Switch the sympathetic bank on in a later stage; then the GAN, after listening.
+- [ ] Switch the sympathetic bank on in a later stage.
 - [ ] Felt model at note-on instead of the hammer spectrum table (review 3, 9.1); Weinreich eigenmodes if
       the fitted aftersound tables look unphysical; pitch glide at *ff*.
 - [ ] Evaluation suite (FAD, transcription F1, listening tests).

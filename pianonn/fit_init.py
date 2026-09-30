@@ -9,7 +9,10 @@ with the recordings of the same MIDI:
 2. tuning: cross-correlation of log-frequency spectra (reference pitch of that year's piano);
 3. level and long-term spectrum per channel: the microphone gain, and a smooth EQ folded into
    the body FIR (third-octave, +-20 dB);
-4. the stationary noise floor per channel and band (low percentile of the recordings' band energy).
+4. the stationary noise floor per channel and band, and the mains hum, measured on the silence before
+   each piece's first note (:func:`floor_from_silence`). In continuous music the quietest windows are
+   quiet piano, not floor: the trial's low-percentile estimate was 6-16 dB high between 300 Hz and 1.6 kHz
+   and 15 dB low at 40 Hz (docs/plan_round2.md, 2.2).
 
 Each is logged, so the per-year recording chain is also a measurement.
 """
@@ -67,9 +70,53 @@ def _band_matrix(model, n_fft):
 
 
 @torch.no_grad()
-def initialise_from_data(model, batches, log=print, max_latency=0.06, max_cents=60, tuning=True):
+def floor_from_silence(model, cond, clips, log=print, hum_halfwidth=2.5):
+    """Set the condition's noise floor and hum from recorded silence: ``clips`` is a list of ``[ch, n]`` tensors
+    (e.g. :meth:`pianonn.data.MaestroSegments.silence_clips`). Per clip, a periodogram of the 20 Hz high-passed
+    signal: the hum lines' power is read off (above the local floor) and the lines are replaced by that floor;
+    the band levels are then the white-equivalent power in the noise bank's bands. Medians over clips."""
+    from .losses import highpass
+    from .room import HUM_LINES, MAINS_HZ
+
+    sr = model.cfg.sample_rate
+    dev = model.room.floor_ref_db.device
+    bands, hums = [], []
+    for x in clips:
+        x = highpass(x.to(dev).float(), sr)
+        n = x.shape[-1]
+        w = torch.hann_window(n, device=dev)
+        P = torch.fft.rfft(x * w).abs() ** 2 / w.pow(2).sum()  # white noise of variance s2 -> E[P] = s2
+        f = torch.fft.rfftfreq(n, 1 / sr).to(dev)
+        width = max(hum_halfwidth, 4.0 * sr / n)  # the Hann main lobe is +-2 bins
+        line_p = []
+        for k in range(1, HUM_LINES + 1):
+            fk = MAINS_HZ * k
+            line = (f - fk).abs() <= width
+            near = ((f - fk).abs() > width) & ((f - fk).abs() <= width + 15.0)
+            local = P[:, near].median(-1).values[:, None]  # [ch, 1]
+            line_p.append(2.0 * (P[:, line] - local).clamp(min=0).sum(-1) / n)  # RMS power of the line
+            P[:, line] = local.expand(-1, int(line.sum()))
+        M = model.noise.band_masks(n) * (f >= 25.0)  # the high-passed bins would bias the lowest band down
+        bands.append((P @ M.T) / M.sum(-1))  # [ch, bands]
+        hums.append(torch.stack(line_p, -1))  # [ch, lines]
+    E, H = torch.stack(bands).median(0).values, torch.stack(hums).median(0).values
+    model.room.floor_ref_db[cond] = 10 * torch.log10(E.clamp(min=1e-14))
+    model.room.hum_ref_db[cond] = 10 * torch.log10(H.clamp(min=1e-20))
+    model.room.raw_floor.data[cond] = 0.0
+    model.room.raw_hum.data[cond] = 0.0
+    fl = model.room.floor_ref_db[cond].mean(0)
+    est = {"floor_db": [round(float(v), 1) for v in fl[::4]],
+           "hum_db": [[round(float(v), 1) for v in c] for c in model.room.hum_ref_db[cond]], "silence_clips": len(clips)}
+    log(f"init: noise floor from {len(clips)} silences (white-equivalent dBFS, every 4th band) {est['floor_db']}; "
+        f"hum at {MAINS_HZ:.0f}/{2 * MAINS_HZ:.0f}/{3 * MAINS_HZ:.0f} Hz (RMS dBFS per channel) {est['hum_db']}")
+    return est
+
+
+@torch.no_grad()
+def initialise_from_data(model, batches, log=print, max_latency=0.06, max_cents=60, tuning=True, silence=None):
     """``batches``: collated examples of one condition, on the model's device. Returns a dict of estimates.
-    ``tuning=False`` keeps the tuning (e.g. when it came from :func:`apply_mined_priors`)."""
+    ``tuning=False`` keeps the tuning (e.g. when it came from :func:`apply_mined_priors`). ``silence``: clips of
+    that condition's recorded silence for the floor (without them the floor is left as it is)."""
     cfg = model.cfg
     sr = cfg.sample_rate
     conds = torch.cat([b["condition"] for b in batches]).unique()
@@ -136,17 +183,11 @@ def initialise_from_data(model, batches, log=print, max_latency=0.06, max_cents=
         est["eq_db"].append({int(f): round(float(eq_db[(freqs - f).abs().argmin()]), 1) for f in (63, 125, 250, 500, 1000, 2000, 4000, 8000)})
     log(f"init: mic gain {['%+.1f dB' % v for v in est['level_db']]}; body EQ (dB) {est['eq_db']}")
 
-    # 4. noise floor: 2nd percentile of the recordings' band energy averaged over ~0.2 s (single frames have only
-    # 1-2 bins in the bass bands, so their low percentiles sit 10-16 dB under the mean), 2 dB under; learned from here
-    M = _band_matrix(model, n_fft).to(Pt.device)
-    for c in range(cfg.channels):
-        E = torch.einsum("kf,nft->nkt", M, _mag(tgt[:, c], n_fft, n_fft // 4) ** 2)  # [N, bands, frames]
-        E = torch.nn.functional.avg_pool1d(E, 10, 5)  # ~0.2 s windows (hop 512 at 24 kHz)
-        q = torch.quantile(E.permute(1, 0, 2).reshape(E.shape[1], -1), 0.02, dim=-1)
-        model.room.floor_db.data[cond, c] = 10 * torch.log10(q.clamp(min=1e-14)) - 2.0
-    fl = model.room.floor_db.data[cond].mean(0)
-    est["floor_db"] = [round(float(v), 1) for v in fl[:: max(1, len(fl) // 8)]]
-    log(f"init: noise floor (white-equivalent dBFS, every 4th band) {est['floor_db']}")
+    # 4. noise floor and hum, from recorded silence
+    if silence:
+        est.update(floor_from_silence(model, cond, silence, log=log))
+    else:
+        log("init: no silence clips, noise floor left as it is")
     return est
 
 

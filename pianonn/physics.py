@@ -279,6 +279,7 @@ class PianoPhysics(nn.Module):
         with torch.no_grad():
             e = self._mf_energy_db()
             self.gain_db -= (e - e[39]).nan_to_num(0.0, 0.0, 0.0).clamp(-60, 60)
+        self.register_buffer("prior_gain_db", self.gain_db.detach().clone())  # the level gauge (regularizer)
 
     def _mf_energy_db(self, seconds=0.3):
         ki = torch.arange(N_KEYS)[None]
@@ -470,4 +471,9 @@ class PianoPhysics(nn.Module):
         reg = reg + smooth(bounded(self.cond_vel_curve[conds], 12.0) / 20, 1)
         col = bounded(self.color[conds], COLOR_BOUND)
         reg = reg + 1e-2 * (col**2).mean() + smooth(col, 1) + smooth(col, 2) + (col.mean(1) ** 2).mean()
+        # level gauge: the per-key gains, the condition gain and the velocity curve could all trade a constant dB
+        # with the microphone gain, so their means are pinned and the mic gain carries the level (review 4, 6)
+        reg = reg + ((self.gain_db - self.prior_gain_db).mean() / 10) ** 2
+        reg = reg + (bounded(self.cond_gain_db[conds], 12.0) / 10).pow(2).mean()
+        reg = reg + (bounded(self.cond_vel_curve[conds], 12.0).mean(1) / 10).pow(2).mean()
         return reg

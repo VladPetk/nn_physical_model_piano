@@ -2,23 +2,35 @@
 
 The plan behind this run is in [`plan_phase0_1.md`](plan_phase0_1.md). This page reports what happened.
 
+> **Corrected after review 4** ([`reviews/review_4_trial_2018.md`](reviews/review_4_trial_2018.md); measurements in
+> [`plan_round2.md`](plan_round2.md), section 2). Corrected claims are marked *[corrected]* where they stand. In brief:
+> - the headline starts at the initialised prior: the untrained prior was 16 dB too quiet, so its row measures level;
+> - the loss's spectral-convergence term set the model's level about 1.8 dB low in every band. That explains the
+>   soft-playing deficit better than the pedal decay. *[round 2]* On review 4's 96 test excerpts the 220-minute model
+>   shows no soft deficit at all: −1.2 dB on soft excerpts, −2.6 dB on loud ones
+>   ([`round2_results.md`](round2_results.md), section 2);
+> - the "60–125 Hz drift" came from three validation excerpts; on test excerpts every band is 1–3 dB under;
+> - the fitted noise floor matches the recordings' silence; it was the initial floor estimate that was wrong;
+> - the residual's gain had no control run, and its noise path was held down by a flawed budget term and, as round 2
+>   showed, by the loss itself;
+> - the phantom partials are plausible, not established.
+
 **In short.** On MAESTRO 2018 (stereo, RTX 3090): a 2 h run (5,111 steps), a continuation to 220 min (9,000
 steps), and two 40-minute follow-up experiments.
 
 | held-out test audio (48 excerpts) | MR-STFT loss | log-mel L1 |
 |---|---|---|
-| untrained prior | 1.747 | 15.1 dB |
-| prior with its recording chain initialised from the recordings | 1.404 | 6.7 dB |
+| untrained prior (16 dB too quiet: this row measures level, not the prior) | 1.747 | 15.1 dB |
+| prior with its recording chain initialised from the recordings (**the honest starting point**) | 1.404 | 6.7 dB |
 | fitted physics, 2 h | 1.023 | 4.0 dB |
 | fitted physics + learned residual, 220 min | **1.002** | **3.84 dB** |
 
 - **Go.** The physics fits real performance audio and carries almost all of the gain. On one excerpt it beats the recording chain alone, and on held-out audio it takes the mel distance from 6.7 to 4.0 dB.
-- **The residual behaved as designed.** It was neutral while the physics was still improving, then became a real gain (−0.23 dB) by correcting per-note loudness in context. Throughout, it reported the model's errors (knock ~1 dB loud, 2.5–4 kHz hot) instead of hiding them, and it never added noise.
-- **The fit found something the prior had wrong, and the recordings confirm it:** this piano's middle register has strong phantom partials (−20 dB re the neighbouring partial where the prior had −43 dB).
+- **The residual costs nothing and reads as a map** *[corrected]*. It was neutral while the physics was still improving, then gained −0.23 dB log-mel by correcting per-note loudness in context. That gain has no physics-only control of the same length yet, and the physics alone was still improving. Throughout, it reported the model's errors (knock ~1 dB loud, 2.5–4 kHz hot) instead of hiding them. It added no noise, but the budget term forbade noise wherever the physics was silent, so that is not a finding.
+- **Phantom partials: plausible, not established** *[corrected]*. The fit raised the middle register's phantom partials 10–14 dB above the prior. A component at exactly 2f_j is in the recordings for j = 3 and 5 in 10–20 % more notes than chance. But its level does not grow like a phantom's (a_j²), and it decays no faster than partial 2j (`scripts/measure_phantoms.py`).
 - **Frequencies are not identifiable from this loss.** Started from a bass inharmonicity 2.4× too high, the fit stayed there, and the validation loss did not notice. Measured per-year frequencies (isolated-note mining) are necessary.
 - **Open errors, named:**
-  - 60–125 Hz drifts 6 dB under the recordings (per-bin loss hedging; a log-mel term halves the early deficit but does not stop the drift);
-  - soft, pedalled playing is ~2 dB quiet (a per-year velocity curve does not fix it; decay under the pedal is the next suspect);
+  - the model is 1–3 dB under the recordings in every band from 60 Hz to 5 kHz, and soft, pedalled playing is ~2 dB quieter still *[corrected]*. The spectral-convergence term puts its optimum ~1.8 dB low in every band. The "60–125 Hz drift" of section 5 came from three validation excerpts;
   - the attack is the worst resolution: its level relative to the note is right, but it is ~3 dB too bright above 4 kHz.
 - Next steps are in section 12.
 
@@ -82,7 +94,7 @@ physics can do.
 
 ## 4. The two-hour run
 
-`python -m pianonn.train --data data/maestro24k --years 2018 --mined runs/mined_2018.json --out runs/trial_2018 --minutes 120 --batch 8`
+`python -m pianonn.train --data data/maestro24k --years 2018 --mined runs/measurements/mined_2018.json --out runs/round1_trial/main --minutes 120 --batch 8`
 
 - 5,111 steps in 120 minutes (1.3–1.5 s per step of 8 examples, peak 15 GB).
 - That is 41k two-second loss windows, about one pass over the 22.9 h of 2018 training audio.
@@ -133,9 +145,9 @@ The physics does the work:
 | step 2000 | −0.7 | −3.9 | −0.8 | −2.0 | −0.2 | −1.9 | +1.8 | +1.4 | −0.5 | 3.4 dB |
 | step 5111 | −0.3 | **−5.9** | −1.1 | −2.0 | −0.4 | −3.0 | +0.9 | 0.0 | −0.8 | 3.6 dB |
 
-- Every octave converges except 60–125 Hz, whose deficit *grows* during training.
-- This looks like the per-bin log-spectral loss hedging on bass partials it cannot align: at 60 Hz a 4096-point bin is 170 cents wide, so any mismatch in beating, detune or inharmonicity costs less when the partial is quieter.
-- The loss needs a term that is insensitive to misalignment (band energies or log-mel), and a longer window for the bass (sections 10 and 12).
+- Every octave converges except 60–125 Hz, whose deficit *grows* during training. *[corrected]* This rests on three excerpts. On 24 test excerpts, the 56–113 Hz bands are 1–2 dB under, like every other band (plan_round2.md, 2.1).
+- ~~This looks like the per-bin log-spectral loss hedging on bass partials it cannot align.~~ The cause of the general deficit is the spectral-convergence term, whose optimum is ~1.8 dB low in every band.
+- The loss needs a term that is unbiased in level (log band energies): round 2's loss.
 - By resolution, the 4096-point term fell most (1.50 → 1.02) and the 128-point term least (1.34 → 1.07): the attack remains the weakest part, as review 3 expected.
 - Onset-aligned over 196 test strikes with no other strike within 80 ms:
   - the attack's level relative to the note's body (0–30 ms vs 100–300 ms) matches the recordings within 0.5 dB in every band (60–250, 250–1k, 1k–4k, 4k–11k Hz);
@@ -146,7 +158,7 @@ The physics does the work:
 
 ## 6. What the model learned about the 2018 instrument and recording
 
-From `runs/trial_2018/eval_2h/report.md` (per-key tables there):
+From `runs/round1_trial/main/eval_2h/report.md` (per-key tables there):
 
 | | prior | fitted |
 |---|---|---|
@@ -171,7 +183,7 @@ Two of these deserve a closer look:
   | prior (vel 64) | −43.1 | −30.4 | −34.3 | −42.3 | −47.6 | −61.8 |
   | fitted (vel 64) | −28.0 | −22.7 | −16.4 | −21.3 | −26.2 | −31.4 |
 
-  The fit moved 7–30 dB towards what the recordings show. Unprompted by any prior, it found that this piano's middle register has strong phantom partials, and the prior's levels (tag M) were too low. This is the kind of evidence review 3 hoped the fit would give.
+  The fit moved 7–30 dB towards what the recordings show. ~~Unprompted by any prior, it found that this piano's middle register has strong phantom partials.~~ *[corrected]* The detection above had no control for chance peaks. With controls (`scripts/measure_phantoms.py`, 1,398 notes), a component at exactly 2f_j is real for j = 3 and 5, in 10–20 % more notes than chance. For j ≥ 6 the detection rate is at chance. The component's level does not grow like a_j², and it decays no faster than partial 2j. So phantoms are plausible but not established, and the prior stays as it is.
 - The shorter damper delay and the later half-pedal point partly trade off against each other: both change when damping starts.
 
 **Identifiability (review 3, section 4.6).** Fitted inharmonicity and stretch against values tracked on isolated notes of the same recordings:
@@ -200,17 +212,18 @@ On the test excerpts the residual's outputs, in their own units, are small and c
 | decay, decay tilt | ~0 | ~0 | ~0 | the decays are not what it corrects |
 
 - The R3 band gains average −0.1 to −0.4 dB, and −0.9/−1.2 dB around 2.5–4 kHz: the 2–4 kHz excess of the dumps.
-- The R3 noise path was pushed 23–28 dB *down* from its start: nothing in the recordings calls for broadband noise beyond the learned floor.
+- The R3 noise path was pushed 23–28 dB *down* from its start. *[corrected]* That was the budget term, not the recordings. It measured the residual's noise against the physics alone, so wherever the physics was silent any noise counted as 100 % residual. *[round 2]* Not the budget alone: with the budget fixed, round 2's loss still
+  pushed the noise path 3–15 dB down in 20 minutes (the texture penalty; [`round2_results.md`](round2_results.md), section 3).
 
-So in this first pass the residual worked as a map, not as a model. It says the knock is a little loud, 2.5–4 kHz a little hot and the bass slightly bright, and it adds no noise. None of these is large. The attack's shortfall (the 128-point term) is not something the residual's current forms fix.
+So in this first pass the residual worked as a map, not as a model. It says the knock is a little loud, 2.5–4 kHz a little hot and the bass slightly bright; its noise path was held down by the budget. None of these is large. The attack's shortfall (the 128-point term) is not something the residual's current forms fix.
 
 ## 8. Listening material
 
 (`runs/` is local and not in git.)
 
 - `samples/trained_2018_2h.wav` and `samples/trained_2018_2h_physics.wav`: `samples/demo.mid` rendered by the trained model (stereo, the 2018 condition, no noise floor), with and without the residual. `samples/trained_2018_4h.wav` is the 220-minute model. They sit at MAESTRO's recorded level (about −28 dBFS RMS, peak −10 dBFS), not normalised. Compare with `samples/physics_prior_v6.wav`, the untrained prior of spec v4 (mono, normalised).
-- `runs/trial_2018/eval_2h/long{0,1}_ab.wav`: two 19 s **test** excerpts played in turn: the recording, the training start, the fitted physics, and physics + residual.
-- `runs/trial_2018/audio/`: three 7 s validation excerpts with the recording (`_target`), the training start (`_prior_physics`) and every 1000 steps.
+- `runs/round1_trial/main/eval_2h/long{0,1}_ab.wav`: two 19 s **test** excerpts played in turn: the recording, the training start, the fitted physics, and physics + residual.
+- `runs/round1_trial/main/audio/`: three 7 s validation excerpts with the recording (`_target`), the training start (`_prior_physics`) and every 1000 steps.
 
 ## 9. Follow-up: two more hours (220 min in total)
 
@@ -228,7 +241,7 @@ The run was resumed from its last checkpoint for another 100 minutes of stage 2 
 - The residual's contribution, noisy in the first hour of stage 2, became consistently positive: +0.010 over the last six validations, +0.014 at the end.
 - The per-resolution losses at the end are 1.008 / 0.993 / 0.988 / 1.005 / 1.029 / 1.066 (4096 … 128 points). The attack end is still the worst.
 
-On the test split (`runs/trial_2018/eval_cont/report.md`, best checkpoint = step 9000):
+On the test split (`runs/round1_trial/main/eval_cont/report.md`, best checkpoint = step 9000):
 
 | model | MR-STFT loss | log-mel L1 |
 |---|---|---|
@@ -236,8 +249,9 @@ On the test split (`runs/trial_2018/eval_cont/report.md`, best checkpoint = step
 | fitted physics, 220 min | 1.022 | 4.07 dB |
 | **fitted physics + residual, 220 min** | **1.002** | **3.84 dB** |
 
-With the extra time the residual became a real gain on held-out audio (−0.02 MR-STFT, −0.23 dB log-mel),
-while the physics alone stayed where it was. Its read-out changed accordingly:
+With the extra time the residual became a gain on held-out audio (−0.02 MR-STFT, −0.23 dB log-mel),
+while the physics alone stayed where it was. *[corrected]* On review 4's scale that is 3 % of the explainable
+range, half what a per-excerpt broadband gain is worth, and there is no physics-only control of the same length. Its read-out changed accordingly:
 - Its main work is now **per-note loudness in context**: note-gain corrections of 0.61 dB rms in the bass and 0.33 dB
   in the middle and treble. That is exactly the dynamics-dependent level error that the single velocity slope
   per year cannot express (section 5).
@@ -245,14 +259,14 @@ while the physics alone stayed where it was. Its read-out changed accordingly:
 
 The damper delay kept falling (4.1 ms) and the hall's 8 kHz T60 rose to 1.0 s. The phantom levels and B are
 unchanged from the 2 h fit. The demo rendered with this model is `samples/trained_2018_4h.wav`, and the
-test excerpts are `runs/trial_2018/eval_cont/long{0,1}_ab.wav`.
+test excerpts are `runs/round1_trial/main/eval_cont/long{0,1}_ab.wav`.
 
 ## 10. Follow-up experiments (40 minutes each, stage 1 only)
 
 ### Identifiability ablation: no measured frequencies
 
 The same training for 40 minutes, but started from the Steinway prior's inharmonicity and stretch (plus the
-data-driven global tuning), not from the isolated-note measurements (`runs/ident_2018`):
+data-driven global tuning), not from the isolated-note measurements (`runs/round1_trial/ident`):
 
 | register (MIDI) | B tracked | B prior = start | B fitted (40 min) | cents tracked | cents start | cents fitted |
 |---|---|---|---|---|---|---|
@@ -273,7 +287,7 @@ So the MR-STFT loss is blind to a 2× error in bass inharmonicity, which is clea
 
 ### The log-mel loss term against the bass drift
 
-The same 40 minutes of stage 1 from the same start as the main run, with `--mel-weight 1.0` (`runs/mel_2018`).
+The same 40 minutes of stage 1 from the same start as the main run, with `--mel-weight 1.0` (`runs/round1_trial/mel`).
 Band errors on the same three validation dumps (dB, model minus recording):
 
 | | 30–60 | 60–125 | 125–250 | 250–500 | 0.5–1k | 1–2k | 2–4k | 4–8k | 8–12k Hz | mean abs |
@@ -295,7 +309,7 @@ term of the identifiability section as well: the same blindness shows in both re
 The report above blamed the soft-playing deficit on the single velocity slope, so a per-year correction curve
 was added: 6 knots over the velocity range, ±12 dB, zero-initialised (`cond_vel_curve`). It was trained for the
 same 40 minutes as the log-mel run and with the same settings, so the curve is the only difference
-(`runs/velcurve_2018`).
+(`runs/round1_trial/velcurve`).
 
 - The curve learned a compressive shape: +1.9, +1.7, +1.4, +0.6, −0.9 and −2.4 dB at velocity 0, 25, 51, 76,
   102 and 127, on top of a slope of −2.1 dB.
@@ -303,7 +317,7 @@ same 40 minutes as the log-mel run and with the same settings, so the curve is t
 - **The soft-versus-loud level error did not flatten.** Regressing each excerpt's broadband level error on its
   mean velocity (92 excerpts) gives +6.3 dB across the velocity range, against +5.5 dB without the curve.
 
-So the deficit is not (only) the velocity law. Soft excerpts get more of their energy from sustained, pedalled,
+So the deficit is not (only) the velocity law. *[corrected]* The loss does not want it removed: its spectral-convergence term's optimum is ~1.8 dB under the recordings in every band, most for unpredictable (soft, pedalled) sound (review 4, section 3; plan_round2.md, 2.1). Soft excerpts get more of their energy from sustained, pedalled,
 decaying sound. That points at the decay under the pedal and at the aftersound: the Iowa decay-profile checks at
 C2/C3 also fail, 6–7 dB too fast at 1–2 s, and the residual's biggest correction is per-note loudness in
 context. The curve stays in the model: it is harmless at zero and learns a plausible shape.
@@ -314,27 +328,27 @@ Against the phase-1 success criterion of review 3 ("a clear reduction of the hel
 frequencies that agree with tracked ones, and resyntheses that a listener places nearer the recording
 than the prior"):
 
-- **Held-out distance: yes.** On the test split the log-mel distance fell 15.1 → 6.7 dB from the data
-  initialisation alone, to 4.0 dB with two hours of fitting, and to 3.84 dB at 220 minutes with the residual.
-  The MR-STFT loss fell 1.75 → 1.40 → 1.02 → 1.00.
+- **Held-out distance: yes.** On the test split the log-mel distance fell from 6.7 dB (the initialised prior) to
+  4.0 dB with two hours of fitting, and to 3.84 dB at 220 minutes with the residual. The MR-STFT loss fell
+  1.40 → 1.02 → 1.00. About a third of that loss is irreducible: two noise seeds of the same model are 0.33
+  apart (review 4, section 2).
 - **Frequencies: agree, but only because they were measured.** The fitted B and stretch agree with the
   tracked ones (within 5 % and 0.5 cents). The ablation (section 10) shows that the fit would not have found the
   bass inharmonicity, and that the loss does not notice when it is wrong.
-- **Listening: not done.** I cannot listen. The A/B files in section 8 are there for it.
+- **Listening** *[added]*. The project owner listened to `eval_cont/long{0,1}_ab.wav`. The fitted model is audibly nearer the recording than the initialised prior, and the residual makes no audible difference. Still wrong: "one-dimensional", "sounds like a synth", "much less powerful" (review 4, section 7).
 
 What worked:
 - the physics carries the fit;
-- initialising the recording chain from the recordings (latency, level, long-term spectrum, noise floor) did 40 % of the validation-loss reduction and three quarters of the test log-mel reduction before the first gradient step (the measured frequencies did not change the loss, section 10);
+- initialising the recording chain from the recordings (latency, level, long-term spectrum, noise floor) gave a sound starting point. *[corrected]* The "40 % of the reduction" was mostly the 16 dB level of the untrained prior, and the floor estimate was wrong (6–16 dB high in the middle bands, 15 dB low at 40 Hz);
 - stereo, the noise floor and the history give sensible, stable training;
-- the fit found a real property of the instrument its prior had wrong: the strong middle-register phantom partials;
-- the residual, kept on a budget, reports the model's remaining errors (knock level, 2.5–4 kHz) instead of hiding them;
+- the fit raised the middle-register phantom partials well above the prior; whether they are phantoms is not established (see the first section);
+- the residual, kept on a budget, reads as a map of the model's remaining errors (knock level, 2.5–4 kHz), and costs nothing;
 - one step is 1.3–1.5 s for 8 examples, so a full pass over one year takes about two hours.
 
 What did not, or not yet:
-- The per-bin loss lets the **60–125 Hz octave drift 6 dB under** the recordings. The fix is a
-  misalignment-insensitive term (tested in section 10) and a longer window for the bass.
-- **Soft playing is ~2 dB too quiet**. A per-year velocity curve learns a compressive shape but does not
-  remove the deficit (section 10), so the decay under the pedal is the next suspect.
+- *[corrected]* The model is **1–3 dB too quiet in every band** and soft playing ~2 dB quieter still. A per-year
+  velocity curve does not remove it (section 10) because the loss does not want it removed: its
+  spectral-convergence term's optimum is ~1.8 dB low. The 60–125 Hz "drift" was a three-excerpt reading.
 - The **attack** is the largest remaining error by resolution. Its level relative to the note is right, but it is ~3 dB too bright
   above 4 kHz and its fine texture is not captured.
 - The **residual needed time**: neutral at two hours, −0.23 dB log-mel at 220 minutes, mostly through per-note
@@ -342,6 +356,10 @@ What did not, or not yet:
   justified yet: the residual's own read-out points at physics fixes first (velocity curve, knock level).
 
 ## 12. Next steps, in order
+
+*[corrected]* Superseded by [`plan_round2.md`](plan_round2.md): the loss comes first (item 1 below points the wrong
+way: a longer window resolves more beating; frequencies come from measurement), then the budget, the evaluation
+scale and a re-fit with a control, before the physics items.
 
 1. **Loss**: keep the log-mel term (section 10: it helps, but only partly). Add a term that sees bass
    partial frequencies (an 8192–16384-point resolution below ~1 kHz, or partials compared on mined notes),

@@ -106,8 +106,8 @@ def test_gradients_point_back_to_the_teacher():
         teacher = NeuralPhysicalPiano(cfg)
         teacher.load_state_dict(student.state_dict())
         with torch.no_grad():
-            student.room.floor_db.fill_(-100.0)
-            teacher.room.floor_db.fill_(-100.0)
+            student.room.floor_ref_db.fill_(-100.0)
+            teacher.room.floor_ref_db.fill_(-100.0)
             getattr(teacher.physics, name).add_(delta)
             n = int(1.3 * cfg.sample_rate)
             target = teacher(_perf(teacher, n, notes), n, residual=False, generator=torch.Generator().manual_seed(1))["audio"]
@@ -127,8 +127,73 @@ def test_stages_freeze_the_residual_first():
     set_stage(m, opt, 1)
     frozen = {n for n, p in m.named_parameters() if not p.requires_grad}
     assert {"physics.partial_gain", "physics.color", "noise.att", "context.head.2.weight"} <= frozen
-    assert "physics.raw_log_B" not in frozen and "room.floor_db" not in frozen
+    assert "physics.raw_log_B" not in frozen and "room.raw_floor" not in frozen
     set_stage(m, opt, 2, physics_lr=0.3)
     assert all(p.requires_grad for p in m.parameters())
     lrs = {g["name"]: g["lr"] / g["base_lr"] for g in opt.param_groups}
     assert abs(lrs["physics.raw_log_B"] - 0.3) < 1e-9 and lrs["context.head.2.weight"] == 1.0
+
+
+def test_budget_share_is_not_degenerate_where_the_physics_is_silent():
+    """Review 4, section 5: measured against the physics alone, a residual noise 60 dB under the floor counted as a
+    100 % share wherever the physics was silent. Measured against the output (floor included), it must count ~0."""
+    from pianonn.train import residual_budget
+
+    m = NeuralPhysicalPiano(small_cfg(sample_rate=16000))
+    g = torch.Generator().manual_seed(0)
+    floor = 1e-3 * torch.randn(1, 2, 16000, generator=g)
+    res = 1e-6 * torch.randn(1, 2, 16000, generator=g)
+    out = {"noise_res_out": res, "audio": floor + res}
+    assert float(residual_budget(m, out, torch.ones(1, 1, dtype=torch.bool))["additive"]) < 1e-4
+    out = {"noise_res_out": floor, "audio": floor + 1e-6 * res}  # the residual is all there is
+    assert float(residual_budget(m, out, torch.ones(1, 1, dtype=torch.bool))["additive"]) > 0.4
+
+
+def test_texture_view_keeps_the_critic_away_from_the_physics():
+    """The GAN sees ``audio_texture``: numerically the output, but only the noise bank and the residual are
+    differentiable in it, so the critic cannot bend inharmonicity, decays, damper timing, the body or the floor."""
+    from pianonn.diagnostics import _perf
+
+    cfg = small_cfg(sample_rate=16000, use_sympathetic=False, use_floor=True)
+    m = NeuralPhysicalPiano(cfg)
+    n = 16000
+    perf = _perf(m, n, [(60, 0.1, 0.6, 80), (48, 0.3, 0.9, 90)])
+    out = m(perf, n, residual=True, extras=("texture_view", "residual_out"), generator=torch.Generator().manual_seed(0))
+    assert torch.allclose(out["audio_texture"], out["audio"], atol=1e-6)
+    assert out["noise_res_out"].shape == out["audio"].shape
+    out["audio_texture"].pow(2).mean().backward()
+    grads = {k: p.grad for k, p in m.named_parameters()}
+    for name, g in grads.items():
+        if not name.startswith(("noise.", "context.")):
+            assert g is None or g.abs().sum() == 0, name
+    for name in ("noise.knock", "noise.release", "context.frame_head.2.weight"):
+        assert grads[name] is not None and grads[name].abs().sum() > 0, name
+
+
+def test_piano_loss_gradients_point_back_to_the_teacher():
+    """Round-2 loss: a perturbed decay, contact time, damper delay or velocity curve in the teacher must pull the
+    student's parameter the right way (review 3, section 5, test 1; review 4, 6: the re-strike and delays)."""
+    from pianonn.diagnostics import _perf
+    from pianonn.losses import PianoLoss
+
+    cfg = small_cfg(sample_rate=16000, n_partials=24, use_noise=False, use_sympathetic=False, use_floor=False)
+    notes = [(48, 0.05, 0.5, 90), (55, 0.1, 0.7, 80), (60, 0.15, 0.4, 85), (64, 0.2, 0.9, 75), (60, 0.8, 1.1, 70)]
+    cases = (("raw_log_b1", 0.4, slice(None)), ("raw_log_tc", -0.22, slice(None)), ("cond_damper_delay", 0.5, 9),
+             ("cond_vel_curve", 0.6, 9))
+    for name, delta, idx in cases:
+        torch.manual_seed(0)
+        student = NeuralPhysicalPiano(cfg)
+        teacher = NeuralPhysicalPiano(cfg)
+        teacher.load_state_dict(student.state_dict())
+        with torch.no_grad():
+            getattr(teacher.physics, name)[idx] += delta
+            n = int(1.3 * cfg.sample_rate)
+            target = teacher(_perf(teacher, n, notes), n, residual=False)["audio"]
+        onsets = torch.tensor([[o for _, o, _, _ in notes]])
+        pred = student(_perf(student, n, notes), n, residual=False)["audio"]
+        loss, _ = PianoLoss(cfg.sample_rate)(pred, target, onsets, torch.ones_like(onsets, dtype=torch.bool))
+        loss.backward()
+        g = getattr(student.physics, name).grad[idx]
+        if name == "raw_log_b1" or name == "raw_log_tc":
+            g = g[torch.tensor([p - 21 for p, *_ in notes])]
+        assert (g.sum() * delta) < 0, (name, g)

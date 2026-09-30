@@ -436,13 +436,16 @@ class NeuralPhysicalPiano(nn.Module):
         return amp.new_zeros(B, pan.shape[-1], n_samples).scatter_add(2, idx, src)
 
     def render_noise(self, ki, u, onset, release, mask, pedal_env, w_off, ctx, frame_ctx, n_samples, block,
-                     generator, residual):
-        """Mechanical noise ``[B, n]`` and the residual noise (R2 attack + R3 path) ``[B, n]`` or None."""
+                     generator, residual, white=None, white_res=None):
+        """Mechanical noise ``[B, n]``, the residual noise (R2 attack + R3 path) ``[B, n]`` or None, and the two white
+        noises they were shaped from (pass them back in to render the same realisation again)."""
         cfg = self.cfg
         sr, hop = cfg.sample_rate, cfg.hop
         w_on = mask.float()
-        white = torch.randn(ki.shape[0], n_samples, generator=generator, device=ki.device)
-        white_res = torch.randn(ki.shape[0], n_samples, generator=generator, device=ki.device) if residual else None
+        if white is None:
+            white = torch.randn(ki.shape[0], n_samples, generator=generator, device=ki.device)
+        if white_res is None and residual:
+            white_res = torch.randn(ki.shape[0], n_samples, generator=generator, device=ki.device)
         pedal_bands = torch.exp(2 * self.noise.pedal)[None, :, None]
         r3 = None
         if residual and frame_ctx is not None:
@@ -467,7 +470,7 @@ class NeuralPhysicalPiano(nn.Module):
             if residual:
                 res = torch.zeros_like(power) if res is None else res
                 res_out.append((self.noise.band_split(white_res, s0, L) * (res.clamp(min=0) + 1e-12).sqrt()).sum(1))
-        return torch.cat(out, -1), (torch.cat(res_out, -1) if residual else None)
+        return torch.cat(out, -1), (torch.cat(res_out, -1) if residual else None), white, white_res
 
     def apply_band_gains(self, x, gains, block):
         """R3: frame-rate band gains (log amplitude, ``[B, 16, F]``) on ``x[B, ch, T]``, blockwise overlap-save."""
@@ -480,7 +483,13 @@ class NeuralPhysicalPiano(nn.Module):
             out.append((bands * torch.exp(frames_to_samples(g, s0, L, cfg.hop))[:, None]).sum(2))
         return torch.cat(out, -1)
 
-    def forward(self, perf, n_samples, block_seconds=None, generator=None, residual=True, floor=None):
+    def forward(self, perf, n_samples, block_seconds=None, generator=None, residual=True, floor=None, extras=()):
+        """``extras``: ``"residual_out"`` adds ``out["noise_res_out"]``, the residual noise at the microphones (the
+        budget measures it against the output); ``"texture_view"`` adds ``out["audio_texture"]``, numerically the
+        same audio, in which only the noise bank's and the residual's parameters are differentiable: the noise is
+        rendered a second time from the same white noise with every physical input (damper timing, pedal, levels)
+        detached, and the strings, knock impulse, room and floor enter detached. That is what the GAN may change
+        (docs/plan_round2.md, A10)."""
         cfg = self.cfg
         sr, hop = cfg.sample_rate, cfg.hop
         pitch, mask, cond = perf["pitch"], perf["mask"], perf["condition"]
@@ -530,32 +539,60 @@ class NeuralPhysicalPiano(nn.Module):
                 y, state = self.symp(own.sum(1), own, key_modes, engagement, s0 + H * hop, state)
                 symp.append(y)
         out = {"strings": torch.cat(strings, -1)}
-        dry = out["strings"]
+        tonal = out["strings"]
         if cfg.use_sympathetic:
             out["symp"] = torch.cat(symp, -1)
-            dry = dry + out["symp"][:, None]
+            tonal = tonal + out["symp"][:, None]
+        texture = torch.zeros_like(tonal)  # stochastic and attack components
         if cfg.use_impulse:
             out["impulse"] = self.render_impulses(modes["impulse"], modes["tc"], onset, mask, pan, n_samples)
-            dry = dry + out["impulse"]
+            texture = texture + out["impulse"]
         if cfg.use_noise:
             damp_at_release = sample_curve(pedal_damping, release.clamp(min=-t_hist) + t_hist, sr, hop)
             latched = sample_keyed(latch, ki, release.clamp(min=-t_hist) + t_hist, sr, hop)
             w_off = mask.float() * self.physics.damper_strength[ki] * damp_at_release * (1 - latched)
             pedal_env = self.noise.pedal_envelope(lift)[:, H:]
-            noise, res = self.render_noise(ki, u, onset, release, mask, pedal_env, w_off, ctx, frame_ctx, n_samples,
-                                           block, generator, residual)
+            white = torch.randn(B, n_samples, generator=generator, device=pitch.device)
+            white_res = torch.randn(B, n_samples, generator=generator, device=pitch.device) if residual else None
+            args = (ki, u, onset, release, mask, pedal_env, w_off, ctx, frame_ctx, n_samples, block, None, residual,
+                    white, white_res)
+            if "texture_view" in extras and torch.is_grad_enabled():  # the GAN's memory has to come from somewhere
+                noise, res = checkpoint(lambda *a: self.render_noise(*a)[:2], *args, use_reentrant=False)
+            else:
+                noise, res, _, _ = self.render_noise(*args)
             out["noise"] = noise
-            dry = dry + noise[:, None]
-            out["dry_phys"] = dry  # before the residual: what the budget measures the residual against
+            texture = texture + noise[:, None]
+            out["dry_phys"] = tonal + texture  # before the residual
             if res is not None:
                 out["noise_res"] = res
-                dry = dry + res[:, None]
-        if residual and frame_ctx is not None:
-            dry = self.apply_band_gains(dry, frame_ctx["band_gain"], block)
+                texture = texture + res[:, None]
+        gains = frame_ctx["band_gain"] if residual and frame_ctx is not None else None
+        dry = tonal + texture
+        if gains is not None:
+            dry = self.apply_band_gains(dry, gains, block)
         out["dry"] = dry
-        audio = fft_convolve(dry, self.room(cond)) if cfg.use_room else dry
+        ir = self.room(cond) if cfg.use_room else None
+        audio = fft_convolve(dry, ir) if cfg.use_room else dry
+        fl = None
         if cfg.use_room and (cfg.use_floor if floor is None else floor):
-            audio = audio + self.room.floor_noise(cond, n_samples, generator)
+            fl = self.room.floor_noise(cond, n_samples, generator)
+            audio = audio + fl
         out["audio"] = audio
+        if "residual_out" in extras and "noise_res" in out:
+            r = out["noise_res"][:, None].expand(-1, tonal.shape[1], -1)
+            out["noise_res_out"] = fft_convolve(r, ir.detach()) if cfg.use_room else r
+        if "texture_view" in extras:
+            view = (tonal + out["impulse"]).detach() if "impulse" in out else tonal.detach()
+            if cfg.use_noise:
+                # recomputed in the backward pass: the per-note envelopes ([B, notes, samples]) would double the
+                # noise path's memory
+                nv, rv = checkpoint(lambda *a: self.render_noise(*a)[:2], ki, u, onset, release.detach(), mask,
+                                    pedal_env.detach(), w_off.detach(), ctx, frame_ctx, n_samples, block, None, residual,
+                                    white, white_res, use_reentrant=False)
+                view = view + nv[:, None] + (rv[:, None] if rv is not None else 0)
+            if gains is not None:
+                view = self.apply_band_gains(view, gains.detach(), block)
+            view = fft_convolve(view, ir.detach()) if cfg.use_room else view
+            out["audio_texture"] = view + fl.detach() if fl is not None else view
         out["ctx"], out["frame_ctx"] = ctx, frame_ctx
         return out
