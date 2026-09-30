@@ -31,8 +31,8 @@ from torch.utils.data import DataLoader  # noqa: E402
 from .config import PianoConfig  # noqa: E402
 from .data import MaestroSegments, SyntheticPerformances, collate
 from .dsp import bounded
-from .losses import (MultiResolutionDiscriminator, MultiResolutionSTFTLoss, band_energies, discriminator_loss,
-                     generator_adv_loss)
+from .losses import (LogMelLoss, MultiResolutionDiscriminator, MultiResolutionSTFTLoss, band_energies,
+                     discriminator_loss, generator_adv_loss)
 from .synth import ContextNet, NeuralPhysicalPiano
 
 STAGE2_ONLY = ("context.", "noise.att", "physics.partial_gain", "physics.color")
@@ -75,14 +75,16 @@ def param_groups(model, lr, fir_lr_scale=None):
     return groups
 
 
-def set_stage(model, opt, stage, physics_lr=1.0, only=None):
+def set_stage(model, opt, stage, physics_lr=1.0, only=None, frozen=()):
     """Freeze/unfreeze by stage and rescale the physical groups' learning rate.
 
-    ``only``: optional tuple of name prefixes that are the *only* trainable parameters (overfit ladders)."""
+    ``only``: optional tuple of name prefixes that are the *only* trainable parameters (overfit ladders);
+    ``frozen``: name prefixes that stay frozen in every stage (ablations)."""
     for g in opt.param_groups:
         name = g["name"]
         residual = name.startswith(STAGE2_ONLY)
-        train = (stage >= 2 or not residual) and (only is None or name.startswith(only))
+        train = ((stage >= 2 or not residual) and (only is None or name.startswith(only))
+                 and not (frozen and name.startswith(tuple(frozen))))
         for p in g["params"]:
             p.requires_grad_(train)
             if not train:
@@ -180,6 +182,9 @@ def main(argv=None):
     ap.add_argument("--warmup", type=float, default=1.0)
     ap.add_argument("--lookback", type=float, default=12.0)
     ap.add_argument("--reg", type=float, default=1.0, help="weight of the smoothness regulariser")
+    ap.add_argument("--mel-weight", type=float, default=0.0,
+                    help="weight of a log-mel band-energy term (insensitive to partial misalignment); 0 = off")
+    ap.add_argument("--freeze", nargs="*", default=[], help="parameter-name prefixes kept frozen in every stage")
     ap.add_argument("--stage2-at", type=float, default=0.6,
                     help="switch to stage 2 at this step (>= 1) or this fraction of --minutes / --steps (< 1); -1: never")
     ap.add_argument("--stage2-physics-lr", type=float, default=0.3)
@@ -244,6 +249,7 @@ def main(argv=None):
                         prefetch_factor=4 if args.workers > 0 else None)
 
     recon = MultiResolutionSTFTLoss()
+    mel_loss = LogMelLoss(cfg.sample_rate).to(device) if args.mel_weight > 0 else None
     opt = torch.optim.Adam(param_groups(model, args.lr))
     disc = disc_opt = None
     if args.adv_start >= 0:
@@ -304,7 +310,7 @@ def main(argv=None):
             return step >= args.stage2_at
         return (elapsed() >= args.stage2_at * budget_s) if budget_s else step >= args.stage2_at * n_steps
 
-    set_stage(model, opt, stage, args.stage2_physics_lr)
+    set_stage(model, opt, stage, args.stage2_physics_lr, frozen=args.freeze)
     amp_ctx = lambda: torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp)
 
     def save(tag):
@@ -335,7 +341,7 @@ def main(argv=None):
     while step < n_steps:
         if stage == 1 and stage2_due():
             stage = 2
-            set_stage(model, opt, stage, args.stage2_physics_lr)
+            set_stage(model, opt, stage, args.stage2_physics_lr, frozen=args.freeze)
             log(f"step {step}: stage 2 (partial_gain, colouration and the residual unfrozen; physics lr x{args.stage2_physics_lr})")
             run_validation()
         batch = to_device(next(it), device, non_blocking=device.type == "cuda")
@@ -355,6 +361,9 @@ def main(argv=None):
 
         logs = {"recon": recon(pred, tgt), "reg": model.physics.regularizer(batch["condition"]) + pan_smoothness(model, batch["condition"])}
         loss = logs["recon"] + args.reg * logs["reg"]
+        if mel_loss is not None:
+            logs["mel"] = mel_loss(pred, tgt)
+            loss = loss + args.mel_weight * logs["mel"]
         if residual:
             weights = dict(zip(("note", "frame", "additive"), args.budget))
             for k, v in residual_budget(model, out, batch["mask"]).items():

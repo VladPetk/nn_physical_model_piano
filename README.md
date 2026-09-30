@@ -9,8 +9,10 @@ Pianoteq's (re-strike, phantom partials, sympathetic resonance) is added by hand
 feature (review 3, section 2). MAESTRO gives about 200 h of Disklavier recordings with note- and
 pedal-level MIDI aligned to about 3 ms, which is exactly the supervision this needs.
 
-The core is about 10k interpretable physical parameters plus a recording chain per MAESTRO year (two body
-FIRs, a parametric hall, mic gains, a noise floor). A small causal context network is the learned
+The core is about 1.9k interpretable per-key and global physical parameters, 888 more per MAESTRO year
+(bridge conductance, per-key colouration, tuning, level and velocity law, contact time, damper delay), an
+8.4k table of per-partial corrections held to +-8 dB, and a recording chain per year (two body FIRs, a
+parametric hall, mic gains, a noise floor: 14.4k). A small causal context network is the learned
 residual: bounded, zero-initialised corrections per note and per frame that absorb what the physics
 omits, switched on only after the physics has been fitted. Synthesis is closed-form or a linear
 recurrence, and nothing is autoregressive.
@@ -94,10 +96,10 @@ per channel: mic gain · body FIR ⊛ (direct + parametric octave-band hall), pe
 
 | component | params | learned from data |
 |---|---|---|
-| `physics` | ~10k (+ per-condition tables) | inharmonicity, tuning, unison detune, loss curves, prompt/aftersound, strike point, hammer cutoff/rolloff/velocity response, damper strength and delay, pedal curve, una corda, re-strike, phantoms, knock impulse; per year: bridge conductance, colouration, scalars; `partial_gain` (±8 dB, stage 2) |
-| `context` | ~200k | the residual R1–R3 (zero-initialised, stage 2) |
+| `physics` | 1.9k + 888 per year + 8.4k `partial_gain` | inharmonicity, tuning, unison detune, loss curves, prompt/aftersound, strike point, hammer cutoff/rolloff/velocity response, damper strength and delay, pedal curve, una corda, re-strike, phantoms, knock impulse; per year: bridge conductance, colouration, scalars; `partial_gain` (±8 dB, stage 2) |
+| `context` | 160k | the residual R1–R3 (zero-initialised, stage 2) |
 | `symp` / `noise` | ~9k | coupling gains; knock, attack and release spectra and envelopes |
-| `room` | 2 × 7.2k body taps + hall, gains, pan, 2 × 32 floor bands per condition | soundboard body per mic; hall T60 and level per octave band; noise floor |
+| `room` | 14.4k per year: 2 × 7.2k body taps + hall, gains, per-key pan, 2 × 32 floor bands | soundboard body per mic; hall T60 and level per octave band; noise floor |
 
 ## Usage
 

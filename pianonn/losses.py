@@ -45,6 +45,46 @@ class MultiResolutionSTFTLoss(nn.Module):
         return (loss, terms) if per_resolution else loss
 
 
+def mel_filterbank(sr, n_fft, n_mels, f_lo=30.0):
+    """Triangular mel filters ``[n_mels, n_fft//2+1]``."""
+    import numpy as np
+
+    mel = lambda f: 2595 * np.log10(1 + f / 700)
+    imel = lambda m: 700 * (10 ** (m / 2595) - 1)
+    pts = imel(np.linspace(mel(f_lo), mel(sr / 2), n_mels + 2))
+    f = np.fft.rfftfreq(n_fft, 1 / sr)
+    M = np.stack([np.clip(np.minimum((f - lo) / (c - lo), (hi - f) / (hi - c)), 0, None)
+                  for lo, c, hi in zip(pts[:-2], pts[1:-1], pts[2:])])
+    return torch.tensor(M, dtype=torch.float32)
+
+
+class LogMelLoss(nn.Module):
+    """L1 distance of log mel energies (in units of 10 dB), at a long and a short window.
+
+    Band energies do not care where exactly inside a band a partial sits, so unlike the per-bin
+    log-magnitude term this cannot be lowered by making a partial that is slightly misaligned
+    (beating, detune, inharmonicity) quieter: at 60 Hz a 4096-point bin is 170 cents wide, and
+    the per-bin term alone let the 60-125 Hz octave drift 6 dB under the recordings. The floor
+    (white noise at ``floor_db`` dBFS) matches the STFT loss.
+    """
+
+    def __init__(self, sr, fft_sizes=(4096, 1024), n_mels=64, floor_db=-80.0):
+        super().__init__()
+        self.fft_sizes, self.floor_db = fft_sizes, floor_db
+        for n in fft_sizes:
+            self.register_buffer(f"mel{n}", mel_filterbank(sr, n, n_mels))
+
+    def forward(self, pred, target):
+        pred, target = pred.reshape(-1, pred.shape[-1]), target.reshape(-1, target.shape[-1])
+        loss = 0.0
+        for n in self.fft_sizes:
+            M = getattr(self, f"mel{n}")
+            eps = 10 ** (self.floor_db / 10) * 0.375 * n * M.sum(-1)[:, None]  # white floor in each mel band
+            e = lambda x: torch.log10(torch.einsum("mf,bft->bmt", M, _mag(x, n) ** 2) + eps)
+            loss = loss + (e(pred) - e(target)).abs().mean()
+        return loss / len(self.fft_sizes)
+
+
 def band_energies(x, band_masks, n_fft=512, hop=120):
     """Frame energies per band ``[..., bands, frames]`` of ``x[..., T]`` (``band_masks[bands, n_fft//2+1]``)."""
     lead = x.shape[:-1]
