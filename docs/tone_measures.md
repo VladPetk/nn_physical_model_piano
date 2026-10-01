@@ -4,7 +4,7 @@ A design for round 3: derive what we measure, and what we train on, from what a 
 0–8 are the design; sections 9–11 report what has been built, how each measure was validated and what it found
 (status 2026-09-30). The physics it points to is in 10.4, revised in 11.4; section 12 is phase 3: its order and its
 steps so far (per-key B, the strike comb's sign; the body's Q and the hall); section 13 the learned residual and its ceiling; section 14 phase 4 (the attack in three parts, a gain per piece, the
-whole-excerpt level term, a cheap sympathetic bank); section 15 isolated tenor notes partial by partial.
+whole-excerpt level term, a cheap sympathetic bank); section 15 isolated tenor notes partial by partial; section 16 the plan of phase 5.
 
 ## 0. Why
 
@@ -1307,8 +1307,13 @@ per-strike variation on. Medians over notes; n per cell 10–56.
   register decays its partials in much the same way; the piano's do not. The per-strike variation scales all of a
   note's decays together (`strike_log_decay`, `strike_decay_tilt`), and a partial's decay in the model is a smooth
   function of its number. A candidate, not checked: in the piano a partial's decay depends on the bridge's
-  admittance at its frequency, which is peaky (the board's modes), so each note's partials land on different peaks;
-  the recordings' decays plotted against absolute frequency across notes would show it.
+  admittance at its frequency, which is peaky (the board's modes), so each note's partials land on different peaks.
+  **Checked, and it is not that** (leave-one-note-out prediction of each partial's decay, rms dB/s): in the
+  recordings neither the partial number (late decay 10.5), nor the absolute frequency in 1/6-octave bins (10.2), nor
+  the same key's same partial in its other notes (10.3; early decay 12.0) predicts it better than the overall median
+  (9.8–13.0). In the model the same key's same partial predicts it to 4.6 dB/s (early; overall 9.9): every strike of a
+  key decays the same way, and that 4.6 also bounds the measure's own noise. So the piano's variety is strike to
+  strike, partial by partial (n 42 notes of 13 keys; 1/6-octave bins are coarser than the board's modes).
 - **The fundamental fades too fast:** partial 1 decays at −14.6 against −6.4 dB/s over 50–350 ms (paired −8.4, n
   30) and ends ~4 dB low at 0.9 s; partial 6 too slowly after 0.5 s (paired +9.4, n 15; +5.7 dB at 0.9 s).
 - **The middle partials peak too early:** partials 2–4 and 8 reach their maximum 15–35 ms sooner than in the
@@ -1322,6 +1327,32 @@ beats slower than ~1.2 Hz and the knee beyond 1 s (the notes are clear for only 
 (each partial radiates from a different part of the board; `channel_measures` is per band); and everything the
 context adds (pedal halo, overlapping notes), which these notes exclude by design. The recordings' spread includes
 measurement noise (earlier notes ringing under the pedal, the room), but the model's renders carry the same contexts.
+"Isolated" means no other onset 0.3 s before or 1 s after, not silence: earlier notes still sound under most of them
+(in the 12 A/B recordings the 0.3 s lead-in sits −11 to +4 dB re the note's first 0.5 s). Notes with nothing sounding
+0.4 s before and nothing struck 0.6 s after are 26 in R3 across all ten years, mostly the first notes of pieces.
 
 Listening: `samples/r3_notes/` (12 of the notes sounding to 1 s, soft to loud; each recording and the model's render,
 its level matched over the first 0.5 s; `ab.wav` plays every pair in turn).
+
+## 16. Phase 5: the plan (2026-10-01)
+
+From sections 14 and 15 and the owner's listening ("a complex synth wave with a custom attack envelope": the decay,
+the timbre and the attack). One round, one training run at the end, no per-change ablations:
+
+1. **The first 20 ms.** Nothing measures how a note's onset unfolds: the partial tracks (15) smear it over 40 ms, N4
+   rise and N6 cover it in one number each. An onset measure: band envelopes at a few ms resolution from −10 to +60 ms
+   re N0, per band the arrival, rise and peak time and the level at the peak re the note's 50-100 ms, the brightness
+   over the first 30 ms, the waveforms. Checked on synthetic notes with known ramps; run on the R3 notes, the bench's
+   registers and the music onsets (E4: the high attack in music is too abrupt and phase 4 did not change it). The
+   onset jitter re-set from it (review 5, 3.1: the 3.3 ms likely includes detection noise).
+2. **The medians on isolated notes.** The middle partials peak 15-35 ms early (the tone builds up too fast) and the
+   fundamental decays at −15 against −6 dB/s over 50-350 ms: a per-partial track term in the note fit, and what item 1
+   finds.
+3. **Per-strike, per-partial variation** of how the hammer excites the unison's strings (prompt/aftersound weights,
+   the mode amplitudes and phases), so that each strike gets its own two-stage decay and beating per partial; its
+   spread set by a variance match on `partial_profile`'s spreads across notes (as 12.7).
+4. **The sympathetic bank's level** from a scan of its gain against E1 (it sits 32-45 dB under the strings, 14.3), with
+   the quiet stretches' deficit (P3) split by pedal state.
+5. **One training run**, the bench, and A/B on the same R3 notes and phase 4's excerpts.
+
+Later: all years, the residual's read-out and budget, texture. Parked: pitch glide, duplex, felt, multiple contacts.

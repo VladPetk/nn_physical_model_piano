@@ -262,7 +262,7 @@ In short, on one year (RTX 3090):
   irregular), but the notes are too much alike (the spread of the partials' late decays across notes 3–8 dB/s against
   6–24 in the recordings), the fundamental fades too fast early (−15 vs −6 dB/s) and the middle partials peak 15–35 ms
   too soon. A/B files in [`samples/r3_notes/`](samples/r3_notes/).
-- **Open:** the physics above, then texture (a GAN branch had no measurable effect in 500 steps) and listening.
+- **Next: phase 5** (below; `docs/tone_measures.md` 16).
 
 The prior is calibrated against the literature (the KTH *Five Lectures on the Acoustics of the Piano*,
 arXiv and Zenodo papers) and against 260 recorded notes of a Steinway B, analysed with the same code as the
@@ -297,6 +297,18 @@ Each step is checked on the note bench with re-renders; one training run comes a
       dB low), texture.
 - [ ] 5. All years: mine isolated notes per year (B, stretch, velocity curve, damper delay, T60); the per-key stretch
       offset is still shared across conditions.
+Phase 5 (`docs/tone_measures.md` 16), one round with one training run at the end:
+- [ ] 1. The first 20 ms: an onset measure (band onsets at a few ms, rise and arrival order per band, the brightness
+      over the first 30 ms, waveforms), on the R3 notes, the bench registers and music onsets (E4's abrupt attack); the
+      onset jitter re-set from it (review 5, 3.1).
+- [ ] 2. The medians on isolated notes: the tone's build-up (middle partials peak 15-35 ms early) and the fundamental's
+      early decay (-15 vs -6 dB/s), with a per-partial track term in the note fit, plus what item 1 finds.
+- [ ] 3. Per-strike, per-partial variation of the unison's excitation (the notes are too much alike, 15), its spread set
+      by a variance match.
+- [ ] 4. The sympathetic bank's level from E1; the quiet stretches' deficit split by pedal state.
+- [ ] 5. One training run, the bench, A/B on the same notes and excerpts.
+Then: all years (5 above), the residual's read-out and budget, texture.
+
 - [ ] Deferred on measurement: pitch glide (~1.5–3 cents at *ff*), duplex strings. Later: felt model at note-on,
       Weinreich eigenmodes, evaluation suite (FAD, transcription F1, listening tests), 48 kHz stage, real-time
       C++/JUCE engine.
