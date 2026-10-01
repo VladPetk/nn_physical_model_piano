@@ -33,6 +33,7 @@ BODY_TARGET_DB = [(20, -40), (30, -30), (40, -20), (55, -10), (70, -4), (100, 0)
 GRAND_LOW_MODES = [62.0, 90.0, 105.0, 127.0, 187.0, 222.0, 245.0, 325.0]  # 2.90 m concert grand (Wogram, modal.html)
 HALL_BANDS = [125, 250, 500, 1000, 2000, 4000, 8000]
 HALL_T60 = [2.0, 1.8, 1.7, 1.6, 1.45, 1.2, 0.8]
+Q_BANDS = [31.25, 62.5, 125, 250, 500, 1000, 2000, 4000, 8000]  # octave bands of the body's Q cap
 FLOOR_BOUND_DB = 3.0  # the floor is a measurement (leading silence); training may refine it by this much
 MAINS_HZ = 60.0  # MAESTRO: the Piano-e-Competition, Minneapolis (US mains); hum at 60, 120, 180 Hz
 HUM_LINES = 3
@@ -113,13 +114,11 @@ def soundboard_body(sr, seconds, seed=0, eta=0.02, predelay=0.003, crossover=135
     return (h / plateau).float()
 
 
-def band_carriers(sr, seconds, seed=1):
-    """White noise split into octave bands (raised-cosine crossovers, bands sum to the original)."""
-    g = torch.Generator().manual_seed(seed)
-    L = int(seconds * sr)
-    X = torch.fft.rfft(torch.randn(L, generator=g, dtype=torch.float64))
-    lf = torch.log2(torch.fft.rfftfreq(L, 1 / sr).clamp(min=1.0).to(torch.float64))
-    centers = torch.log2(torch.tensor(HALL_BANDS, dtype=torch.float64))
+def octave_masks(n, sr, bands):
+    """Raised-cosine crossover masks ``[bands, n//2+1]`` in log f between the band centres (the first open below,
+    the last open above); they sum to one."""
+    lf = torch.log2(torch.fft.rfftfreq(n, 1 / sr).clamp(min=1.0).to(torch.float64))
+    centers = torch.log2(torch.tensor(bands, dtype=torch.float64))
     masks = []
     for i, c in enumerate(centers):
         m = torch.ones_like(lf)
@@ -128,7 +127,15 @@ def band_carriers(sr, seconds, seed=1):
         if i < len(centers) - 1:
             m = torch.where(lf > c, torch.cos(0.5 * math.pi * ((lf - c) / (centers[i + 1] - c)).clamp(0, 1)) ** 2, m)
         masks.append(m)
-    return torch.stack([torch.fft.irfft(X * m, L) for m in masks]).float()
+    return torch.stack(masks)
+
+
+def band_carriers(sr, seconds, seed=1):
+    """White noise split into octave bands (raised-cosine crossovers, bands sum to the original)."""
+    g = torch.Generator().manual_seed(seed)
+    L = int(seconds * sr)
+    X = torch.fft.rfft(torch.randn(L, generator=g, dtype=torch.float64))
+    return torch.stack([torch.fft.irfft(X * m, L) for m in octave_masks(L, sr, HALL_BANDS)]).float()
 
 
 class Room(nn.Module):
@@ -171,6 +178,10 @@ class Room(nn.Module):
         # mains hum: sinusoids at MAINS_HZ x (1, 2, 3), RMS dBFS per channel (-200 = none until measured)
         self.register_buffer("hum_ref_db", torch.full((C, ch, HUM_LINES), -200.0))
         self.raw_hum = nn.Parameter(torch.zeros(C, ch, HUM_LINES))
+        if cfg.body_q_max > 0:
+            Lb = self.body.shape[-1]
+            self.register_buffer("q_masks", octave_masks(2 * Lb, sr, Q_BANDS).float(), persistent=False)
+            self.register_buffer("q_sigma", math.pi * torch.tensor(Q_BANDS) / cfg.body_q_max, persistent=False)
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         old = prefix + "floor_db"  # checkpoints before round 2: an unbounded learned floor
@@ -195,11 +206,30 @@ class Room(nn.Module):
         gain = self.log_gain[cond] if gain is None else gain  # [B, ch]
         return (self.carriers[None] * env[:, None]).sum(2) * self.ramp * torch.exp(gain)[..., None]
 
+    def limit_q(self, body):
+        """The body FIRs ``[B, ch, L]`` with their ringing capped at Q = ``cfg.body_q_max`` (see the config): each
+        octave band (zero-phase crossovers) is multiplied by exp(-pi f_band (t - t0) / Q) after the direct arrival
+        t0 (the first sample at 10 % of the peak), then rescaled to its energy before."""
+        L = body.shape[-1]
+        sr = self.cfg.sample_rate
+        parts = torch.fft.irfft(torch.fft.rfft(body, 2 * L)[..., None, :] * self.q_masks, 2 * L)  # [B, ch, bands, 2L]
+        with torch.no_grad():
+            a = body.abs()
+            t0 = (a >= 0.1 * a.amax(-1, keepdim=True)).float().argmax(-1) / sr  # [B, ch]
+        t = torch.arange(2 * L, device=body.device) / sr
+        w = torch.exp(-self.q_sigma[:, None] * (t - t0[..., None, None]).clamp(min=0))  # [B, ch, bands, 2L]
+        cut = parts * w
+        g = (parts.pow(2).sum(-1) / cut.pow(2).sum(-1).clamp(min=1e-30)).sqrt()
+        return (cut * g[..., None]).sum(-2)[..., :L]
+
     def forward(self, cond):
         """Impulse responses ``[B, ch, L]`` for conditions ``cond[B]``: mic gain x body * (delta + hall)."""
         hall = self._hall(cond)
         hall = torch.cat([hall[..., :1] + 1.0, hall[..., 1:]], -1)  # + delta: the direct sound
-        body = self.body[cond] * torch.pow(10.0, self.mic_gain_db[cond] / 20)[..., None]
+        body = self.body[cond]
+        if self.cfg.body_q_max > 0:
+            body = self.limit_q(body)
+        body = body * torch.pow(10.0, self.mic_gain_db[cond] / 20)[..., None]
         return fft_convolve(torch.cat([body, body.new_zeros(*body.shape[:2], hall.shape[-1])], -1), hall)
 
     def pan_gains(self, ki, cond):

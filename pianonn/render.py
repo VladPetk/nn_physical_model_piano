@@ -29,6 +29,46 @@ def load_model(ckpt=None, device="cpu", **overrides):
     return model.to(device).eval()
 
 
+def _parse_value(v):
+    if v.lower() in ("1", "true", "yes", "on"):
+        return True
+    if v.lower() in ("0", "false", "no", "off"):
+        return False
+    for kind in (int, float):
+        try:
+            return kind(v)
+        except ValueError:
+            pass
+    return v
+
+
+def load_variant(spec, device="cpu", log=print):
+    """A model from ``label=checkpoint:physics|residual[:option,option,...]``; returns ``(label, model, residual)``.
+
+    Options change the checkpoint's model without training it: ``key=value`` overrides a config field (e.g.
+    ``bridge_end_comb=1``); ``mined=<file>`` re-applies per-key B from a ``scripts/mine_notes.py`` file (the tuning
+    is left as it is)."""
+    label, rest = spec.split("=", 1)
+    parts = rest.split(":")
+    i = max(j for j, p in enumerate(parts) if p in ("physics", "residual"))
+    ckpt, mode = ":".join(parts[:i]), parts[i]
+    overrides, mined = {}, None
+    for opt in filter(None, ":".join(parts[i + 1:]).split(",")):
+        k, v = opt.split("=", 1)
+        if k == "mined":
+            mined = v
+        else:
+            overrides[k] = _parse_value(v)
+    model = load_model(ckpt, device=device, **overrides)
+    if mined:
+        import json
+
+        from .fit_init import apply_mined_priors
+        with open(mined) as f:
+            apply_mined_priors(model, json.load(f), log=log, set_cents=False)
+    return label, model, mode == "residual"
+
+
 @torch.no_grad()
 def render_notes(model, notes, pedals, condition=0, tail=3.0, block_seconds=2.0, seed=0, residual=True, floor=False):
     """``notes[N, 4]`` = (pitch, onset, offset, velocity) in seconds; returns float32 audio ``[channels, T]``.

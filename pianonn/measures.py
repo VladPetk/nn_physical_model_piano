@@ -1,8 +1,9 @@
-"""The note bench and the measures of docs/tone_measures.md (N0-N10, E1, E4, P3).
+"""The note bench and the measures of docs/tone_measures.md (N0-N10, N3 glide, N12, E1, E3/F4, E4, P3, P4).
 
 The *bench* is a fixed, seeded list of isolated notes from the recordings (no other onset from 0.3 s before to
 0.65 s after), stratified by register, velocity and pedal and split by piece: a calibration group (training
-pieces) and an evaluation group (validation and test pieces). It also holds isolated note-offs, for the release.
+pieces) and an evaluation group (validation and test pieces). It also holds note-offs (N10), free decays (P4)
+and re-strike runs (F4).
 
 Every measure is computed identically on a recording's clip and on a model's render of the same MIDI in its
 context (12 s lookback, 1 s warm-up). Clips are ``[T, channels]`` arrays; power is summed over the channels

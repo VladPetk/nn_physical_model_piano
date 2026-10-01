@@ -34,6 +34,26 @@ class PianoConfig:
     use_context: bool = True
     use_room: bool = True  # body + hall; off = dry bridge-force signal
     use_floor: bool = True  # stationary microphone/hall noise floor per condition (review 3, F1)
+    # strike comb as the force at the bridge end: sin(n pi (1 - x0)) = (-1)^(n+1) sin(n pi x0) with x0 measured from
+    # the agraffe. Same partial levels, but the first transverse pulse reaches the bridge after (1 - x0) T/2 instead
+    # of x0 T/2 (off: the round-1/2 models, whose comb is the agraffe-end force)
+    bridge_end_comb: bool = False
+    # cap on the Q of the body FIR's ringing (0 = off): per octave band the FIR decays after its direct arrival at
+    # least as fast as a mode of Q = body_q_max at the band centre, with each band's energy kept. The round-2 bodies
+    # grew modes 2.9 Hz wide (1158, 612, 2740 Hz) that ring after every note (docs/tone_measures.md 11.3); 50 is the
+    # loss factor 0.02 the body was initialised with
+    body_q_max: float = 0.0
+    # per-strike variation (docs/tone_measures.md 12.7): at equal key and velocity the piano's notes vary more than the
+    # model's, from strike to strike rather than key to key (N11). Each field is the sd of a zero-median normal offset
+    # drawn per note (clipped at 2.5 sd), either one value for every key or one per register R2..R6 (a list, or a
+    # "/"-separated string; knots at MIDI 37.5, 53, 65.5, 77.5, 86, flat beyond). 0 = off
+    strike_level_db: object = 0.0  # the note's level: strings, knock impulse and knock noise together
+    # brightness and decay keep the note's energy over 0-0.3 s (the level has its own dimension)
+    strike_log_fc: object = 0.0  # brightness: log of the contact time's inverse (the knock impulse's width too)
+    strike_knock_db: object = 0.0  # the attack's noises: knock noise, key-bottom thump and knock impulse
+    strike_log_decay: object = 0.0  # log of every decay rate of the note
+    strike_decay_tilt: object = 0.0  # log decay rate per octave re 1 kHz: the high partials' early decay
+    strike_onset_ms: object = 0.0  # the sound's onset re the MIDI note-on
     checkpoint: bool = True
 
     def to_dict(self):

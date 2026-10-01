@@ -236,12 +236,13 @@ class NoiseBank(nn.Module):
         d = t - t_event[..., None]
         return torch.exp(-2 * d.clamp(min=0) / tau[..., None]) * (d >= 0)
 
-    def event_power(self, ki, u, onset, release, weight_on, weight_off, ctx, start, length, residual):
-        """Per-band power ``[B, bands, L]`` of note events: (physical, residual attack)."""
+    def event_power(self, ki, u, onset, release, weight_on, weight_off, ctx, start, length, residual, speed=None):
+        """Per-band power ``[B, bands, L]`` of note events: (physical, residual attack). ``speed``: hammer speeds
+        (m/s) from the condition's velocity map (default: the prior map)."""
         cfg = self.cfg
         t = (start + torch.arange(length, device=ki.device, dtype=torch.float64)).to(u.dtype) / cfg.sample_rate
         taus = self.taus(ki)
-        thump_at = onset + _key_bottom_delay(hammer_velocity(u))
+        thump_at = onset + _key_bottom_delay(hammer_velocity(u) if speed is None else speed)
         zero = torch.zeros_like(u)
         knock = self.knock[ki] + (self.knock_vel[ki] * (u - 0.6) + ctx.get("log_knock", zero))[..., None]
         if "knock_spec" in ctx:
@@ -274,6 +275,29 @@ class NoiseBank(nn.Module):
 # floor after the room, so switching the residual on starts (nearly) neutral; the context net can raise it by 35 dB
 R3_NOISE_BASE = -12.0
 
+# per-strike variation (config ``strike_*``, docs/tone_measures.md 12.7): the dimensions, the MIDI pitches of their
+# per-register knots (R2..R6 centres) and the clip of the normal draws
+STRIKE_DIMS = ("level_db", "log_fc", "knock_db", "log_decay", "decay_tilt", "onset_ms")
+STRIKE_KNOTS = (37.5, 53.0, 65.5, 77.5, 86.0)
+STRIKE_CLIP = 2.5
+
+
+def strike_sd_table(cfg):
+    """``[dims, 88]``: the sd of each per-strike dimension per key, or None when every one is off."""
+    rows = []
+    for d in STRIKE_DIMS:
+        v = getattr(cfg, "strike_" + d)
+        if isinstance(v, str):
+            v = [float(x) for x in v.split("/") if x.strip()]
+        v = [float(v)] if isinstance(v, (int, float)) else [float(x) for x in v]
+        if len(v) <= 1:
+            rows.append(torch.full((N_KEYS,), v[0] if v else 0.0))
+        else:
+            assert len(v) == len(STRIKE_KNOTS), f"strike_{d}: one value or one per register ({len(STRIKE_KNOTS)})"
+            rows.append(key_curve([(k - LOWEST_MIDI, s) for k, s in zip(STRIKE_KNOTS, v)]))
+    table = torch.stack(rows).clamp(min=0)
+    return table if bool(table.any()) else None
+
 
 class NeuralPhysicalPiano(nn.Module):
     """MIDI performance -> audio ``[B, channels, n_samples]``.
@@ -294,9 +318,35 @@ class NeuralPhysicalPiano(nn.Module):
         self.symp = SympatheticBank(cfg)
         self.noise = NoiseBank(cfg)
         self.room = Room(cfg)
+        sd = strike_sd_table(cfg)
+        self.strike_on = sd is not None
+        self.register_buffer("strike_sd", sd if sd is not None else torch.zeros(len(STRIKE_DIMS), N_KEYS), persistent=False)
 
     def n_frames(self, n_samples: int) -> int:
         return n_samples // self.cfg.hop + 2
+
+    def strike_offsets(self, ki, generator=None):
+        """Per-strike random offsets ``{dim: [B, N]}`` (config ``strike_*``), or None when they are off. Drawn afresh
+        at every call: a new realisation of the same performance, as the piano never strikes a key twice alike."""
+        if not self.strike_on:
+            return None
+        z = torch.randn(*ki.shape, len(STRIKE_DIMS), generator=generator, device=ki.device)
+        x = z.clamp(-STRIKE_CLIP, STRIKE_CLIP) * self.strike_sd.T[ki]
+        return {d: x[..., i] for i, d in enumerate(STRIKE_DIMS)}
+
+    @staticmethod
+    def with_strike(ctx, var, zero):
+        """The per-note corrections the physics and the noise bank see: the context net's plus the strike's."""
+        if var is None:
+            return ctx
+        out = dict(ctx)
+        db = math.log(10) / 20  # dB -> the noise bank's log amplitude
+        out["gain_db"] = ctx.get("gain_db", zero) + var["level_db"]
+        out["log_knock"] = ctx.get("log_knock", zero) + db * (var["level_db"] + var["knock_db"])
+        out["impulse_db"] = var["knock_db"]  # the level reaches the impulse through gain_db
+        for d in ("log_fc", "log_decay", "decay_tilt"):  # level-neutral: PianoPhysics.modes keeps the early energy
+            out["strike_" + d] = var[d]
+        return out
 
     def key_rolls(self, ki, onset, release, u, mask, F):
         """Per-key damper-lifted curve ``key_down[B,88,F]`` and onset-velocity roll ``[B,88,F]``.
@@ -436,7 +486,7 @@ class NeuralPhysicalPiano(nn.Module):
         return amp.new_zeros(B, pan.shape[-1], n_samples).scatter_add(2, idx, src)
 
     def render_noise(self, ki, u, onset, release, mask, pedal_env, w_off, ctx, frame_ctx, n_samples, block,
-                     generator, residual, white=None, white_res=None):
+                     generator, residual, white=None, white_res=None, speed=None):
         """Mechanical noise ``[B, n]``, the residual noise (R2 attack + R3 path) ``[B, n]`` or None, and the two white
         noises they were shaped from (pass them back in to render the same realisation again)."""
         cfg = self.cfg
@@ -460,7 +510,8 @@ class NeuralPhysicalPiano(nn.Module):
             if sel.numel():
                 sub = {k: v[:, sel] for k, v in ctx.items()}
                 p, r = self.noise.event_power(ki[:, sel], u[:, sel], onset[:, sel], release[:, sel], w_on[:, sel],
-                                              w_off[:, sel], sub, s0, L, residual)
+                                              w_off[:, sel], sub, s0, L, residual,
+                                              None if speed is None else speed[:, sel])
                 power = power + p
                 if r is not None:
                     res = r if res is None else res + r
@@ -517,7 +568,13 @@ class NeuralPhysicalPiano(nn.Module):
         ctx, frame_ctx = {}, None
         if residual:
             ctx, frame_ctx = self.context(onset_roll, key_down, pedals, ki, u, (onset + t_hist) * sr / hop, cond, H)
-        modes = self.physics.modes(ki, u, soft_on, cond, ctx, phantoms=cfg.n_phantoms > 0)
+        # per-strike variation: the keys and the context net follow the MIDI, the sound starts at the jittered onset;
+        # ``out["ctx"]`` stays the context net's own (the residual budget penalises it)
+        var = self.strike_offsets(ki, generator)
+        note_ctx = self.with_strike(ctx, var, torch.zeros_like(u))
+        if var is not None:
+            onset = onset + var["onset_ms"] / 1000
+        modes = self.physics.modes(ki, u, soft_on, cond, note_ctx, phantoms=cfg.n_phantoms > 0)
         m = mask[..., None]
         modes["amp"] = modes["amp"] * m[..., None]
         if "ph_amp" in modes:
@@ -554,8 +611,9 @@ class NeuralPhysicalPiano(nn.Module):
             pedal_env = self.noise.pedal_envelope(lift)[:, H:]
             white = torch.randn(B, n_samples, generator=generator, device=pitch.device)
             white_res = torch.randn(B, n_samples, generator=generator, device=pitch.device) if residual else None
-            args = (ki, u, onset, release, mask, pedal_env, w_off, ctx, frame_ctx, n_samples, block, None, residual,
-                    white, white_res)
+            speed = self.physics.hammer_speed(u, cond)
+            args = (ki, u, onset, release, mask, pedal_env, w_off, note_ctx, frame_ctx, n_samples, block, None, residual,
+                    white, white_res, speed)
             if "texture_view" in extras and torch.is_grad_enabled():  # the GAN's memory has to come from somewhere
                 noise, res = checkpoint(lambda *a: self.render_noise(*a)[:2], *args, use_reentrant=False)
             else:
@@ -587,8 +645,8 @@ class NeuralPhysicalPiano(nn.Module):
                 # recomputed in the backward pass: the per-note envelopes ([B, notes, samples]) would double the
                 # noise path's memory
                 nv, rv = checkpoint(lambda *a: self.render_noise(*a)[:2], ki, u, onset, release.detach(), mask,
-                                    pedal_env.detach(), w_off.detach(), ctx, frame_ctx, n_samples, block, None, residual,
-                                    white, white_res, use_reentrant=False)
+                                    pedal_env.detach(), w_off.detach(), note_ctx, frame_ctx, n_samples, block, None, residual,
+                                    white, white_res, speed.detach(), use_reentrant=False)
                 view = view + nv[:, None] + (rv[:, None] if rv is not None else 0)
             if gains is not None:
                 view = self.apply_band_gains(view, gains.detach(), block)

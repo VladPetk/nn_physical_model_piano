@@ -195,18 +195,25 @@ REGISTERS = ((21, 36), (36, 48), (48, 60), (60, 72), (72, 84), (84, 96), (96, 10
 
 
 @torch.no_grad()
-def apply_mined_priors(model, mined, log=print, min_notes=5, min_reliable=3):
+def apply_mined_priors(model, mined, log=print, min_notes=5, min_reliable=3, b_per_key=True, b_window=1,
+                       b_max_window=6, set_cents=True):
     """Start inharmonicity and stretch from values tracked on isolated notes of the same recordings
-    (``scripts/mine_notes.py``): per-register medians, interpolated over the keys, flat beyond the measured
-    registers. Frequencies are what spectral gradients cannot find from far away (an error in B of 2x puts
-    the high bass partials tens of Hz off), so they come from measurement and are then only refined.
+    (``scripts/mine_notes.py``). Frequencies are what spectral gradients cannot find from far away (an error in B
+    of 2x puts the high bass partials tens of Hz off), so they come from measurement and are then only refined.
 
-    The stretch goes into the per-key cents offsets (shared by all conditions: right for a single-year fit).
+    B, with ``b_per_key``: per key, the median ratio to the prior over the reliable notes within ``b_window`` keys
+    (widened up to ``b_max_window`` until ``min_notes`` are in), interpolated across keys without any, flat beyond
+    the measured keys. The piano's B is flat through the wound bass and rises over a few keys where the plain strings
+    begin (2018: ~5e-5 up to MIDI 42, ~1.3e-4 by 49-51); per-register medians put that knee between register centres
+    and left the round-2 models' B 15-20 % low from MIDI 43 to 63. Without ``b_per_key``: per-register medians
+    interpolated over the keys (rounds 1-2).
+
+    The stretch: per-register medians, into the per-key cents offsets (shared by all conditions: right for a
+    single-year fit); ``set_cents=False`` leaves them (re-applying B to a trained checkpoint).
     """
     from .physics import LOWEST_MIDI, N_KEYS, key_curve
 
     ph = model.physics
-    per_key = {int(k): v for k, v in mined["per_key"].items()}
     notes = [n for n in mined["notes"] if not n["suspect"]]
     b_pts, c_pts = [], []
     for lo, hi in REGISTERS:
@@ -232,13 +239,32 @@ def apply_mined_priors(model, mined, log=print, min_notes=5, min_reliable=3):
             pts = [(0.0, pts[0][1]), (float(N_KEYS - 1), pts[0][1])]
         return key_curve(pts).to(ph.raw_log_B.device)
 
-    if b_pts:
+    rel = [n for n in notes if n["B_reliable"]]
+    if b_per_key and rel:
+        prior = torch.exp(ph.prior_log_B).cpu().numpy().astype(np.float64)
+        pk = np.array([n["pitch"] - LOWEST_MIDI for n in rel])
+        lr = np.log([n["B"] for n in rel]) - np.log(prior[pk.clip(0, N_KEYS - 1)])
+        ratio = np.full(N_KEYS, np.nan)
+        for k in range(N_KEYS):
+            for w in range(b_window, b_max_window + 1):
+                sel = np.abs(pk - k) <= w
+                if sel.sum() >= min_notes:
+                    ratio[k] = np.median(lr[sel])
+                    break
+        ok = np.isfinite(ratio)
+        if ok.any():
+            keys = np.arange(N_KEYS)
+            b_pts = [(float(k), float(ratio[k])) for k in keys[ok]]
+            log_ratio = torch.tensor(np.interp(keys, keys[ok], ratio[ok]), dtype=torch.float32).clamp(-1.4, 1.4)
+            ph.raw_log_B.copy_(1.5 * torch.atanh(log_ratio.to(ph.raw_log_B.device) / 1.5))
+    elif b_pts:
         log_ratio = curve(b_pts).clamp(-1.4, 1.4)
         ph.raw_log_B.copy_(1.5 * torch.atanh(log_ratio / 1.5))
-    if c_pts:  # offsets interpolated, held beyond the measured registers: the prior's curvature at the ends stays
+    if c_pts and set_cents:  # offsets interpolated, held beyond the measured registers: the prior's curvature at the ends stays
         off = curve(c_pts).clamp(-29, 29)
         ph.raw_cents.copy_(30.0 * torch.atanh(off / 30.0))
-    log(f"mined priors from {len(notes)} notes: B x " + " ".join(f"{LOWEST_MIDI + k:.0f}:{math.exp(v):.2f}" for k, v in b_pts)
+    shown = b_pts[:: max(1, len(b_pts) // 12)] if b_per_key else b_pts
+    log(f"mined priors from {len(notes)} notes: B x " + " ".join(f"{LOWEST_MIDI + k:.0f}:{math.exp(v):.2f}" for k, v in shown)
         + " | cents re prior " + " ".join(f"{LOWEST_MIDI + k:.0f}:{v:+.1f}" for k, v in c_pts))
     return {"B_ratio": [(LOWEST_MIDI + k, math.exp(v)) for k, v in b_pts],
             "cents_re_prior": [(LOWEST_MIDI + k, v) for k, v in c_pts]}

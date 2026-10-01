@@ -37,8 +37,8 @@ from torch.utils.data import DataLoader  # noqa: E402
 from .config import PianoConfig  # noqa: E402
 from .data import MaestroSegments, SyntheticPerformances, collate
 from .dsp import bounded
-from .losses import (LogMelLoss, MultiResolutionDiscriminator, MultiResolutionSTFTLoss, PianoLoss, band_energies,
-                     discriminator_loss, generator_adv_loss, highpass)
+from .losses import (LogMelLoss, MultiResolutionDiscriminator, MultiResolutionSTFTLoss, OnsetLoss, PianoLoss,
+                     band_energies, discriminator_loss, generator_adv_loss, highpass)
 from .synth import ContextNet, NeuralPhysicalPiano
 
 STAGE2_ONLY = ("context.", "noise.att", "physics.partial_gain", "physics.color")
@@ -97,7 +97,8 @@ def set_stage(model, opt, stage, physics_lr=1.0, only=None, frozen=()):
             p.requires_grad_(train)
             if not train:
                 p.grad = None
-        g["lr"] = g["base_lr"] * (1.0 if residual or stage < 2 else physics_lr)
+        g["stage_scale"] = 1.0 if residual or stage < 2 else physics_lr
+        g["lr"] = g["base_lr"] * g["stage_scale"]
 
 
 def to_device(batch, device, non_blocking=False):
@@ -140,30 +141,45 @@ def onsets_of(batch, s, sr):
 
 
 @torch.no_grad()
-def validate(model, batches, loss_fn, residual, old=None):
-    """Mean loss and terms over fixed batches; with ``old``, also the trial's MR-STFT loss (``terms["mrstft"]``)."""
+def validate(model, batches, loss_fn, residual, old=None, onset=None):
+    """Mean loss and terms over fixed batches; with ``old``, also the trial's MR-STFT loss (``terms["mrstft"]``); with
+    ``onset`` = (``OnsetLoss``, weight), its term too (in the total with its weight; pooled over each batch, the
+    running pool left as training left it)."""
     model.eval()
+    if onset is not None:
+        onset[0].eval()
     tot, per = 0.0, {}
     for b in batches:
         n, s = b["audio"].shape[-1], int(b["loss_start"][0])
         g = torch.Generator(device=b["audio"].device).manual_seed(0)
-        pred, tgt = model(b, n, residual=residual, generator=g)["audio"][..., s:], b["audio"][..., s:]
+        full = model(b, n, residual=residual, generator=g)["audio"]
+        pred, tgt = full[..., s:], b["audio"][..., s:]
         loss, terms = loss_fn(pred, tgt, *onsets_of(b, s, model.cfg.sample_rate))
         terms = {k: float(v) for k, v in terms.items()}
+        if onset is not None:
+            v = onset[0](full.float(), b["audio"].float(), b, s / model.cfg.sample_rate)
+            terms["onset"] = float(v)
+            loss = loss + onset[1] * v
         if old is not None:
             terms["mrstft"] = float(old(pred, tgt))
         tot += float(loss)
         for k, v in terms.items():
             per[k] = per.get(k, 0.0) + v
     model.train()
+    if onset is not None:
+        onset[0].train()
     return tot / len(batches), {k: v / len(batches) for k, v in per.items()}
 
 
 @torch.no_grad()
-def dump_audio(model, examples, out_dir, tag, residual_too):
+def dump_audio(model, examples, out_dir, tag, residual_too, strike=None):
+    """Render the fixed excerpts; ``strike`` switches the per-strike variation on or off for them (None: as it is)."""
     import soundfile as sf
 
     model.eval()
+    keep = model.strike_on
+    if strike is not None:
+        model.strike_on = strike
     os.makedirs(out_dir, exist_ok=True)
     sr = model.cfg.sample_rate
     for i, b in enumerate(examples):
@@ -176,6 +192,7 @@ def dump_audio(model, examples, out_dir, tag, residual_too):
         if residual_too:
             pred = model(b, n, residual=True, generator=g)["audio"][0]
             sf.write(os.path.join(out_dir, f"ex{i}_{tag}_residual.wav"), pred.T.clamp(-1, 1).cpu().numpy(), sr)
+    model.strike_on = keep
     model.train()
 
 
@@ -191,19 +208,42 @@ def main(argv=None):
     ap.add_argument("--synthetic", action="store_true", help="fit a randomly perturbed teacher instead of MAESTRO")
     ap.add_argument("--out", default="runs/default")
     ap.add_argument("--resume", help="checkpoint to continue from (model, optimiser, step, stage)")
+    ap.add_argument("--init-from", help="start from this checkpoint's weights and model config (a training checkpoint or "
+                                        "a fitted model.pt): fresh optimiser, step 0, stage 1, no data initialisation")
+    ap.add_argument("--strike-train", action="store_true",
+                    help="draw the per-strike variation (config strike_*) in training and validation too. By default it "
+                         "is off there, since median-seeking terms would pull the fitted parameters (docs/tone_measures.md "
+                         "12.7), and on in the audio dumps; the checkpoints keep it in their config for rendering")
     ap.add_argument("--sr", type=int, default=24000)
     ap.add_argument("--steps", type=int, default=200_000)
     ap.add_argument("--minutes", type=float, help="stop after this much wall-clock time in the training loop "
                                                    "(validation and dumps included; the initialisation is not)")
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--lr-decay-at", type=float, default=-1.0,
+                    help="from this step (>= 1) or fraction of --minutes / --steps (< 1) the learning rate falls on a "
+                         "half cosine to --lr-final times its value at the end; -1: constant")
+    ap.add_argument("--lr-final", type=float, default=0.1)
+    ap.add_argument("--lr-warmup", type=int, default=0,
+                    help="steps over which each parameter's learning rate rises linearly from 0, counted from when it "
+                         "first trains (the start, or stage 2 for the tables and the residual): a fresh optimiser's "
+                         "first steps are full-sized whatever the gradient noise, which pushes a fitted model off")
     ap.add_argument("--segment", type=float, default=2.0)
     ap.add_argument("--warmup", type=float, default=1.0)
     ap.add_argument("--lookback", type=float, default=12.0)
     ap.add_argument("--reg", type=float, default=1.0, help="weight of the smoothness regulariser")
     ap.add_argument("--mel-weight", type=float, default=0.0,
                     help="weight of a log-mel band-energy term (insensitive to partial misalignment); 0 = off")
+    ap.add_argument("--onset-weight", type=float, default=0.0,
+                    help="weight of the onset-aligned attack term (losses.OnsetLoss: windows at each note's expected "
+                         "sound onset, pooled over the batch; docs/tone_measures.md 12.6); 0 = off")
+    ap.add_argument("--onset-relative", action="store_true",
+                    help="the onset term compares the attack re the same onset's early window (30-100 ms; 12.8)")
+    ap.add_argument("--onset-pool", type=float, default=0.0,
+                    help="the onset term's pool runs across steps, decaying by this factor per step (e.g. 0.99; 12.8)")
     ap.add_argument("--freeze", nargs="*", default=[], help="parameter-name prefixes kept frozen in every stage")
+    ap.add_argument("--cfg", nargs="*", default=[], metavar="KEY=VALUE",
+                    help="model config overrides, e.g. bridge_end_comb=1 body_q_max=50 (pianonn.config.PianoConfig)")
     ap.add_argument("--stage2-at", type=float, default=0.6,
                     help="switch to stage 2 at this step (>= 1) or this fraction of --minutes / --steps (< 1); -1: never")
     ap.add_argument("--stage2-physics-lr", type=float, default=0.3)
@@ -237,7 +277,13 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     torch.manual_seed(args.seed)
-    cfg = PianoConfig(sample_rate=args.sr)
+    from .render import _parse_value
+    overrides = {k: _parse_value(v) for k, v in (o.split("=", 1) for o in args.cfg)}
+    unknown = set(overrides) - set(PianoConfig.__dataclass_fields__)
+    assert not unknown, f"unknown config fields {sorted(unknown)}"
+    source = args.resume or args.init_from  # its model config is the base; --cfg overrides it
+    base_cfg = torch.load(source, map_location="cpu")["cfg"] if source else {}
+    cfg = PianoConfig.from_dict({**base_cfg, "sample_rate": args.sr, **overrides})
     device = torch.device(args.device)
     if device.type == "cuda":
         # Every chunk renders a different number of notes and partials, so tensor sizes vary and the caching
@@ -254,6 +300,16 @@ def main(argv=None):
         print(msg, flush=True)
         with open(log_path, "a") as f:
             f.write(json.dumps({"time": time.time(), "msg": msg, **rec}) + "\n")
+
+    if args.init_from and not args.resume:
+        from .render import load_weights
+
+        load_weights(model, torch.load(args.init_from, map_location=device)["model"], log=log)
+        log(f"weights from {args.init_from}")
+    has_strike = model.strike_on
+    model.strike_on = has_strike and args.strike_train
+    if has_strike:
+        log(f"per-strike variation {'on' if args.strike_train else 'off'} in training and validation, on in the dumps")
 
     teacher = None
     n_steps = args.steps
@@ -276,6 +332,9 @@ def main(argv=None):
     recon = PianoLoss(cfg.sample_rate, weights=args.loss_weights).to(device)
     old_loss = MultiResolutionSTFTLoss()  # the trial's loss, reported for continuity
     mel_loss = LogMelLoss(cfg.sample_rate).to(device) if args.mel_weight > 0 else None
+    onset_loss = (OnsetLoss(cfg.sample_rate, relative=args.onset_relative, pool_decay=args.onset_pool).to(device)
+                  if args.onset_weight > 0 else None)
+    onset_val = (onset_loss, args.onset_weight) if onset_loss is not None else None
     opt = torch.optim.Adam(param_groups(model, args.lr))
     disc = disc_opt = None
     if args.adv_start >= 0 or args.adv_with_stage2:
@@ -297,21 +356,24 @@ def main(argv=None):
         step, stage = state["step"], state["stage"]
         best, elapsed0 = state.get("best", math.inf), state.get("elapsed", 0.0)
         log(f"resumed from {args.resume} at step {step}, stage {stage}, {elapsed0 / 60:.1f} min in, best val {best:.4f}")
+    for g in opt.param_groups:  # where each parameter's warm-up starts (kept in the optimiser's state across resumes)
+        g.setdefault("warm_from", step)
     with open(os.path.join(args.out, "config.json"), "w") as f:
         json.dump({"model": cfg.to_dict(), "args": vars(args)}, f, indent=2)
 
     val_batches = fixed_batches(val_set, args.val_examples, args.batch, device) if val_set else None
     dump_examples = fixed_batches(dump_set, 3, 1, device) if val_set else None
     if val_batches and not args.resume:
-        v_raw, _ = validate(model, val_batches, recon, residual=False, old=old_loss)
-        log(f"val (untrained prior, before init): {v_raw:.4f}", kind="val", step=0, val_physics=v_raw, tag="raw_prior")
+        v_raw, _ = validate(model, val_batches, recon, residual=False, old=old_loss, onset=onset_val)
+        log(f"val ({'start model' if args.init_from else 'untrained prior, before init'}): {v_raw:.4f}", kind="val",
+            step=0, val_physics=v_raw, tag="raw_prior")
         if args.mined:
             from .fit_init import apply_mined_priors
 
             with open(args.mined) as f:
                 est = apply_mined_priors(model, json.load(f), log=log)
             log("mined priors", kind="init", **est)
-        if not args.no_init:
+        if not args.no_init and not args.init_from:  # a checkpoint's recording chain is already fitted
             from .fit_init import initialise_from_data
 
             for year in (args.years or sorted({p["year"] for p in dataset.pieces})):  # one recording condition at a time
@@ -320,14 +382,27 @@ def main(argv=None):
                 est = initialise_from_data(model, fixed_batches(init_set, args.init_examples, args.batch, device),
                                            log=log, tuning=not args.mined, silence=dataset.silence_clips(year))
                 log(f"init estimates {year}", kind="init", year=year, **{k: v for k, v in est.items()})
-            v0, per0 = validate(model, val_batches, recon, residual=False, old=old_loss)
+            v0, per0 = validate(model, val_batches, recon, residual=False, old=old_loss, onset=onset_val)
             log(f"val (prior after init): {v0:.4f}", kind="val", step=0, val_physics=v0, per_res=per0, tag="init_prior")
-        dump_audio(model, dump_examples, os.path.join(args.out, "audio"), "prior", residual_too=False)
+        dump_audio(model, dump_examples, os.path.join(args.out, "audio"), "prior", residual_too=False, strike=has_strike)
 
     t_train, steps_run = 0.0, 0
     budget_s = args.minutes * 60 if args.minutes else None
     t_loop = time.time()
     elapsed = lambda: elapsed0 + time.time() - t_loop  # wall clock of the training loop, validation included
+
+    def lr_factor():
+        """The learning-rate decay's multiplier: 1 until --lr-decay-at, then a half cosine to --lr-final at the end."""
+        if args.lr_decay_at < 0:
+            return 1.0
+        if args.lr_decay_at >= 1:
+            start, now, end = args.lr_decay_at, step, n_steps
+        elif budget_s:
+            start, now, end = args.lr_decay_at * budget_s, elapsed(), budget_s
+        else:
+            start, now, end = args.lr_decay_at * n_steps, step, n_steps
+        x = min(max((now - start) / max(end - start, 1e-9), 0.0), 1.0)
+        return args.lr_final + (1.0 - args.lr_final) * 0.5 * (1.0 + math.cos(math.pi * x))
 
     def stage2_due():
         if args.stage2_at < 0:
@@ -350,12 +425,12 @@ def main(argv=None):
         nonlocal best
         if not val_batches:
             return
-        v_phys, per = validate(model, val_batches, recon, residual=False, old=old_loss)
+        v_phys, per = validate(model, val_batches, recon, residual=False, old=old_loss, onset=onset_val)
         rec = {"kind": "val", "step": step, "stage": stage, "val_physics": v_phys, "per_res": per}
         msg = f"val step {step}: physics {v_phys:.4f} (" + " ".join(f"{k} {v:.4f}" for k, v in per.items()) + ")"
         v = v_phys
         if use_residual():
-            v_res, per_res = validate(model, val_batches, recon, residual=True, old=old_loss)
+            v_res, per_res = validate(model, val_batches, recon, residual=True, old=old_loss, onset=onset_val)
             rec["val_residual"], rec["per_res_residual"] = v_res, per_res
             msg += f"  with residual {v_res:.4f}  (unexplained by physics: {v_phys - v_res:+.4f})"
             v = v_res
@@ -375,6 +450,9 @@ def main(argv=None):
         if stage == 1 and stage2_due():
             stage = 2
             set_stage(model, opt, stage, args.stage2_physics_lr, frozen=frozen)
+            for g in opt.param_groups:
+                if g["name"].startswith(STAGE2_ONLY):
+                    g["warm_from"] = step
             log(f"step {step}: stage 2 (partial_gain, colouration{'' if args.no_residual else ' and the residual'} unfrozen; "
                 f"physics lr x{args.stage2_physics_lr})")
             if args.adv_with_stage2 and disc is not None:
@@ -406,6 +484,9 @@ def main(argv=None):
         if mel_loss is not None:
             logs["mel"] = mel_loss(pred, tgt)
             loss = loss + args.mel_weight * logs["mel"]
+        if onset_loss is not None:
+            logs["onset"] = onset_loss(out["audio"].float(), target.float(), batch, s / cfg.sample_rate)
+            loss = loss + args.onset_weight * logs["onset"]
         if residual:
             weights = dict(zip(("note", "frame", "additive"), args.budget))
             for k, v in residual_budget(model, out, batch["mask"]).items():
@@ -446,6 +527,10 @@ def main(argv=None):
             log(f"step {step}: non-finite gradient norm, step skipped", kind="warn", step=step)
             opt.zero_grad(set_to_none=True)
             continue
+        decay = lr_factor()
+        for g in opt.param_groups:
+            warm = min(1.0, (step - g["warm_from"]) / args.lr_warmup) if args.lr_warmup > 0 else 1.0
+            g["lr"] = g["base_lr"] * g["stage_scale"] * decay * warm
         opt.step()
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -459,12 +544,13 @@ def main(argv=None):
             mem = torch.cuda.max_memory_allocated() / 2**30 if device.type == "cuda" else 0.0
             log(f"step {step} stage {stage} " + " ".join(f"{k}={v:.4f}" for k, v in vals.items())
                 + f" | grad {' '.join(f'{k}={v:.2g}' for k, v in gnorm.items())} | {dt / args.log_every:.2f}s/step "
-                  f"(compute {t_train / steps_run:.2f}) mem {mem:.1f}G notes {batch['pitch'].shape[1]}",
-                kind="train", step=step, stage=stage, grad=gnorm, **vals)
+                  f"(compute {t_train / steps_run:.2f}) mem {mem:.1f}G notes {batch['pitch'].shape[1]} lr x{decay:.3g}",
+                kind="train", step=step, stage=stage, grad=gnorm, lr_factor=decay, **vals)
         if step % args.val_every == 0:
             run_validation()
         if dump_examples and step % args.dump_every == 0:
-            dump_audio(model, dump_examples, os.path.join(args.out, "audio"), f"step{step}", residual_too=use_residual())
+            dump_audio(model, dump_examples, os.path.join(args.out, "audio"), f"step{step}", residual_too=use_residual(),
+                       strike=has_strike)
         if step % args.save_every == 0:
             save("last")
         if budget_s and elapsed() >= budget_s:
@@ -473,7 +559,8 @@ def main(argv=None):
 
     run_validation()
     if dump_examples:
-        dump_audio(model, dump_examples, os.path.join(args.out, "audio"), f"step{step}", residual_too=use_residual())
+        dump_audio(model, dump_examples, os.path.join(args.out, "audio"), f"step{step}", residual_too=use_residual(),
+                   strike=has_strike)
     save("last")
     log(f"done: {step} steps, best val {best:.4f}")
 

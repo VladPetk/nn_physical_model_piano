@@ -11,3 +11,4 @@ data/
 *.pt
 !samples/*.wav
 .claude/
+CLAUDE.md

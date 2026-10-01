@@ -51,3 +51,26 @@ def test_initialisation_finds_latency_sign_and_level():
     est = initialise_from_data(model, [batch], log=lambda *a: None, tuning=False)
     assert 2.5 < est["latency_ms"] < 5.5, est["latency_ms"]
     assert all(abs(v - 6.0) < 1.5 for v in est["level_db"]), est["level_db"]
+
+
+def test_mined_b_per_key_follows_a_knee():
+    """B flat through the bass, then 2.5x over MIDI 42-49 (as the 2018 piano): per-key B keeps the knee."""
+    import math
+
+    import numpy as np
+
+    from pianonn.fit_init import apply_mined_priors
+
+    m = NeuralPhysicalPiano(small_cfg())
+    prior = torch.exp(m.physics.prior_log_B).numpy()
+    rng = np.random.default_rng(0)
+
+    def ratio(p):
+        return 0.8 * 2.5 ** float(np.clip((p - 42) / 7, 0, 1))
+
+    notes = [{"pitch": p, "B": float(prior[p - 21] * ratio(p) * math.exp(0.05 * rng.standard_normal())),
+              "B_reliable": True, "cents": 0.0, "suspect": False} for p in range(24, 80) for _ in range(3)]
+    apply_mined_priors(m, {"notes": notes, "per_key": {}}, log=lambda *a: None)
+    B = torch.exp(m.physics.prior_log_B + 1.5 * torch.tanh(m.physics.raw_log_B.detach() / 1.5)).numpy()
+    for p in (30, 40, 46, 49, 60, 75):
+        assert abs(math.log(B[p - 21] / (prior[p - 21] * ratio(p)))) < 0.12, p

@@ -219,6 +219,10 @@ So in this first pass the residual worked as a map, not as a model. It says the 
 
 ## 8. Listening material
 
+*The `samples/*.wav` renders named here were removed from the repository on 2026-09-30;
+re-render them with `python -m pianonn.render samples/demo.mid out.wav --ckpt runs/round1_trial/main/best_2h.pt --year 2018`
+(add `--physics-only` for the physics alone; `best.pt` and `last.pt` are from the 220-minute continuation).*
+
 (`runs/` is local and not in git.)
 
 - `samples/trained_2018_2h.wav` and `samples/trained_2018_2h_physics.wav`: `samples/demo.mid` rendered by the trained model (stereo, the 2018 condition, no noise floor), with and without the residual. `samples/trained_2018_4h.wav` is the 220-minute model. They sit at MAESTRO's recorded level (about −28 dBFS RMS, peak −10 dBFS), not normalised. Compare with `samples/physics_prior_v6.wav`, the untrained prior of spec v4 (mono, normalised).

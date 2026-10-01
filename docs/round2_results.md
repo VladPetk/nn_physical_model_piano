@@ -246,6 +246,9 @@ being judged.
 
 ## 8. What this suggests next
 
+*Superseded by [`tone_measures.md`](tone_measures.md): the note bench measured these gaps; its sections 10.4 and
+11.4 give the order now.*
+
 For discussion before any code:
 1. **A whole-excerpt level term.** Add the log of each band's total energy per excerpt, compared with L1. It is
    unbiased for level by construction, and it closes the 4 kHz gap without touching the per-frame terms.

@@ -3,7 +3,8 @@
     python scripts/compare_runs.py data/maestro24k --years 2018 --out runs/round2/compare.md \\
         --model control=runs/round2/b_control/last.pt:physics --model residual=runs/round2/a_residual/last.pt:residual
 
-Each ``--model`` is ``label=checkpoint:physics|residual``. Every model renders the excerpts of
+Each ``--model`` is ``label=checkpoint:physics|residual``, optionally with config overrides after the mode
+(``:key=value,...``, as in ``pianonn.render.load_variant``). Every model renders the excerpts of
 ``scripts/evaluate.py`` (test split, seed 11) under several noise seeds. Reported, per distance:
 * each model's mean, and how far that mean moves between noise seeds (the spread a difference must beat);
 * for every model against the first one, the paired per-excerpt difference, averaged over the seeds, with
@@ -23,7 +24,7 @@ import torch  # noqa: E402
 
 from pianonn.data import MaestroSegments  # noqa: E402
 from pianonn.metrics import make_terms, render  # noqa: E402
-from pianonn.render import load_model  # noqa: E402
+from pianonn.render import load_variant  # noqa: E402
 from pianonn.train import fixed_batches  # noqa: E402
 
 KEYS = ("new: total", "new: band", "new: fine", "new: attack", "old: MR-STFT", "log-mel (dB)")
@@ -48,7 +49,7 @@ def main():
     ap.add_argument("--split", default="test")
     ap.add_argument("--examples", type=int, default=96)
     ap.add_argument("--seeds", type=int, default=4)
-    ap.add_argument("--model", action="append", required=True, help="label=checkpoint:physics|residual")
+    ap.add_argument("--model", action="append", required=True, help="label=checkpoint:physics|residual[:key=value,...] (render.load_variant)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -56,16 +57,12 @@ def main():
     dev = torch.device(args.device)
     if dev.type == "cuda":
         torch.cuda.set_per_process_memory_fraction(0.6)
-    specs = []
-    for m in args.model:
-        label, rest = m.split("=", 1)
-        ckpt, mode = rest.rsplit(":", 1)
-        specs.append((label, ckpt, mode == "residual"))
-
     res = {}  # label -> {key: [seeds, excerpts]}
     batches = None
-    for label, ckpt, residual in specs:
-        model = load_model(ckpt, device=dev)
+    specs = []  # (label, the spec's checkpoint and options, residual)
+    for spec in args.model:
+        label, model, residual = load_variant(spec, device=dev)
+        specs.append((label, spec.split("=", 1)[1], residual))
         if batches is None:
             ds = MaestroSegments(args.data, args.split, model.cfg, 2.0, 1.0, 12.0, length=args.examples,
                                  deterministic=True, years=args.years, seed=11)

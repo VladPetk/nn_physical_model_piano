@@ -2,6 +2,7 @@
 
 import math
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -169,6 +170,150 @@ class PianoLoss(nn.Module):
         if per_example:
             return total, t
         return total.mean(), {k: v.mean() for k, v in t.items()}
+
+
+def taper(length, flat=0.0, device=None, dtype=torch.float32):
+    """Hann window (``flat`` = 0), or a Tukey window whose tapers take ``1 - flat`` of the length (N6's knock window
+    is ``flat`` = 0.7: the first milliseconds of an attack count)."""
+    if flat <= 0:
+        return torch.hann_window(length, periodic=False, device=device, dtype=dtype)
+    n = torch.arange(length, device=device, dtype=dtype)
+    edge = 0.5 * (1 - flat) * (length - 1)
+    up = 0.5 - 0.5 * torch.cos(math.pi * (n / edge).clamp(max=1))
+    down = 0.5 - 0.5 * torch.cos(math.pi * ((length - 1 - n) / edge).clamp(max=1))
+    return torch.minimum(up, down)
+
+
+# the recordings' sound onset (N0) re the MIDI onset, ms: a + b (pitch - 60) + c (velocity - 64); 382 evaluation notes
+# of the 2018 bench (residual IQR -3.8 .. +4.2 ms); the model follows the same law (docs/tone_measures.md 12.6)
+ONSET_DELAY_MS = (7.17, -0.273, -0.073)
+
+
+class OnsetLoss(nn.Module):
+    """The attack at every note's expected sound onset, pooled (docs/tone_measures.md 12.6, 12.8).
+
+    Windows from 3 ms before to 33 ms after each note's expected sound onset (its MIDI onset plus ``delay_ms``),
+    flat-topped as N6's, band powers in 1/3-octave bands from 100 Hz (the last band open above); notes whose expected
+    onsets lie within ``merge`` s share a window (a chord is one attack). A band of a window counts where the target's
+    or the prediction's window stands ``min_over_bg`` dB over its own background (330 to 30 ms before; detached). The
+    counted windows' powers are summed per band before the log, so a level offset's optimum is the energy match of the
+    pool; the loss is the mean over the counted bands of |log10 P_pred - log10 P_target| (1 = 10 dB), as in
+    ``PianoLoss``.
+
+    - ``relative``: the attack re the same onset's early window (``early``, 30-100 ms, Hann), both pooled: the attack's
+      excess over the tone, which a level or brightness error of the tone, common to both windows, does not move. A
+      cell then needs the early window over the background too (on the side that counts it).
+    - ``pool_decay`` > 0 (training mode only): the pool runs across steps. Per band, both sides' counted powers are
+      kept as sums decaying by ``pool_decay`` per call; the loss's value and the sign of its gradient come from the
+      running sums, the gradient's size from this batch's own log ratio. The optimum is then the energy match over
+      about ``1 / (1 - pool_decay)`` batches, whatever the batch size (pooled over one batch of 2 segments the median
+      and the energy mean part ways by up to 1.5 dB where the spreads differ, 12.6). In eval mode the pool is the
+      batch.
+
+    It sees what ``PianoLoss`` does not: the attack below ~400 Hz (the attack term has no band there, the band term
+    averages the bass over 341 ms). ``forward(pred, target, batch, t_lo)`` takes the whole rendered window
+    ``[B, ch, T]`` (the background needs the warm-up) and the performance ``batch`` (``onset`` in s re the window's
+    first sample, ``pitch``, ``velocity``, ``mask``); windows anchored before ``t_lo`` s do not count.
+    """
+
+    def __init__(self, sr, window=(-0.003, 0.033), flat=0.7, background=(-0.33, -0.03), n_bands=20, f_lo=100.0,
+                 min_over_bg=6.0, merge=0.010, delay_ms=ONSET_DELAY_MS, relative=False, early=(0.030, 0.100),
+                 pool_decay=0.0):
+        super().__init__()
+        self.sr, self.window, self.background, self.merge, self.delay_ms = sr, window, background, merge, delay_ms
+        self.relative, self.pool_decay = relative, pool_decay
+        self.over = 10 ** (min_over_bg / 10)
+        centers = f_lo * 2 ** (torch.arange(n_bands, dtype=torch.float64) / 3)
+        self.register_buffer("centers", centers.float())
+        # running sums per band: prediction attack, prediction early, target attack, target early
+        self.register_buffer("pool", torch.zeros(4, n_bands, dtype=torch.float64), persistent=False)
+        self.spec = {}
+        wins = [("attack", window, flat), ("bg", background, 0.0)] + ([("early", early, 0.0)] if relative else [])
+        for name, (a, b), fl in wins:
+            L = int(round((b - a) * sr))
+            n = 1 << int(math.ceil(math.log2(L)))
+            self.register_buffer(f"mask_{name}", log_f_band_masks(n, sr, centers, open_low=False).float())
+            self.register_buffer(f"taper_{name}", taper(L, fl))
+            self.spec[name] = (a, L, n)
+
+    def anchors(self, batch, t_lo, t_hi):
+        """``(rows, times, velocity)`` of every onset group whose window anchor (s re the window's first sample) lies
+        in ``[t_lo, t_hi]``: the example, the anchor and the group's loudest velocity."""
+        a, b, c = self.delay_ms
+        rows, times, vels = [], [], []
+        onset, pitch, vel, mask = (batch[k].detach().cpu().numpy() for k in ("onset", "pitch", "velocity", "mask"))
+        for r in range(onset.shape[0]):
+            m = mask[r].astype(bool)
+            v = vel[r][m].astype(float)
+            t = onset[r][m] + 1e-3 * np.maximum(a + b * (pitch[r][m] - 60) + c * (v - 64), 0.0)
+            o = np.argsort(t, kind="stable")
+            t, v = t[o], v[o]
+            i = 0
+            while i < len(t):
+                j = i
+                while j + 1 < len(t) and t[j + 1] - t[i] < self.merge:
+                    j += 1
+                if t_lo <= t[i] <= t_hi:
+                    rows.append(r), times.append(float(t[i])), vels.append(float(v[i: j + 1].max()))
+                i = j + 1
+        return np.array(rows, dtype=np.int64), np.array(times), np.array(vels)
+
+    def powers(self, x, rows, times):
+        """Band powers (mean power per sample, channels summed) ``{"attack", "bg"[, "early"]}: [G, bands]`` of
+        ``x[B, ch, T]`` in the windows of the onset groups ``rows``, ``times``."""
+        rows_t = torch.as_tensor(rows, device=x.device)
+        out = {}
+        for name, (a, L, n) in self.spec.items():
+            start = torch.as_tensor(np.round((times + a) * self.sr), dtype=torch.long, device=x.device)
+            idx = start.clamp(0, x.shape[-1] - L)[:, None] + torch.arange(L, device=x.device)
+            w = getattr(self, f"taper_{name}").to(x.dtype)
+            seg = x[rows_t[:, None], :, idx].permute(0, 2, 1) * w  # [G, ch, L]
+            P = (torch.fft.rfft(seg, n).abs() ** 2).sum(1)
+            out[name] = 2 * P @ getattr(self, f"mask_{name}").T / (n * (w ** 2).sum())
+        return out
+
+    def cells(self, p, q):
+        """1 where either side's window stands ``min_over_bg`` dB over its own background (detached): ``[G, bands]``;
+        with ``relative``, its early window too."""
+        def stands(d):
+            c = d["attack"] >= self.over * d["bg"]
+            return c & (d["early"] >= self.over * d["bg"]) if self.relative else c
+        return (stands(p) | stands(q)).detach().float()
+
+    def pooled(self, d, c):
+        """Counted powers summed over the windows: ``[2, bands]`` (attack; early, or ones)."""
+        a = (d["attack"] * c).sum(0)
+        return torch.stack([a, (d["early"] * c).sum(0) if self.relative else torch.ones_like(a)])
+
+    @staticmethod
+    def log_ratio(s, eps=1e-12):
+        """log10 of the pooled attack (re the pooled early window) from ``pooled``'s ``[2, bands]``."""
+        return torch.log10(s[0] + eps) - torch.log10(s[1] + eps)
+
+    def forward(self, pred, target, batch, t_lo):
+        rows, times, _ = self.anchors(batch, t_lo, pred.shape[-1] / self.sr - self.window[1])
+        if not len(rows):
+            return pred.sum() * 0.0
+        p = self.powers(pred, rows, times)
+        with torch.no_grad():
+            q = self.powers(target, rows, times)
+        c = self.cells(p, q)
+        sp, sq = self.pooled(p, c), self.pooled(q, c)
+        mine = self.log_ratio(sp)
+        if self.pool_decay > 0 and self.training:
+            with torch.no_grad():
+                run = self.pool * self.pool_decay + torch.cat([sp, sq]).detach().double()
+                self.pool.copy_(run)
+                if not self.relative:
+                    run[1] = run[3] = 1.0
+                d = (self.log_ratio(run[:2]) - self.log_ratio(run[2:])).to(mine.dtype)
+                has = (run[0] > 0) | (run[2] > 0)
+            s = torch.sign(d)
+            per_band = s * mine - (s * mine).detach() + d.abs()  # value from the pool, gradient from the batch
+        else:
+            per_band = (mine - self.log_ratio(sq)).abs()
+            has = c.sum(0) > 0
+        return (per_band * has).sum() / has.sum().clamp(min=1)
 
 
 def mel_filterbank(sr, n_fft, n_mels, f_lo=30.0):

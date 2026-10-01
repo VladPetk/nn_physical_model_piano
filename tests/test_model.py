@@ -2,7 +2,7 @@ import math
 
 import torch
 
-from pianonn import NeuralPhysicalPiano
+from pianonn import NeuralPhysicalPiano, PianoConfig
 from pianonn.physics import PianoPhysics
 
 from .conftest import make_perf, small_cfg
@@ -29,7 +29,8 @@ def test_forward_backward():
                  "context.frame_head.2.weight", "noise.att", "physics.raw_pedal_theta", "physics.raw_pedal_power",
                  "physics.raw_order", "physics.raw_order_vel", "physics.raw_restrike", "physics.raw_phantom_db",
                  "physics.raw_impulse_db", "physics.raw_bridge_g", "physics.cond_damper_delay", "physics.color",
-                 "room.raw_floor", "room.raw_pan", "room.mic_gain_db", "noise.raw_knock_tau", "physics.cond_vel_curve"]:
+                 "room.raw_floor", "room.raw_pan", "room.mic_gain_db", "noise.raw_knock_tau", "physics.cond_vel_curve",
+                 "physics.cond_vel_map"]:
         g = dict(m.named_parameters())[name].grad
         assert g is not None and torch.isfinite(g).all() and g.abs().sum() > 0, name
 
@@ -277,3 +278,140 @@ def test_damper_delay_is_learnable():
     out = m(make_perf(m, n, [(48, 0.0, 0.3, 90)]), n, residual=False)
     out["audio"][..., 2400:].pow(2).sum().backward()
     assert m.physics.cond_damper_delay.grad[3] > 0  # a later damper leaves more sound after the release
+
+
+def test_bridge_end_comb_keeps_levels_and_delays_the_first_string_pulse():
+    """(-1)^(n+1) on the strike comb: the bridge end's force. Same |amplitude| per partial (phantoms unchanged), but
+    on A1 (T = 18.2 ms, x0 ~ 0.12) the first transverse pulse arrives after (1 - x0) T/2 instead of x0 T/2."""
+    cfg = small_cfg(use_noise=False, use_sympathetic=False, use_room=False, use_impulse=False, use_context=False)
+    m = NeuralPhysicalPiano(cfg)
+    ki, u = torch.tensor([[12, 40, 60]]), torch.tensor([[0.8, 0.5, 0.3]])
+    mode, audio = {}, {}
+    n, sr = 4000, cfg.sample_rate
+    perf = make_perf(m, n, [(33, 0.1, 0.4, 100)])
+    for flag in (False, True):
+        m.cfg.bridge_end_comb = m.physics.cfg.bridge_end_comb = flag
+        mode[flag] = m.physics.modes(ki, u, torch.zeros_like(u), torch.tensor([3]))
+        audio[flag] = m(perf, n)["audio"][0, 0]
+    assert torch.allclose(mode[False]["amp"].abs(), mode[True]["amp"].abs())
+    assert not torch.allclose(mode[False]["amp"], mode[True]["amp"])
+    assert torch.allclose(mode[False]["ph_amp"], mode[True]["ph_amp"])
+    T = 1 / 55.0
+    start = int((audio[False].abs() > 1e-6 * audio[False].abs().max()).float().argmax())
+    win = slice(start, start + int(0.6 * T * sr))
+    t_peak = {f: audio[f][win].abs().argmax().item() / sr for f in audio}
+    assert t_peak[False] < 0.2 * T and t_peak[True] > 0.35 * T
+
+
+def test_body_q_cap_damps_a_narrow_mode_and_keeps_band_energy():
+    """An undamped 1158 Hz mode in the body (as the round-2 bodies grew): with the Q capped at 50 its ringing at
+    0.15-0.3 s falls by >= 30 dB, and the energy per octave moves by under 25 % of the total (each band keeps its
+    energy; the crossovers overlap, so some shows in the neighbours); off (the default), nothing changes."""
+    from pianonn.room import octave_masks
+
+    m = NeuralPhysicalPiano(small_cfg(body_q_max=50.0, body_seconds=0.3))
+    sr, L = m.cfg.sample_rate, m.room.body.shape[-1]
+    t = torch.arange(L) / sr
+    h = torch.zeros(L)
+    h[int(0.003 * sr)] = 1.0
+    h = h + 0.05 * torch.sin(2 * math.pi * 1158 * t) * (t > 0.003)
+    out = m.room.limit_q(h[None, None])[0, 0]
+
+    def tail_db(x):
+        seg = x[int(0.15 * sr): int(0.3 * sr)]
+        P = torch.fft.rfft(seg * torch.hann_window(len(seg))).abs() ** 2
+        f = torch.fft.rfftfreq(len(seg), 1 / sr)
+        return 10 * torch.log10(P[(f > 1100) & (f < 1220)].sum()).item()
+
+    assert tail_db(out) < tail_db(h) - 30
+    masks = octave_masks(2 * L, sr, [125, 250, 500, 1000, 2000, 4000]).float()
+    e = lambda x: ((torch.fft.rfft(x, 2 * L).abs() ** 2) * masks).sum(-1)
+    assert (e(out) - e(h)).abs().sum() < 0.25 * e(h).sum()
+    off = NeuralPhysicalPiano(small_cfg())
+    cond = torch.tensor([3])
+    ir = off.room(cond)
+    with torch.no_grad():
+        off.room.body.data[cond] = off.room.body.data[cond] * 1.0
+    assert torch.equal(ir, off.room(cond))
+
+
+def test_velocity_map_is_the_prior_at_zero_monotone_and_anchored_at_mf():
+    from pianonn.physics import hammer_velocity
+
+    ph = PianoPhysics(small_cfg())
+    u = torch.arange(1, 128).float()[None] / 127
+    c = torch.tensor([3])
+    assert torch.allclose(ph.hammer_speed(u, c), hammer_velocity(u), rtol=1e-5)
+    with torch.no_grad():
+        ph.cond_vel_map[3] = 5.0 * torch.randn(ph.cond_vel_map.shape[1])
+    v = ph.hammer_speed(u, c)[0]
+    assert (v[1:] > v[:-1]).all() and abs(float(v[63]) - 2.8) < 1e-4
+    # faster hammers above mf shorten the contact of loud notes only
+    with torch.no_grad():
+        ph.cond_vel_map.zero_()
+        ki, uu, soft = torch.tensor([[39, 39]]), torch.tensor([[40 / 127, 110 / 127]]), torch.zeros(1, 2)
+        tc0 = ph.contact_time(ki, uu, soft, c)
+        ph.cond_vel_map[3, 4:] = 0.5
+        tc1 = ph.contact_time(ki, uu, soft, c)
+    assert abs(float(tc1[0, 0] / tc0[0, 0]) - 1) < 1e-5 and float(tc1[0, 1] / tc0[0, 1]) < 0.9
+
+
+def test_strike_variation_is_off_by_default_and_draws_the_configured_spread():
+    """Per-strike variation (config ``strike_*``): off unless set; per-register knots are held flat beyond the ends;
+    a 3 dB level sd and a 5 ms onset sd come out of the renderer as such, around the unvaried note."""
+    from pianonn.synth import STRIKE_DIMS, strike_sd_table
+
+    assert not NeuralPhysicalPiano(small_cfg()).strike_on
+    tab = strike_sd_table(PianoConfig(strike_log_fc="0.1/0.2/0.3/0.4/0.5", strike_onset_ms=[1, 1, 1, 1, 5]))
+    fc, on = tab[STRIKE_DIMS.index("log_fc")], tab[STRIKE_DIMS.index("onset_ms")]
+    assert abs(fc[21 - 21] - 0.1) < 1e-6 and abs(fc[108 - 21] - 0.5) < 1e-6 and abs(fc[59 - 21] - 0.2 - 0.1 * 6 / 12.5) < 1e-5
+    assert on[60 - 21] == 1 and on[100 - 21] == 5 and tab[STRIKE_DIMS.index("level_db")].abs().sum() == 0
+
+    base = dict(use_noise=False, use_sympathetic=False, use_room=False, use_impulse=False, use_context=False)
+    n, sr = 6000, 8000
+    notes = [(60, 0.1, 0.6, 80)]
+    ref = NeuralPhysicalPiano(small_cfg(**base))
+    m = NeuralPhysicalPiano(small_cfg(**base, strike_level_db=3.0, strike_onset_ms=5.0))
+    m.load_state_dict(ref.state_dict())
+    perf = make_perf(m, n, notes)
+
+    def first(x):
+        return int((x.abs() > 1e-4 * x.abs().max()).float().argmax()) / sr
+
+    y0 = ref(perf, n)["audio"][0, 0]
+    e0, t0 = 10 * math.log10(energy(y0, sr, 0.0, 0.75)), first(y0)
+    levels, shifts = [], []
+    for seed in range(60):
+        y = m(perf, n, generator=torch.Generator().manual_seed(seed))["audio"][0, 0]
+        levels.append(10 * math.log10(energy(y, sr, 0.0, 0.75)) - e0)
+        shifts.append(1000 * (first(y) - t0))
+    lv, sh = torch.tensor(levels), torch.tensor(shifts)
+    assert 2.3 < lv.std() < 3.7 and lv.median().abs() < 1.0
+    assert 3.8 < sh.std() < 6.2 and sh.median().abs() < 1.5
+
+
+def test_strike_brightness_and_decay_keep_the_note_level():
+    """The per-strike brightness, decay and decay tilt change the spectrum and its evolution but keep the note's energy
+    over its first 0.3 s (the level is a dimension of its own)."""
+    base = dict(use_noise=False, use_sympathetic=False, use_room=False, use_impulse=False, use_context=False)
+    n, sr = 6000, 8000
+    ref = NeuralPhysicalPiano(small_cfg(**base))
+    perf = make_perf(ref, n, [(60, 0.1, 0.6, 80)])
+
+    def level_and_centroid(y):
+        seg = y[int(0.1 * sr): int(0.4 * sr)]
+        S = torch.fft.rfft(seg).abs() ** 2
+        f = torch.fft.rfftfreq(len(seg), 1 / sr)
+        return 10 * math.log10(seg.pow(2).mean().item()), float((S * f).sum() / S.sum())
+
+    e0, c0 = level_and_centroid(ref(perf, n)["audio"][0, 0])
+    for kw in (dict(strike_log_fc=0.2), dict(strike_log_decay=0.3), dict(strike_decay_tilt=0.3)):
+        m = NeuralPhysicalPiano(small_cfg(**base, **kw))
+        m.load_state_dict(ref.state_dict())
+        lv, ce = [], []
+        for seed in range(12):
+            e, c = level_and_centroid(m(perf, n, generator=torch.Generator().manual_seed(seed))["audio"][0, 0])
+            lv.append(e - e0), ce.append(1200 * math.log2(c / c0))
+        assert torch.tensor(lv).abs().max() < 0.3, (kw, lv)
+        if "strike_log_decay" not in kw:
+            assert torch.tensor(ce).std() > 50, (kw, ce)

@@ -112,7 +112,9 @@ pip install torch --index-url https://download.pytorch.org/whl/cu124  # CUDA bui
 pip install -e .[dev]
 pytest
 
-# 1. prepare MAESTRO v3 straight from the zip (stereo FLAC at 24 kHz plus cached MIDI); one year takes a minute
+# 1. prepare MAESTRO v3 straight from the zip (stereo FLAC at 24 kHz plus cached MIDI); one year takes a minute,
+#    all ten (omit --years) ~26 GB. Scripts without a --years default (pianonn.train, mine_notes, measure_phantoms,
+#    overfit_excerpt) use every year present in data/maestro24k, so pass --years to stay on one
 python scripts/prepare_maestro.py data/maestro-v3.0.0.zip data/maestro24k --years 2018
 
 # 2. measure inharmonicity and stretch on isolated notes of that year (CPU)
@@ -123,16 +125,26 @@ python scripts/overfit_excerpt.py data/maestro24k --years 2018 --out runs/exp1/o
 
 # 4. train (stage 1 physics + recording chain, stage 2 + residual after 60 %; --minutes caps the time)
 python -m pianonn.train --data data/maestro24k --years 2018 --mined runs/measurements/mined_2018.json --out runs/exp1/train --minutes 120 --batch 8
+# or continue from a fitted checkpoint's weights and config (fresh optimiser; phase 3, step 4: runs/phase3/step4/chain.sh)
+python -m pianonn.train --data data/maestro24k --years 2018 --init-from runs/phase3/step3/spread/model.pt --out runs/exp1/music --minutes 450 --batch 8 --lr 5e-4 --lr-warmup 200 --stage2-at 0.5 --lr-decay-at 0.5 --lr-final 0.05 --onset-weight 0.5 --onset-pool 0.97 --freeze physics.raw_log_B physics.raw_cents physics.cond_cents room.raw_log_t60 room.band_log_gain room.log_gain
 
 # 5. evaluate on the test split, with the identifiability table
 python scripts/evaluate.py runs/exp1/train/best.pt data/maestro24k --years 2018 --mined runs/measurements/mined_2018.json --out runs/exp1/train/eval
 
 # the note bench: isolated notes of the recordings vs each model, by register, velocity and pedal (docs/tone_measures.md)
 python scripts/note_bench.py data/maestro24k --years 2018 --out runs/exp1/bench --validate --music 24 --model a=runs/exp1/train/best.pt:physics
+# pitch glide (N3) and extra narrow peaks (N12) on the bench; N12 on notes after silence, recordings of every year
+python scripts/measure_glide_extra.py data/maestro24k --model runs/exp1/train/best.pt --out runs/exp1/glide_extra
+python scripts/survey_after_silence.py data/maestro24k --model runs/exp1/train/best.pt --out runs/exp1/after_silence
+# a model's options go after its mode: config overrides and re-applied per-key B, e.g.
+#   --model b=runs/exp1/train/best.pt:physics:bridge_end_comb=1,mined=runs/measurements/mined_2018.json
+# when the strings' first pulse arrives after the strike, bass and tenor (waveforms, not magnitudes)
+python scripts/attack_waveforms.py data/maestro24k --out runs/exp1/attack --model a=runs/exp1/train/best.pt:physics
 
 # compare checkpoints excerpt by excerpt over several noise seeds, and render them in turn for listening
 python scripts/compare_runs.py data/maestro24k --out runs/exp1/compare.md --model a=runs/exp1/a/last.pt:residual --model b=runs/exp1/b/last.pt:physics
 python scripts/ab_render.py data/maestro24k --out runs/exp1/listen --model a=runs/exp1/a/last.pt:residual --model b=runs/exp1/b/last.pt:physics
+python scripts/listen_page.py runs/exp1/listen   # index.html: every excerpt's versions side by side, for a browser
 
 # render (stereo; without --ckpt you hear the untrained prior; --physics-only switches the residual off)
 python -m pianonn.render some.mid out.wav --ckpt runs/exp1/train/best.pt --year 2018
@@ -154,12 +166,9 @@ a source for every value. The literature reviews are in [`docs/literature/`](doc
 recording calibration is in [`docs/calibration_iowa.md`](docs/calibration_iowa.md) (reproduce it with
 `python -m pianonn.calibration data/iowa`), and the current acceptance report is
 [`docs/diagnostics_prior.md`](docs/diagnostics_prior.md).
-`samples/` has renders of `samples/demo.mid`: `physics_prior_v1.wav` is the first guess and
-`physics_prior_v2.wav` is the first literature pass, `v3` has the review fixes, `v4` is the v2
-calibration, and `v5` is the corrected v3 calibration (fast three-string prompt decay). `v6` is the v4
-per-partial calibration (steeper hammer top, high partials that sustain, frequency-dependent bridge loss), and
-`ab_bass_notes_v5_v6.wav` plays A1, C2 and C3 at mf three times each: the Iowa Steinway recording, v5, then v6
-(each through the soundboard body only, no hall, loudness-matched).
+`samples/demo.mid` is the demo score. Renders are no longer kept in the repository: make
+them with `python -m pianonn.render samples/demo.mid out.wav --ckpt ...`, or take the listening sets in
+`runs/round2/listen/` and `runs/round2/ab/`.
 
 ## Status
 
@@ -171,7 +180,8 @@ The documents, in order:
   evaluation scale;
 - [`docs/round2_results.md`](docs/round2_results.md): the re-fit with a control branch and a GAN branch.
 - [`docs/tone_measures.md`](docs/tone_measures.md): what a piano note is made of, the measures that follow,
-  and what each loss term can see (the design for round 3).
+  and what each loss term can see (the design for round 3); sections 9–11 report the note bench built from it,
+  its validation and what it found, and 10.4 / 11.4 the physics it points to.
 
 In short, on one year (RTX 3090):
 - **Distance.** On 96 held-out test excerpts, the round-2 loss (log band energies, fine and attack terms, no
@@ -183,15 +193,52 @@ In short, on one year (RTX 3090):
   on it (it takes over turning the knock down). Its noise path stays silent: the per-frame loss shuts it.
 - **Frequencies.** Inharmonicity and tuning are measured on isolated notes and frozen: no loss term sees them
   well enough to fit them.
-- **Open:** the knock's spectrum (too much low-middle, too little at 4 kHz), texture (a GAN branch had no
-  measurable effect in 500 steps), and listening.
+- **The note bench** (isolated notes of the recordings against the models' renders, every measure validated
+  on synthetic notes and on known changes pushed through the renderer) found what listening heard:
+  - the attack has the wrong spectrum in every register: too much at 8 kHz everywhere (the fitted knock noise),
+    too little 250 Hz thump in the bass (−4…−5 dB) and 1 kHz knock in the middle (−10 dB), a low thud too strong
+    in the treble (+13…+18 dB);
+  - the hall decays 10–30 % too fast;
+  - at equal key and velocity the model's notes vary 30–70 % as much as the piano's (step 3 closes part of it);
+  - phantom partials are too weak from the bass up to C♯6;
+  - the model's soundboard filter has narrow modes that ring after every note.
 
-Renders of `samples/demo.mid`:
-- `samples/trained_2018_2h.wav`: the trained model, with the residual;
-- `samples/trained_2018_2h_physics.wav`: physics only;
-- `samples/trained_2018_4h.wav`: after 220 minutes.
-
-Both are stereo, at MAESTRO's recorded level.
+  Re-strikes, dampers, the touch precursor and the level are close; the pitch glide is real but small; duplex
+  strings cannot be told apart from other faint components.
+- **Phase 3, steps 0–1** (no training): the hall's T60 and level set from free decays, the soundboard filter's
+  narrow modes capped (12.4; the notes come out 1.6–1.7 dB loud in R3–R5 and their onset rise too slow until step 2);
+  per-key B fixes a 15–20 % error from MIDI 43 to 63 (the recordings' partials 10–30
+  sat ~5 cents sharp of the model's); in the bass the recordings' tone starts about (1 − x0) T/2 after the strike, as
+  the bridge end's force predicts, where the round-2 models start it at x0 T/2.
+- **Phase 3, step 2 in part** (fits on isolated notes, 12.5): a per-year velocity map with per-key level and
+  brightness brings the level within 1.2 dB in R2–R5 and cuts the brightness excess in R2 from +209 to +66 cents; a refit of the existing
+  attack parts removes a 10–20 dB low knock excess in R6–R7, but isolated notes cannot set the knock above ~2.5 kHz
+  (it barely rises over the background there), and one knock decay per key cannot be right in both low and high bands.
+  On music, every attack-aware loss term puts the knock 4.5–7 dB lower than the note fit left it.
+- **An onset-aligned attack term for training** (12.6, 12.8; `losses.OnsetLoss`, `train.py --onset-weight
+  --onset-pool`, off by default): windows at each note's expected sound onset see the knock impulse below 400 Hz and
+  pin the contact time better than the training loss. Pooled over one batch of 2 its bias gate fails (up to 3.2 dB on
+  512 segments); pooled across steps (a running pool of ~32 batches) it passes (0.1–0.7 dB). A relative form (the
+  attack re the same onset's 30–100 ms) passes too but moves nothing a run would fit. No band-level term at onsets sets
+  the knock's level in music.
+- **Phase 3, step 3** (12.7): at equal key and velocity the piano's notes differ strike to strike (not key to key) in
+  level (R2–R3), brightness, attack, early decay and onset timing, nearly independently. The model now draws a
+  per-note offset for each (config `strike_*`; brightness and decay keep the note's level), with spreads set from
+  the bench by a variance match, not fitted: onset timing and level now vary as the piano's, brightness and early
+  decay part of the way; the attack at 1–2 kHz still varies less (no model part moves it alone; the knock barely
+  reaches it). Medians stay; the training loss against the recordings rises 2–6 % (a random model loses to its median
+  under L1). Checkpoint `runs/phase3/step3/spread/model.pt`.
+- **Phase 3, step 4** (12.9): one 450-minute run on music (2018) from the step-3 checkpoint, 17,840 steps. On 96 held-out
+  test excerpts it is the nearest model to the recordings so far: total 0.691 (physics alone; 0.686 with the residual),
+  log-mel 3.19 dB, against the round-2 control's 0.719 and 3.35 dB, better on every term beyond two standard errors;
+  steps 1–3 alone had cost 0.053 on music. On held-out isolated notes the brightness excess in R2–R3 is gone (+204 /
+  +160 → +7 / −72 cents), the level is within 1 dB in R2–R5 at every velocity, the 8 kHz attack excess roughly halves
+  (+9…+14 → +5…+10 dB), the bass thump and the phantoms in R4–R5 come close; the level in music is within 0.7 dB in
+  every octave band (energy). Left: the quiet stretches of music 0.5–2 dB quieter than the piano's, the 8 kHz attack
+  still too strong, the onset rise too fast in R4–R5, phantoms weak in R2. The residual adds 0.005; rendered with the
+  per-strike variation on, the distances read 0.032 higher (a random model under median-seeking terms). Checkpoint
+  `runs/phase3/step4/train/last.pt`; listening in `runs/phase3/step4/listen/` (the per-strike variation on).
+- **Open:** the physics above, then texture (a GAN branch had no measurable effect in 500 steps) and listening.
 
 The prior is calibrated against the literature (the KTH *Five Lectures on the Acoustics of the Piano*,
 arXiv and Zenodo papers) and against 260 recorded notes of a Steinway B, analysed with the same code as the
@@ -199,16 +246,33 @@ model's renders ([`docs/calibration_iowa.md`](docs/calibration_iowa.md)); per-ye
 stretch now come from isolated MAESTRO notes. Reviews are in [`docs/reviews/`](docs/reviews/); every open
 finding of reviews 1–3 is either fixed or explicitly deferred in the plan.
 
-Next steps (discussed in [`docs/round2_results.md`](docs/round2_results.md), section 8):
-- [ ] A whole-excerpt band-level term, unbiased by construction, for the 4 kHz gap.
-- [ ] The attack: the knock spectrum per register, then the felt model at note-on.
-- [ ] Texture: open the residual's noise path to the critic, or match band-energy variance and modulation.
-- [ ] Longer training on one year with the residual after the physics; then all years (per-condition tables
-      are in place; the per-key stretch offset is still shared across conditions).
-- [ ] Mine isolated notes for every year: per-year B, stretch, velocity curve, damper delay.
-- [ ] Switch the sympathetic bank on in a later stage.
-- [ ] Felt model at note-on instead of the hammer spectrum table (review 3, 9.1); Weinreich eigenmodes if
-      the fitted aftersound tables look unphysical; pitch glide at *ff*.
-- [ ] Evaluation suite (FAD, transcription F1, listening tests).
-- [ ] 48 kHz stage and more bass partials; real-time C++/JUCE engine (recursive oscillators, online damper
-      integral, partitioned convolution, the context GRU at 200 Hz).
+Phase 3, in this order ([`docs/tone_measures.md`](docs/tone_measures.md), 12.1; the physics from 10.4 and 11.4).
+Each step is checked on the note bench with re-renders; one training run comes after step 3:
+- [x] 0. Fixes that move the baseline: per-key B (the round-2 models' B was 15–20 % low from MIDI 43 to 63; now on by
+      default in `apply_mined_priors`); the strike comb's sign (the bridge end's force; the recordings' bass notes
+      side with it, 12.3; config `bridge_end_comb`, off for older checkpoints, proposed on for the next run).
+- [x] 1. Set from measurement: hall T60 and level from free decays (P4; T60 was 12–20 % short, now within −7…+3 % on
+      held-out decays); the soundboard filter's Q capped at 50 (config `body_q_max`; its recurring narrow peaks go from
+      37 to 16 of the model's extra peaks). Side effects left for step 2: notes 1.6–1.7 dB loud in R3–R5, the onset
+      rise too slow (R4 median 82 vs 49 ms). Checkpoint `runs/phase3/step1/hall/model.pt` (12.4).
+- [ ] 2. Fit on isolated notes, per-note terms aligned to each note's onset (`scripts/fit_notes.py`): done, the
+      velocity map and a refit of the existing attack parts (checkpoint `runs/phase3/step2/knock_2k5/model.pt`, 12.5).
+      Open: the attack in three parts (a string-borne precursor up to ~5 kHz, a structure thump limited to ~2 kHz with
+      the treble's long low ringing, no knock noise above that; the refit shows one knock decay per key is too few)
+      with a per-register velocity law; phantoms from (j−1, j+1) pairs.
+- [x] 3. Per-strike variation, its spread set from the bench by a variance match (`scripts/strike_spread.py`; config
+      `strike_*`; checkpoint `runs/phase3/step3/spread/model.pt`, 12.7). Left: the attack at 1–2 kHz varies ~70 % as
+      much as the piano's.
+- [ ] Alongside: measures T1–T3 (two-stage decay, beating, pedal and decay) from partial fits with phase; E2, E5.
+- [x] 4. One training run on music (12.9): 450 min from the step-3 checkpoint with warm-up and a cosine decay (a constant
+      rate lets the level parameters wander with each batch's pieces), the onset-aligned attack term with a running
+      pool (`--onset-weight 0.5 --onset-pool 0.97`, 12.8), the hall frozen at its measurement, the per-strike variation
+      off in training and on in rendering (12.7); checkpoint `runs/phase3/step4/train/last.pt`. Not in it, still open:
+      per-key unison mistuning with per-key long-window terms, the sympathetic bank for the bass and tenor, a
+      whole-excerpt band-level term (in energy the octave bands are now within 0.7 dB; the quiet stretches read 0.5–2
+      dB low), texture.
+- [ ] 5. All years: mine isolated notes per year (B, stretch, velocity curve, damper delay, T60); the per-key stretch
+      offset is still shared across conditions.
+- [ ] Deferred on measurement: pitch glide (~1.5–3 cents at *ff*), duplex strings. Later: felt model at note-on,
+      Weinreich eigenmodes, evaluation suite (FAD, transcription F1, listening tests), 48 kHz stage, real-time
+      C++/JUCE engine.

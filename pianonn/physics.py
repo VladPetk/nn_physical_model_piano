@@ -98,10 +98,18 @@ F_REF = 27.5  # A0: origin of the log-frequency knot grids
 # per-condition correction of the level-vs-velocity law, dB at u = 0, 0.2, ..., 1 (linear in between, +-12 dB):
 # a Disklavier's velocity map is not a straight line in dB, and one slope per year left soft playing ~2 dB quiet
 VEL_KNOTS = 6
+# per-condition velocity map: MIDI velocity -> hammer speed, piecewise log-linear over segments of 16 velocity steps
+# (knots at 0, 16, ..., 128), each segment's slope the prior's (0.023 / step) x exp(+-1), anchored at 64 -> 2.8 m/s.
+# Monotone by construction. Zero: ``hammer_velocity`` (a guess at the Disklavier's map, docs/tone_measures.md 10.3)
+VEL_MAP_STEP = 16
+VEL_MAP_SEGMENTS = 8
+# per-strike brightness and decay offsets keep the note's energy over this long (N1's window): at equal key and velocity
+# the piano's level barely follows its brightness or early decay (rank correlations -0.16 and +0.24, docs 12.7)
+STRIKE_LEVEL_SECONDS = 0.3
 
 
 def hammer_velocity(u):
-    """MIDI velocity / 127 -> hammer speed in m/s.
+    """MIDI velocity / 127 -> hammer speed in m/s: the prior of ``PianoPhysics.hammer_speed``.
 
     Exponential, anchored so that the dynamic labels of Askenfelt & Jansson (Five Lectures,
     Fig. 6) fall on the usual MIDI velocities: mf = 64 -> 2.8 m/s, f ~ 90 -> 5.1, ff ~ 115 -> 9.0,
@@ -263,6 +271,7 @@ class PianoPhysics(nn.Module):
         self.cond_log_tc = _p(C)
         self.cond_damper_delay = _p(C)  # damper contact after MIDI note-off: 15 ms + [-50, +50] ms (spec: per year)
         self.cond_vel_curve = _p(C, VEL_KNOTS)  # dB correction of the velocity law (zero: the slope alone)
+        self.cond_vel_map = _p(C, VEL_MAP_SEGMENTS)  # log slope multipliers of the velocity map (zero: the prior map)
 
         # --- pedal mechanics (bounded: review 1 nit, the power was free to run off) ---
         self.raw_pedal_theta = _p()  # sustain value at which dampers lift half-way: 0.42 +- 0.3
@@ -288,6 +297,15 @@ class PianoPhysics(nn.Module):
         a2, al = m["amp"] ** 2, m["alpha"]
         energy = (a2 * (1 - torch.exp(-2 * al * seconds)) / (2 * al)).sum((2, 3))[0]
         return 10 * torch.log10(energy)  # -inf where no partial is below Nyquist (tiny test sample rates)
+
+    def hammer_speed(self, u, cond):
+        """Hammer speed (m/s) of normalised MIDI velocities ``u[B, K]`` under condition ``cond[B]``'s velocity map."""
+        slope = 0.023 * VEL_MAP_STEP * torch.exp(bounded(self.cond_vel_map[cond], 1.0))  # [B, S] nats per segment
+        mid = VEL_MAP_SEGMENTS // 2  # the knot at 64
+        up = torch.cumsum(slope[:, mid:], 1)
+        down = -torch.cumsum(slope[:, :mid].flip(1), 1).flip(1)
+        knots = math.log(2.8) + torch.cat([down, torch.zeros_like(slope[:, :1]), up], 1)  # [B, S + 1] at 0, 16, ..., 128
+        return torch.exp(interp_knots(knots, 127.0 * u / VEL_MAP_STEP))
 
     # ------------------------------------------------------------------ pedals, dampers, bridge
     def pedal_lift(self, sustain: torch.Tensor) -> torch.Tensor:
@@ -334,7 +352,7 @@ class PianoPhysics(nn.Module):
         """Hammer-string contact time in seconds; shorter (brighter) for harder strikes."""
         q = 0.2 * torch.exp(bounded(self.raw_tc_vel[ki], 0.7))  # Askenfelt Fig. 6: slope ~ -0.19 at C4
         log_tc = (self.prior_log_tc[ki] + bounded(self.raw_log_tc[ki], 1.0) + bounded(self.cond_log_tc[cond[:, None]], 0.5)
-                  - q * torch.log(hammer_velocity(u) / 2.8) + soft * self.soft_log_tc)
+                  - q * torch.log(self.hammer_speed(u, cond) / 2.8) + soft * self.soft_log_tc)
         if ctx_log_fc is not None:
             log_tc = log_tc - ctx_log_fc
         return log_tc.exp()
@@ -357,7 +375,9 @@ class PianoPhysics(nn.Module):
         ``alpha_damp[B, K, P]``, the hammer contact time ``tc[B, K]``, the re-strike loss
         ``restrike[B, K]`` (nats), the knock impulse amplitude ``impulse[B, K]`` and, with
         ``phantoms``, the phantom partials ``ph_freq / ph_alpha / ph_amp / ph_alpha_damp`` ``[B, K, Q]``.
-        ``ctx`` holds the context network's per-note corrections (all optional).
+        ``ctx`` holds per-note corrections (all optional): the context network's, and the per-strike variation's
+        (``impulse_db``, and ``strike_log_fc``, ``strike_log_decay``, ``strike_decay_tilt``: brightness and decay
+        offsets under which the prompt partials' energy over ``STRIKE_LEVEL_SECONDS`` is kept).
         """
         cfg = self.cfg
         n = self.harmonic
@@ -379,6 +399,10 @@ class PianoPhysics(nn.Module):
         b1 = torch.exp(self.prior_log_b1[ki] + bounded(self.raw_log_b1[ki], 1.5))
         b3 = torch.exp(self.prior_log_b3[ki] + bounded(self.raw_log_b3[ki], 1.5))
         log_decay = ctx.get("log_decay", zero)[..., None] + ctx.get("decay_tilt", zero)[..., None] * torch.log2(fn / 1000.0)
+        strike = "strike_log_fc" in ctx
+        if strike:
+            s_decay = ctx["strike_log_decay"][..., None] + ctx["strike_decay_tilt"][..., None] * torch.log2(fn / 1000.0)
+            log_decay = log_decay + s_decay
         decay_scale = torch.exp(log_decay)
         p = DECAY_EXPONENT * torch.exp(bounded(self.raw_decay_p, 0.25))
         alpha_after = (b1[..., None] + b3[..., None] * 1e6 * (fn / 1000.0) ** p) * decay_scale
@@ -387,17 +411,32 @@ class PianoPhysics(nn.Module):
         alpha = torch.cat([alpha_prompt[..., None], alpha_after[..., None].expand(*alpha_after.shape, cfg.n_modes - 1)], -1)
 
         # excitation: bridge force = gain(v) * hammer pulse spectrum * signed strike-position comb * colouration
-        tc = self.contact_time(ki, u, soft, cond, ctx.get("log_fc"))
+        log_fc = ctx.get("log_fc")
+        if strike:
+            log_fc = ctx["strike_log_fc"] if log_fc is None else log_fc + ctx["strike_log_fc"]
+        tc = self.contact_time(ki, u, soft, cond, log_fc)
         order = (torch.exp(self.prior_log_order[ki] + bounded(self.raw_order[ki], 0.9))
-                 * (hammer_velocity(u) / 2.8) ** (-HAMMER_ORDER_VEL * torch.exp(bounded(self.raw_order_vel[ki], 0.7))))
-        hammer = hammer_spectrum(fn, tc[..., None], order[..., None], HAMMER_X2 * torch.exp(bounded(self.raw_hammer_x2, 0.7)))
+                 * (self.hammer_speed(u, cond) / 2.8) ** (-HAMMER_ORDER_VEL * torch.exp(bounded(self.raw_order_vel[ki], 0.7))))
+        x2 = HAMMER_X2 * torch.exp(bounded(self.raw_hammer_x2, 0.7))
+        hammer = hammer_spectrum(fn, tc[..., None], order[..., None], x2)
         x0 = self.prior_strike[ki] * torch.exp(bounded(self.raw_strike[ki], 0.5))
         comb = torch.sin(math.pi * n * x0[..., None])
+        # the bridge end sees (-1)^(n+1) of the agraffe end's comb; the phantoms keep the agraffe-end signs
+        parity = 1.0 - 2.0 * (n.remainder(2) == 0).to(comb.dtype) if cfg.bridge_end_comb else None
+        if parity is not None:
+            comb = comb * parity
         gain_db = self.level_db(ki, u, soft, cond, ctx.get("gain_db"))
         log_shape = bounded(self.partial_gain[ki], PARTIAL_GAIN_BOUND) + self.coloration(ki, fn, cond)
         if "spec" in ctx:  # context net: per-note spectral correction, smooth in log f
             log_shape = log_shape + log_f_bumps(ctx["spec"], fn)
         gain = torch.pow(10.0, gain_db / 20)
+        if strike:  # the strike's brightness and decay keep the note's early energy (the level is its own offset)
+            def energy(h, al):
+                return ((h * comb * torch.exp(log_shape)) ** 2 * -torch.expm1(-2 * al * STRIKE_LEVEL_SECONDS) / (2 * al)
+                        * (fn < 0.48 * cfg.sample_rate)).sum(-1)
+            h0 = hammer_spectrum(fn, (tc * torch.exp(ctx["strike_log_fc"]))[..., None], order[..., None], x2)
+            e_var, e_0 = energy(hammer, alpha_prompt), energy(h0, alpha_prompt * torch.exp(-s_decay))
+            gain = gain * torch.where(e_var > 0, torch.sqrt(e_0 / e_var.clamp(min=1e-30)), torch.ones_like(e_var))
         base = gain[..., None] * hammer * comb * torch.exp(log_shape)
         soft_after = torch.exp(soft * (self.soft_log_after_prior[ki] + bounded(self.soft_log_after, 1.0)))
         after = torch.exp(self.prior_log_after[ki][..., None] + bounded(self.raw_after[ki], 1.5)) * soft_after[..., None]
@@ -415,12 +454,13 @@ class PianoPhysics(nn.Module):
 
         restrike = self.prior_restrike[ki] * torch.exp(bounded(self.raw_restrike[ki], 1.0))
         impulse_db = (gain_db + self.prior_impulse_db[ki] + bounded(self.raw_impulse_db[ki], 20.0)
-                      + bounded(self.raw_impulse_vel, 20.0) * (u - 0.6))
+                      + bounded(self.raw_impulse_vel, 20.0) * (u - 0.6) + ctx.get("impulse_db", zero))
         out = {"freq": freq, "alpha": alpha, "amp": amp, "alpha_damp": alpha_damp, "tc": tc,
                "restrike": restrike, "impulse": torch.pow(10.0, impulse_db / 20)}
         if phantoms and cfg.n_phantoms > 0:
             ref_db = self.level_db(ki, torch.full_like(u, 64 / 127), zero, cond)
-            out.update(self._phantoms(ki, freq, alpha, amp, alpha_damp, f1, ref_db, cond))
+            ph_amp = amp if parity is None else amp * parity[..., None]
+            out.update(self._phantoms(ki, freq, alpha, ph_amp, alpha_damp, f1, ref_db, cond))
         return out
 
     def _phantoms(self, ki, freq, alpha, amp, alpha_damp, f1, ref_db, cond):
@@ -469,6 +509,7 @@ class PianoPhysics(nn.Module):
         pg = bounded(self.partial_gain, PARTIAL_GAIN_BOUND)
         reg = reg + 1e-2 * (pg**2).mean() + smooth(pg, 0)  # smooth across keys at equal partial number
         reg = reg + smooth(bounded(self.cond_vel_curve[conds], 12.0) / 20, 1)
+        reg = reg + smooth(bounded(self.cond_vel_map[conds], 1.0), 1)
         col = bounded(self.color[conds], COLOR_BOUND)
         reg = reg + 1e-2 * (col**2).mean() + smooth(col, 1) + smooth(col, 2) + (col.mean(1) ** 2).mean()
         # level gauge: the per-key gains, the condition gain and the velocity curve could all trade a constant dB

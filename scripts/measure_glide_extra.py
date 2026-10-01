@@ -27,7 +27,7 @@ from scipy.interpolate import CubicSpline  # noqa: E402
 
 from pianonn import measures as M  # noqa: E402
 from pianonn.config import year_to_condition  # noqa: E402
-from pianonn.render import load_model  # noqa: E402
+from pianonn.render import load_model, load_variant  # noqa: E402
 
 UNDAMPED = 89  # F6: the first key without a damper; its f0 (1397 Hz) is the lowest an undamped string can answer at
 GLIDE_END, EXTRA_END = 0.62, 0.65
@@ -145,7 +145,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("data")
     ap.add_argument("--bench", default="runs/measurements/bench_2018.json")
-    ap.add_argument("--model", required=True, help="a physics-only checkpoint")
+    ap.add_argument("--model", required=True, help="a physics-only checkpoint, or label=checkpoint:physics[:options] "
+                    "(pianonn.render.load_variant)")
+    ap.add_argument("--parts", default="glide,extra", help="glide (N3), extra (N12), or both")
+    ap.add_argument("--no-symp", action="store_true", help="N12 without the model+symp variant")
     ap.add_argument("--max-notes", type=int, default=0, help="cap each note set (smoke runs)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", required=True)
@@ -158,8 +161,10 @@ def main():
     with open(args.bench) as f:
         bench = json.load(f)
     year = bench["years"][0]
-    model = load_model(args.model, device=dev)
+    model = load_variant(args.model, device=dev)[1] if "=" in args.model else load_model(args.model, device=dev)
     cfg = model.cfg
+    parts = set(args.parts.split(","))
+    sources = [s for s in SOURCES if not (args.no_symp and s == "model+symp")]
     sr = cfg.sample_rate
     table = M.partial_table(model, year_to_condition(year), dev)
     symp = copy.deepcopy(model)
@@ -171,10 +176,12 @@ def main():
                and (held(n) >= 0.45 or n["pitch"] >= UNDAMPED)]
     if args.max_notes:
         g_notes, x_notes = g_notes[: args.max_notes], x_notes[: args.max_notes]
+    g_notes = g_notes if "glide" in parts else []
+    x_notes = x_notes if "extra" in parts else []
     L = [f"# N3 glide and N12 extra peaks: `{args.model}` vs the recordings ({year}, both groups)", ""]
 
     # ------------------------------------------------------------ N3
-    clips = render(args.data, g_notes, [("model", model, False)], cfg, dev)
+    clips = render(args.data, g_notes, [("model", model, False)], cfg, dev) if g_notes else {}
     g_rows, val_g = [], []
     for i, n in enumerate(g_notes):
         ps = table[n["pitch"] - 21]
@@ -191,13 +198,14 @@ def main():
     del clips
 
     # ------------------------------------------------------------ N12
-    clips = render(args.data, x_notes, [("model", model, False), ("model+symp", symp, False)], cfg, dev)
+    clips = render(args.data, x_notes, [("model", model, False)] + ([] if args.no_symp else [("model+symp", symp, False)]),
+                   cfg, dev) if x_notes else {}
     x_rows, val_x = [], []
     for i, n in enumerate(x_notes):
         ps = table[n["pitch"] - 21]
         t1 = EXTRA_END if n["pitch"] >= UNDAMPED else min(EXTRA_END, held(n) - 0.03)
         r = {k: n[k] for k in ("piece", "pitch", "velocity", "register", "vel_bin")}
-        for src in SOURCES:
+        for src in sources:
             x = clips[src][i]
             t_on = onset_of(x, sr, float(ps[0]))
             r[src] = M.extra_peaks(x, sr, t_on, ps, t1=t1)
@@ -262,10 +270,10 @@ def main():
           "| register | n | source | per note: phantom / near / between | notes with near or between | level re partials: phantom / near / between (median dB) |",
           "|---|---|---|---|---|---|"]
     for reg in ("R3", "R4", "R5", "R6", "R7"):
-        rr = [r for r in x_rows if r["register"] == reg and all("N12 n" in r[s] for s in SOURCES)]
+        rr = [r for r in x_rows if r["register"] == reg and all("N12 n" in r[s] for s in sources)]
         if not rr:
             continue
-        for src in SOURCES:
+        for src in sources:
             v = [r[src] for r in rr]
             per = " / ".join(f"{np.mean([m[f'N12 n {k}'] for m in v]):.2f}" for k in LABELS)
             share = np.mean([m["N12 n near"] + m["N12 n between"] > 0 for m in v])
@@ -283,10 +291,10 @@ def main():
           "so these are unison splitting, duplex segments or something else.", "",
           "| register | n | source | near peaks per note | notes with one | median dB re partial |", "|---|---|---|---|---|---|"]
     for reg in ("R4", "R5", "R6"):
-        rr = [r for r in x_rows if r["register"] == reg and r["pitch"] < UNDAMPED and all("N12 n" in r[s] for s in SOURCES)]
+        rr = [r for r in x_rows if r["register"] == reg and r["pitch"] < UNDAMPED and all("N12 n" in r[s] for s in sources)]
         if not rr:
             continue
-        for src in SOURCES:
+        for src in sources:
             v = [[p for p in r[src]["N12 peaks"] if p[4] == "near" and p[0] < 1397] for r in rr]
             L.append(f"| {reg} | {len(rr)} | {src} | {np.mean([len(x) for x in v]):.2f} | "
                      f"{100 * np.mean([len(x) > 0 for x in v]):.0f} % | {med([p[3] for x in v for p in x])} |")
@@ -302,7 +310,7 @@ def main():
     L += ["Recurring frequencies: a peak at the same frequency (± 1.5 Hz) in ≥ 4 notes of ≥ 3 keys is a fixed "
           "resonance, not something that follows the note.", "",
           "| source | peaks | in recurring frequencies | the most frequent (Hz: notes, keys) |", "|---|---|---|---|"]
-    for src in SOURCES:
+    for src in sources:
         rec = recurring(x_rows, src)
         allp = [p[0] for r in x_rows for p in r[src].get("N12 peaks", [])]
         inrec = sum(1 for f in allp if any(abs(f - c[0]) <= 1.5 for c in rec))

@@ -29,7 +29,7 @@ import torch  # noqa: E402
 from pianonn import measures as M  # noqa: E402
 from pianonn.config import year_to_condition  # noqa: E402
 from pianonn.data import MaestroSegments  # noqa: E402
-from pianonn.render import load_model  # noqa: E402
+from pianonn.render import load_variant  # noqa: E402
 from pianonn.train import fixed_batches  # noqa: E402
 
 GRID = ["N1 level", "N2 slope", "N2 centroid", "N2 partial 2", "N2 partial 4", "N2 partial 8", "N4 rise",
@@ -404,7 +404,8 @@ def main():
     ap.add_argument("--years", type=int, nargs="*", default=[2018])
     ap.add_argument("--bench", help="bench JSON (default runs/measurements/bench_<years>.json; built if missing)")
     ap.add_argument("--group", default="eval", choices=("eval", "calib"))
-    ap.add_argument("--model", action="append", required=True, help="label=checkpoint:physics|residual")
+    ap.add_argument("--model", action="append", required=True,
+                    help="label=checkpoint:physics|residual[:options] (pianonn.render.load_variant); the first gives the partial table")
     ap.add_argument("--validate", action="store_true")
     ap.add_argument("--music", type=int, default=0, help="E4 and P3 on this many 6 s test excerpts")
     ap.add_argument("--max-notes", type=int, default=0, help="cap the notes (smoke runs)")
@@ -441,11 +442,7 @@ def main():
     repeats = [r for r in bench["repeats"] if r["group"] == args.group]
     if args.max_notes:
         notes, rels, decays, repeats = (v[: args.max_notes] for v in (notes, rels, decays, repeats))
-    models = []
-    for spec in args.model:
-        label, rest = spec.split("=", 1)
-        ckpt, mode = rest.rsplit(":", 1)
-        models.append((label, load_model(ckpt, device=dev), mode == "residual"))
+    models = [load_variant(spec, device=dev) for spec in args.model]
     cfg = models[0][1].cfg
     table = M.partial_table(models[0][1], year_to_condition(args.years[0]), dev)
     parts = set(args.parts.split(","))
