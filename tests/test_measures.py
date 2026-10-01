@@ -344,3 +344,48 @@ def test_partial_profile_reads_two_stage_decay_beating_and_the_attack():
     assert pi["periodic"][0] < pr["periodic"][1] - 0.2
     nt = M.non_tonal(x, sr, t_on, np.array([150.0, 301.0, 452.0, 603.0]))
     assert nt[((0.1, 0.4), 1000)] < -60  # nothing but partials
+
+
+def _onset_note(ramp_lo=0.01, ramp_hi=0.002, delay_hi=0.0, knock=0.0, t_on=0.5, f0=150.0, seed=0):
+    """Partials of f0 (amplitude 1/n, decaying 26 dB/s), each rising as a raised cosine over ``ramp_lo`` s below 1 kHz
+    and ``ramp_hi`` above (those starting ``delay_hi`` s late); ``knock``: a 2-8 kHz noise burst decaying in 3 ms."""
+    rng = np.random.default_rng(seed)
+    t = np.arange(int(0.8 * SR)) / SR
+    x = np.zeros_like(t)
+    for n in range(1, 60):
+        f = n * f0 * np.sqrt(1 + 1e-4 * n * n)
+        if f > 10000:
+            break
+        T, d = (ramp_lo, 0.0) if f < 1000 else (ramp_hi, delay_hi)
+        tau = t - t_on - d
+        env = np.where(tau < 0, 0, np.where(tau < T, 0.5 * (1 - np.cos(np.pi * np.clip(tau, 0, T) / T)), 1.0))
+        x += env * np.exp(-np.clip(tau, 0, None) * 3) / n * np.sin(2 * np.pi * f * t + rng.uniform(0, 2 * np.pi))
+    if knock:
+        hz = np.fft.rfftfreq(len(t), 1 / SR)
+        nz = np.fft.irfft(np.fft.rfft(rng.standard_normal(len(t))) * ((hz >= 2000) & (hz < 8000)), len(t))
+        x += knock * (t >= t_on) * np.exp(-np.clip(t - t_on, 0, None) / 0.003) * nz / nz.std()
+    x += 1e-5 * rng.standard_normal(len(t))
+    return np.stack([x, x], 1)
+
+
+def test_onset_profile_reads_known_delays_ramps_and_a_knock():
+    """Known changes to a synthetic note: the high partials 3 ms late, the low partials' rise 10 -> 30 ms (10 % of a
+    raised cosine's power is reached at 0.38 of its length: +7.6 ms), a 2-8 kHz burst."""
+    bands = list(M.KNOCK_BANDS)
+    i500, i2k, i4k, i8k = (bands.index(c) for c in (500, 2000, 4000, 8000))
+    prof = lambda **kw: M.onset_profile(_onset_note(**kw), SR, 0.5, 150.0)
+    base = prof()
+    late = prof(delay_hi=0.003)
+    assert abs(late["arrival"][i2k] - base["arrival"][i2k] - 0.003) < 0.001
+    assert abs(late["arrival"][i4k] - base["arrival"][i4k] - 0.003) < 0.001
+    assert abs(late["arrival"][i500] - base["arrival"][i500]) < 0.0005
+    assert late["win"][0, i4k] < base["win"][0, i4k] - 3  # the first 5 ms lose most of the band
+    slow = prof(ramp_lo=0.03)
+    assert abs(slow["arrival"][i500] - base["arrival"][i500] - 0.0076) < 0.002
+    assert slow["rise"][i500] > base["rise"][i500] + 0.005
+    assert slow["win"][0, i500] < base["win"][0, i500] - 8 and abs(slow["win"][3, i500] - base["win"][3, i500]) < 1.0
+    knock = prof(knock=0.3)
+    assert knock["win"][0, i8k] > base["win"][0, i8k] + 4 and knock["win"][0, i4k] > base["win"][0, i4k] + 2
+    assert abs(knock["win"][0, i500] - base["win"][0, i500]) < 0.3
+    # a steady note settles: 20-40 ms sits at its 50-100 ms level plus the decay in between (26 dB/s x ~55 ms)
+    assert np.all(np.abs(base["win"][3, 1:] - 1.4) < 0.6)

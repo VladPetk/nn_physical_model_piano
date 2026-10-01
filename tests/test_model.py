@@ -560,3 +560,77 @@ def test_cheap_sympathetic_bank_matches_the_full_rate_one_and_renders_in_blocks(
     assert torch.allclose(b, c, atol=1e-4 * float(b.abs().max())), (b - c).abs().max()  # float32 round-off: ~1e-5
     ea, eb = float(a[..., 4000:].pow(2).sum()), float(b[..., 4000:].pow(2).sum())
     assert abs(10 * math.log10(eb / ea)) < 1.0, (ea, eb)
+
+
+def test_strike_per_partial_keeps_each_partials_energy_and_the_mean_aftersound():
+    """Per strike and partial (config ``strike_partial_decay``, ``strike_after``): off by default; the per-note draws
+    stay what they were; each partial's prompt energy over 0.3 s is kept under its decay draw; the aftersound's random
+    part keeps its mean power and flips its sign in some partials."""
+    from pianonn.physics import STRIKE_LEVEL_SECONDS
+
+    assert not NeuralPhysicalPiano(small_cfg()).strike_partial_on
+    base = dict(use_noise=False, use_sympathetic=False, use_room=False, use_impulse=False, use_context=False)
+    ref = NeuralPhysicalPiano(small_cfg(**base, strike_level_db=2.0))
+    m = NeuralPhysicalPiano(small_cfg(**base, strike_level_db=2.0, strike_partial_decay=0.5, strike_after=2.0))
+    m.load_state_dict(ref.state_dict())
+    ki = torch.tensor([[60 - 21, 40 - 21, 75 - 21]])
+    v0 = ref.strike_offsets(ki, torch.Generator().manual_seed(3))
+    v1 = m.strike_offsets(ki, torch.Generator().manual_seed(3))
+    assert torch.equal(v0["level_db"], v1["level_db"]) and "after" not in v0
+    assert v1["partial_decay"].shape == (1, 3, m.cfg.n_partials) and v1["after"].shape == (1, 3, m.cfg.n_partials, m.cfg.n_modes - 1)
+
+    u = torch.full(ki.shape, 0.6)
+    zero, cond = torch.zeros_like(u), torch.zeros(1, dtype=torch.long)
+    plain = {f"strike_{d}": zero for d in ("log_fc", "log_decay", "decay_tilt")}
+    with torch.no_grad():
+        a = m.physics.modes(ki, u, zero, cond, dict(plain), phantoms=False)
+        b = m.physics.modes(ki, u, zero, cond, {**plain, "strike_partial_decay": v1["partial_decay"]}, phantoms=False)
+    e = lambda md: md["amp"][..., 0] ** 2 * -torch.expm1(-2 * md["alpha"][..., 0] * STRIKE_LEVEL_SECONDS) / (2 * md["alpha"][..., 0])
+    ok = a["amp"][..., 0].abs() > 0
+    assert torch.allclose(e(b)[ok], e(a)[ok], rtol=1e-4)
+    assert (b["alpha"][..., 0][ok] / a["alpha"][..., 0][ok]).log().std() > 0.3
+
+    draws = [m.strike_offsets(ki, torch.Generator().manual_seed(s))["after"] for s in range(40)]
+    g = torch.stack(draws)[..., :40, :]  # partials 1-40
+    assert abs(float((g ** 2).mean()) - 1) < 0.1 and 0.2 < float((g < 0).float().mean()) < 0.45
+
+
+def test_body_ring_up_spreads_a_partials_onset_and_keeps_its_level():
+    """Config ``body_ring_ms``: a decaying noise kernel of amplitude time constant tau in one band. A sinusoid switched on
+    through it builds up as a random walk: over many frequencies its power grows as 1 - exp(-2 t / tau); a band without a kernel passes it at once; ``ring_gain`` is each frequency's steady power gain, the mean
+    over the channels, so dividing it out keeps the partials' levels."""
+    from pianonn.dsp import fft_convolve
+    from pianonn.room import Q_BANDS, Room
+
+    sr = 24000
+    taus = ["0"] * len(Q_BANDS)
+    taus[Q_BANDS.index(2000)] = "6"
+    r0 = Room(PianoConfig(sample_rate=sr, body_seconds=0.3, hall_seconds=0.5))
+    r1 = Room(PianoConfig(sample_rate=sr, body_seconds=0.3, hall_seconds=0.5, body_ring_ms="/".join(taus)))
+    assert not r0.ring_on and r1.ring_on
+    k = r1.ring_kernel[0].double()
+    t = torch.arange(len(k), dtype=torch.float64) / sr
+
+    def build_up(freqs):
+        """Mean over ``freqs`` of |the kernel's transform up to t|^2, re its value at the end; and the steady gains."""
+        z = torch.cumsum(k[None] * torch.exp(-2j * math.pi * freqs[:, None] * t[None]), -1).abs() ** 2
+        return z.mean(0) / z[:, -1].mean(), z[:, -1]
+
+    def settled(p):  # ms until the build-up stays above 90 % (the delta's share at 2 kHz cancels within ~1 ms)
+        return 1000 * (int(torch.nonzero(p < 0.9).max()) + 1) / sr if bool((p < 0.9).any()) else 0.0
+
+    p, steady = build_up(torch.linspace(1600, 2500, 300, dtype=torch.float64))
+    assert 0.6 * 1.15 * 6 < settled(p) < 1.8 * 1.15 * 6, settled(p)  # 1 - exp(-2 t / tau) reaches 90 % at 1.15 tau
+    p_low, _ = build_up(torch.linspace(300, 450, 50, dtype=torch.float64))
+    assert settled(p_low) < 2.0  # 400 Hz: no kernel there, a delta (the 2 kHz band split leaks for ~1.5 ms)
+    f = torch.tensor([1937.0, 2210.0, 2486.0])
+    expect = torch.tensor([[_kernel_power(r1.ring_kernel[c], float(x), sr) for x in f] for c in range(2)]).mean(0)
+    assert torch.allclose(r1.ring_gain(f), expect.float(), rtol=0.05)
+    assert steady.std() / steady.mean() > 0.5  # resonant fine structure: what ring_gain divides out
+
+
+def _kernel_power(k, f, sr):
+    n = torch.arange(len(k), dtype=torch.float64) / sr
+    z = (k.double() * torch.exp(-2j * math.pi * f * n)).sum()
+    return float(z.abs() ** 2)
+

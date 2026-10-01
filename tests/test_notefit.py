@@ -85,3 +85,23 @@ def test_cells_count_where_either_side_stands_out():
     c_rec, c_sym = term.cells(rec, np.array([100.0])), term.cells(rec, np.array([100.0]), mod)
     assert c_rec["early"][0, 10] == 0 and c_sym["early"][0, 10] == 1
     assert c_sym["early"][0, 9] == 0 and c_sym["sustain"].sum() == 0
+
+
+def test_partial_windows_read_each_partials_own_decay():
+    """A tone whose partial 2 decays at 30 dB/s and the others at 10: the per-partial windows read each partial's
+    level (a sine of amplitude a in each channel reads 10 log10(a^2)) and, relative to the first window, the drop of
+    each over 0.1 s; partials of the background do not count."""
+    sr, f0, on = 24000, 200.0, 0.5
+    t = torch.arange(int(1.2 * sr)) / sr
+    tau = (t - on).clamp(min=0)
+    rate = {1: 10.0, 2: 30.0, 3: 10.0, 4: 10.0}
+    tone = sum(0.1 * torch.exp(-tau * r / 8.686) * torch.sin(2 * math.pi * k * f0 * t) for k, r in rate.items()) * (t >= on)
+    x = (tone + 1e-5 * torch.randn(len(t), generator=torch.Generator().manual_seed(0))).repeat(1, 2, 1)
+    win = {"a": (0.05, 0.15, {"partials": 4}), "b": (0.15, 0.25, {"partials": 4, "rel": "a"})}
+    term = NF.NoteTerm(sr, "cpu", win)
+    lv = term.levels(x, np.array([on]), np.array([f0 * np.arange(1, 9)]))
+    expect_a = 20 * math.log10(0.1) - 10 * 0.1  # the window's mean of a 10 dB/s decay centred 0.1 s in, roughly
+    assert abs(float(lv["a"][0, 0]) - expect_a) < 0.5
+    assert abs(float(lv["b"][0, 0]) + 1.0) < 0.2 and abs(float(lv["b"][0, 1]) + 3.0) < 0.2  # 10 and 30 dB/s over 0.1 s
+    cells = term.cells(lv, np.array([f0]))
+    assert cells["a"].all() and cells["b"].all()

@@ -120,7 +120,10 @@ class NoteTerm:
       as N6 knock): the knock without the partials' own onset. A band counts where at least 10 % of it is kept;
     - ``rel``: the level minus that of the named window, band by band (e.g. the attack re the early window: the
       attack's excess over the tone, which a tonal error common to both windows does not move);
-    - ``all_bands``: count bands below 0.7 f0 too (the knock sits there; ``gaps`` windows always do).
+    - ``all_bands``: count bands below 0.7 f0 too (the knock sits there; ``gaps`` windows always do);
+    - ``partials``: K: instead of bands, the levels of the note's own partials 1..K (power within f0 / 4 of each,
+      raised-cosine), so a decay that differs between neighbouring partials shows; counted where the partial stands
+      ``MIN_OVER_BG`` dB over its own level in the background window.
     Cells count where the recording's or the model's window stands ``MIN_OVER_BG`` dB over the same measure of its
     own background. Selecting on the recording alone biased the paired median towards "the model is too weak" by up
     to 7 dB near the background (the 8 kHz knock between the partials: -6.4 dB selected on the recording, +0.6
@@ -137,12 +140,21 @@ class NoteTerm:
             self.spec[name] = (a, L, n_fft, band_masks(n_fft, sr, centers, device), opts.get("flat", 0.0))
             self.opts[name] = opts
         self.gaps = any(o.get("gaps") for o in self.opts.values())
+        self.n_partials = max([int(o.get("partials", 0)) for o in self.opts.values()] + [0])
 
     def _away(self, n_fft, partials, device):
         """Per-note bin masks ``[B, n_fft // 2 + 1]``: 1 farther than max(70 Hz, f0 / 4) from every partial."""
         hz = np.fft.rfftfreq(n_fft, 1 / self.sr)
         m = [~M.near_partials(hz, p, max(70.0, 0.25 * p[0])) for p in np.asarray(partials, float)]
         return torch.as_tensor(np.stack(m), dtype=torch.float32, device=device)
+
+    def _partial_masks(self, n_fft, partials, device):
+        """``[B, K, n_fft // 2 + 1]``: raised-cosine masks within f0 / 4 of each of the first K partials."""
+        hz = torch.as_tensor(np.fft.rfftfreq(n_fft, 1 / self.sr), dtype=torch.float32, device=device)
+        p = torch.as_tensor(np.asarray(partials, float)[:, : self.n_partials], dtype=torch.float32, device=device)
+        half = 0.25 * p[:, :1, None]
+        d = ((hz[None, None] - p[..., None]) / half).clamp(-1, 1)
+        return torch.cos(0.5 * math.pi * d) ** 2 * (p[..., None] < 0.45 * self.sr)
 
     def levels(self, x, t_on, partials=None):
         """``{window: [B, bands]}`` of ``x[B, ch, T]`` with each clip's onset at ``t_on[B]`` s and partial
@@ -154,6 +166,12 @@ class NoteTerm:
             start = start.clamp(0, x.shape[-1] - L)
             gaps = self.opts[name].get("gaps") or (name == "bg" and self.gaps)
             key = f"{name}:raw" if self.opts[name].get("rel") else name
+            if self.opts[name].get("partials") or (name == "bg" and self.n_partials):
+                pm = self._partial_masks(n_fft, partials, x.device)
+                lv = _partial_window_levels(x, start, L, pm, n_fft, flat)
+                out["bg:partials" if name == "bg" else key] = lv
+                if name != "bg":
+                    continue
             if name == "bg" or not self.opts[name].get("gaps"):
                 out[key] = window_levels(x, start, L, masks, n_fft, flat)
             if gaps:
@@ -173,6 +191,9 @@ class NoteTerm:
         above = torch.as_tensor(self.centers[None] >= 0.7 * np.asarray(f0)[:, None], device=rec["bg"].device)
 
         def stands(lv, w, o):
+            if o.get("partials"):
+                c = (lv[f"{w}:raw"] if o.get("rel") else lv[w]) >= lv["bg:partials"] + MIN_OVER_BG
+                return c & (lv[o["rel"]] >= lv["bg:partials"] + MIN_OVER_BG) if o.get("rel") else c
             if o.get("gaps"):
                 c = lv[w] >= lv["bg:gaps"] + MIN_OVER_BG
             else:
@@ -185,7 +206,10 @@ class NoteTerm:
             c = stands(rec, w, o)
             if mod is not None:
                 c = c | stands({k: v.detach() for k, v in mod.items()}, w, o)
-            c = c & (rec[f"frac:{w}"] >= 0.1) if o.get("gaps") else c & (above | bool(o.get("all_bands")))
+            if o.get("gaps"):
+                c = c & (rec[f"frac:{w}"] >= 0.1)
+            elif not o.get("partials"):
+                c = c & (above | bool(o.get("all_bands")))
             out[w] = c.float()
         return out
 
@@ -200,6 +224,20 @@ class NoteTerm:
             num = num + (d.abs() * c).sum()
             den = den + c.sum()
         return num / den.clamp(min=1.0)
+
+
+def _partial_window_levels(x, start, length, pmask, n_fft, flat=0.0):
+    """Levels (dB, as ``window_levels``) of ``x[B, ch, T]`` over ``[start_b, start_b + length)`` in per-note masks
+    ``pmask[B, K, bins]``: ``[B, K]``."""
+    idx = start[:, None] + torch.arange(length, device=x.device)
+    seg = x.gather(2, idx[:, None, :].expand(-1, x.shape[1], -1))
+    w = taper(length, flat, x.device, x.dtype)
+    P = (torch.fft.rfft(seg * w, n_fft).abs() ** 2).sum(1)  # [B, bins]
+    return 10 * torch.log10(2 * torch.einsum("bf,bkf->bk", P, pmask) / (n_fft * (w ** 2).sum()) + 1e-20)
+
+
+def _is_partials(win):
+    return len(win) > 2 and bool(win[2].get("partials"))
 
 
 class PieceLevels(nn.Module):
@@ -307,6 +345,8 @@ def bias_gate(ev, notes, windows=WINDOWS, centers=BAND_CENTERS, min_cells=8):
     strata = np.array([f"{n['register']}|{n['vel_bin']}" for n in notes.notes])
     rows = []
     for w in windows:
+        if _is_partials(windows[w]):
+            continue
         c = (ev["cells"][w] > 0) & ev["ok"][:, None]
         for o in octs:
             med, en, n = [], [], 0
@@ -333,6 +373,12 @@ def residual_table(ev, notes, windows=WINDOWS, centers=BAND_CENTERS, key="regist
     for g in sorted(set(groups)):
         for w in windows:
             c = (ev["cells"][w] > 0) & ev["ok"][:, None] & (groups == g)[:, None]
+            if _is_partials(windows[w]):  # per partial: "p1".."pK" in place of the octaves
+                for k in range(c.shape[1]):
+                    sel = c[:, k]
+                    if sel.sum() >= 10:
+                        out[(g, w, f"p{k + 1}")] = (float(np.median(ev["mod"][w][sel, k] - ev["rec"][w][sel, k])), int(sel.sum()))
+                continue
             for o in octs:
                 sel = c & (near == o)[None]
                 if sel.sum() >= 10:

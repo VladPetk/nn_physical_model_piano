@@ -55,7 +55,14 @@ class PianoConfig:
     # least as fast as a mode of Q = body_q_max at the band centre, with each band's energy kept. The round-2 bodies
     # grew modes 2.9 Hz wide (1158, 612, 2740 Hz) that ring after every note (docs/tone_measures.md 11.3); 50 is the
     # loss factor 0.02 the body was initialised with
-    body_q_max: float = 0.0
+    body_q_max: object = 0.0  # one value, or one per band of room.Q_BANDS (a list or "/"-separated string)
+    # the soundboard's ring-up (docs/tone_measures.md 16): a partial reaching the board takes 10-35 ms to build up in the
+    # recordings, the same at every velocity (a linear stage after the strings: a resonant board, Q ~20-50), where the
+    # fitted body FIRs pass it within a few ms. Each octave band of the body (Q_BANDS, 31.25 Hz-8 kHz) is convolved with
+    # a decaying noise kernel of this time constant (ms; one value, or one per band as a list or "/"-separated
+    # string; 0 = that band as it is). The kernel's resonant fine structure is divided out at the strings' partial
+    # frequencies (their per-key levels are fitted already), so it adds the ring-up and leaves the partials' levels
+    body_ring_ms: object = 0.0
     # per-strike variation (docs/tone_measures.md 12.7): at equal key and velocity the piano's notes vary more than the
     # model's, from strike to strike rather than key to key (N11). Each field is the sd of a zero-median normal offset
     # drawn per note (clipped at 2.5 sd), either one value for every key or one per register R2..R6 (a list, or a
@@ -67,6 +74,11 @@ class PianoConfig:
     strike_log_decay: object = 0.0  # log of every decay rate of the note
     strike_decay_tilt: object = 0.0  # log decay rate per octave re 1 kHz: the high partials' early decay
     strike_onset_ms: object = 0.0  # the sound's onset re the MIDI note-on
+    # per strike and per partial (docs/tone_measures.md 16, item 3): at equal key the piano's partials decay differently
+    # from strike to strike, partial by partial, and neither the partial's number, its frequency nor the key predicts
+    # it (15). How the hammer meets the unison's strings and their polarisations changes with every blow:
+    strike_partial_decay: object = 0.0  # sd of the log of each partial's prompt decay rate (its early energy kept)
+    strike_after: object = 0.0  # sd of a random part of each partial's aftersound amplitudes, re their key's value
     # the learned residual: "gru" (ContextNet: MIDI only, per-note corrections fixed at the onset) or "aware"
     # (residual.AwareResidual: sees each note's expected energy per octave group of partials from the physics, lets
     # the sounding notes attend to each other, and gives each note a gain curve per group over time)

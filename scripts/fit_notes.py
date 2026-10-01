@@ -20,6 +20,13 @@ Parameter sets (``--fit``):
   flat-topped as N6's, every band, below f0 too): its level re the early window (the attack's excess over the tone)
   and the energy between the partials (the knock alone, as N6), with the early window as a guard. Step 2b: what is
   left after it is what new attack physics has to explain.
+- ``onset``: the attack's parts (as ``parts``) and the prompt decay (per-key prompt loss and string loss b1, the
+  bridge conductance over frequency) on the first 40 ms re the early window (0-8, 8-20, 20-40 ms), the energy between
+  the partials in the attack, and the early and sustain levels: the onset as the onset measure reads it, and the low
+  partials' early decay (docs/tone_measures.md 16, item 2).
+- ``decay``: the strings' decay (per-key prompt loss, b1 and b3, the loss exponent, the bridge conductance over
+  frequency) on each partial's level (1-12) at 50-150, 150-300 and 300-480 ms, the later re the first, with the early
+  and sustain band levels as a guard.
 - ``parts``: the attack in three parts (``attack_model="parts"``, ``synth.NoiseBank``; docs/tone_measures.md 14): the
   knock noise (per-key spectrum and velocity slope, a rise per band, a decay per register and band), the thump (its
   spectrum, level per register, velocity slope, rise and decays), the precursor (spectrum, level per register,
@@ -63,16 +70,30 @@ KNOCK = ("noise.knock", "noise.knock_vel", "noise.raw_knock_tau", "noise.thump_l
 PARTS = ("noise.knock", "noise.knock_vel", "noise.knock_raw_tau", "noise.knock_raw_rise", "noise.thump_spec",
          "noise.thump_reg", "noise.thump_vel", "noise.thump_raw_tau", "noise.thump_raw_rise", "noise.prec_spec",
          "noise.prec_reg", "noise.prec_vel", "noise.prec_raw_tau", "physics.raw_impulse_db", "physics.raw_impulse_vel")
-FITS = {"velmap": ("physics.cond_vel_map",) + LEVEL + BRIGHT, "nomap": LEVEL + BRIGHT, "knock": KNOCK, "parts": PARTS}
+DECAY = ("physics.raw_prompt", "physics.raw_log_b1", "physics.raw_bridge_g")
+FITS = {"velmap": ("physics.cond_vel_map",) + LEVEL + BRIGHT, "nomap": LEVEL + BRIGHT, "knock": KNOCK, "parts": PARTS,
+        "onset": PARTS + DECAY, "decay": DECAY + ("physics.raw_log_b3", "physics.raw_decay_p")}
 # the attack's excess over the tone (attack re early, every band), the energy between the partials (the knock without
 # the partials' onset), and the early window as a guard: a band-level term alone let the knock noise stand in for high
 # partials the tone lacks (step 2b, first run)
 ATTACK = {"attack re early": (-0.003, 0.033, {"flat": 0.7, "rel": "early", "all_bands": True}),
           "attack gaps": (-0.003, 0.033, {"flat": 0.7, "gaps": True}), "early": NF.WINDOWS["early"]}
-WINDOWS = {"velmap": NF.WINDOWS, "nomap": NF.WINDOWS, "knock": ATTACK,
+# the first 40 ms re the early window, each side at its own N0 (docs/tone_measures.md 16, item 2: the onset measure's
+# windows), the energy between the partials in the attack, and the early and sustain windows' levels (the low partials'
+# early decay)
+ONSET = {"o 0-8 ms": (-0.002, 0.008, {"rel": "early", "all_bands": True}),
+         "o 8-20 ms": (0.008, 0.02, {"rel": "early", "all_bands": True}),
+         "o 20-40 ms": (0.02, 0.04, {"rel": "early"}),
+         "attack gaps": (-0.003, 0.033, {"flat": 0.7, "gaps": True}), **NF.WINDOWS}
+# each partial's level over the first half second, the later windows re the first: the partials' own decays
+# (docs/tone_measures.md 16, item 2: the fundamental fades too fast early, the middle partials hold too long)
+PARTIAL = {"p 50-150 ms": (0.05, 0.15, {"partials": 12}), "p 150-300 ms": (0.15, 0.30, {"partials": 12, "rel": "p 50-150 ms"}),
+           "p 300-480 ms": (0.30, 0.48, {"partials": 12, "rel": "p 50-150 ms"}), **NF.WINDOWS}
+WINDOWS = {"velmap": NF.WINDOWS, "nomap": NF.WINDOWS, "knock": ATTACK, "onset": ONSET, "decay": PARTIAL,
            "parts": {**ATTACK, "early gaps": (0.03, 0.10, {"gaps": True}), "sustain gaps": (0.10, 0.40, {"gaps": True})}}
 PER_KEY = ("physics.gain_db", "physics.raw_vel_slope", "physics.raw_log_tc", "physics.raw_order", "noise.knock",
-           "noise.knock_vel", "noise.raw_knock_tau", "physics.raw_impulse_db")
+           "noise.knock_vel", "noise.raw_knock_tau", "physics.raw_impulse_db", "physics.raw_prompt", "physics.raw_log_b1",
+           "physics.raw_log_b3")
 MAP_VEL = (20, 32, 48, 64, 80, 96, 112)
 
 
@@ -281,6 +302,21 @@ def main():
             L += fmt_table([[r["window"], str(r["band"]), f"{r['strata']} / {r['n']}", f"{r['median']:+.2f}", f"{r['energy']:+.2f}",
                              f"{r['bias']:+.2f}"] for r in gate], ["window", "octave", "strata / cells", "optimum", "energy", "bias"])
             L.append("")
+    pw = [w for w, win in term.windows.items() if NF._is_partials(win)]
+    if pw:
+        K = term.n_partials
+        for g in groups:
+            tb = NF.residual_table(before[g], groups[g], term.windows, key="register")
+            ta = NF.residual_table(after[g], groups[g], term.windows, key="register")
+            L += [f"## Per partial, by register, {g} group (before → after, median dB)", ""]
+            rows = []
+            for v in ("R1", "R2", "R3", "R4", "R5", "R6", "R7"):
+                for w in pw:
+                    cells = [f"{tb[(v, w, f'p{k}')][0]:+.1f} → {ta[(v, w, f'p{k}')][0]:+.1f}"
+                             if (v, w, f"p{k}") in tb and (v, w, f"p{k}") in ta else "" for k in range(1, K + 1)]
+                    if any(cells):
+                        rows.append([v, w] + cells)
+            L += fmt_table(rows, ["register", "window"] + [str(k) for k in range(1, K + 1)]) + [""]
     for key, vals in (("register", ("R1", "R2", "R3", "R4", "R5", "R6", "R7")), ("vel_bin", ("p", "mp-mf", "mf-f", "ff"))):
         for g in groups:
             tb = NF.residual_table(before[g], groups[g], term.windows, key=key)
@@ -307,14 +343,21 @@ def main():
                    ("order x", lambda d: torch.exp(bounded(d["physics.raw_order"], 0.9))),
                    ("gain dB", lambda d: d["physics.gain_db"]),
                    ("velocity slope dB/u", lambda d: 40.0 * torch.exp(bounded(d["physics.raw_vel_slope"], 0.7))))
-        if args.fit in ("knock", "parts"):  # the noise tables are log amplitudes: x 20 / ln 10 for dB
+        if args.fit in ("knock", "parts", "onset"):  # the noise tables are log amplitudes: x 20 / ln 10 for dB
             per_key = tuple((f"knock noise {f} Hz dB", lambda d, f=f: d["noise.knock"][:, near(f)] * 20 / math.log(10))
                             for f in (250, 1000, 4000, 8000)) + (
                 ("knock noise velocity slope dB/u", lambda d: d["noise.knock_vel"] * 20 / math.log(10)),
                 ("knock noise decay x", lambda d: torch.exp(bounded(d["noise.raw_knock_tau"], 1.0))),
                 ("knock impulse dB", lambda d: bounded(d["physics.raw_impulse_db"], 20.0)))
-        if args.fit == "parts":
+        if args.fit in ("parts", "onset"):
             per_key = per_key[:2] + per_key[4:5] + per_key[6:]  # capped above 2.5 kHz; the per-key decay is unused
+        if args.fit == "decay":
+            per_key = (("prompt loss x", lambda d: torch.exp(bounded(d["physics.raw_prompt"], 1.5))),
+                       ("string loss b1 x", lambda d: torch.exp(bounded(d["physics.raw_log_b1"], 1.5))),
+                       ("string loss b3 x", lambda d: torch.exp(bounded(d["physics.raw_log_b3"], 1.5))))
+        if args.fit == "onset":
+            per_key = per_key + (("prompt loss x", lambda d: torch.exp(bounded(d["physics.raw_prompt"], 1.5))),
+                                 ("string loss b1 x", lambda d: torch.exp(bounded(d["physics.raw_log_b1"], 1.5))))
         for name, fn in per_key:
             a, b_ = fn(snap), fn(now)
             d = (b_ / a) if name.endswith("x") else (b_ - a)
@@ -331,8 +374,23 @@ def main():
         if n in names:
             scal.append(f"`{n}` (raw): {show(snap[n])} → {show(params[n].detach())}")
     L += [""] + [f"- {s}" for s in scal]
-    if args.fit == "parts":
+    if args.fit in ("parts", "onset"):
         L += ["", "## The attack's parts", ""] + parts_tables(model, snap, now)
+    if args.fit in ("onset", "decay"):
+        from pianonn.physics import BRIDGE_KNOTS_PER_OCT, F_REF
+        g0 = snap["physics.raw_bridge_g"][cond]
+        g1 = now["physics.raw_bridge_g"][cond]
+        kf = [F_REF * 2 ** (i / BRIDGE_KNOTS_PER_OCT) for i in range(len(g1))]
+        with torch.no_grad():
+            f = torch.tensor(kf, device=dev)[None]
+            c0 = model.physics.bridge_conductance(f, cvec).clone()
+            model.physics.raw_bridge_g.data[cond] = g0
+            cb = model.physics.bridge_conductance(f, cvec).clone()
+            model.physics.raw_bridge_g.data[cond] = g1
+        L += ["", "Bridge conductance over frequency (after / before, every other knot):", ""]
+        every = range(0, len(kf), 2)
+        L += fmt_table([["after / before"] + [f"{float(c0[0, i] / cb[0, i]):.2f}" for i in every]],
+                       ["knot (Hz)"] + [f"{kf[i]:.0f}" for i in every])
     text = "\n".join(L) + "\n"
     with open(os.path.join(args.out, "report.md"), "w", encoding="utf-8") as f:
         f.write(text)

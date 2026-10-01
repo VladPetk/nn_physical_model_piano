@@ -1356,3 +1356,136 @@ the timbre and the attack). One round, one training run at the end, no per-chang
 5. **One training run**, the bench, and A/B on the same R3 notes and phase 4's excerpts.
 
 Later: all years, the residual's read-out and budget, texture. Parked: pitch glide, duplex, felt, multiple contacts.
+
+### 16.1 The first 20 ms: the board's ring-up
+
+**What was built.** `measures.onset_profile`: per octave band (125 Hz-8 kHz) the power envelope (a zero-phase band
+filter, averaged over one period of f0 where a band holds several partials, since they beat at their spacing; else
+over the band's own resolution), minus its background (-80 to -30 ms), re the band's own level at 50-100 ms; read at
+each side's own N0: the level in 0-5, 5-10, 10-20 and 20-40 ms, the arrival (10 % of the band's peak), the rise (10 →
+90 %), the peak, and the brightness over those windows. Checked on synthetic notes (`tests/test_measures.py`): high
+partials 3 ms late read 3.0 ms late in the 2 and 4 kHz bands and the 500 Hz band does not move; a low-partial rise of
+10 → 30 ms moves the 500 Hz arrival by 7.5 ms (7.6 expected); a 2-8 kHz burst lifts the 0-5 ms level by 3-6 dB at 4-8
+kHz and by under 0.3 dB at 500 Hz. Rises shorter than ~1/f0 read as ~1/f0 on both sides (R3: 4-8 ms, R5: 1-2 ms).
+`scripts/onset_profile.py` runs it on the bench's notes (`runs/phase5/onset/`, 1,462 notes of 2018, N0 found on 1,202
+recordings).
+
+**What it found** (model − recording, paired medians; phase 4):
+- **The model's tone switches on; the piano's builds up.** The rise of the 500 Hz and 2-8 kHz bands is 2-4 times too
+  short from R3 up: R3 500 Hz 23 vs 8.5 ms, R4 500 Hz 33.5 vs 8.5, R3 4 kHz 11.8 vs 5.5, R5 8 kHz 7.5 vs 1.5, R7 2 kHz
+  13.5 vs 3.5; the recordings' bands also start 1-3 ms earlier re N0. Waveforms (`waveforms.png`): the recording's
+  amplitude grows over ~10 ms, irregular from cycle to cycle; the model's starts at full size and repeats. This is the
+  "custom attack envelope".
+- **It is a linear stage after the strings.** The recordings' rise does not depend on velocity (R4 2 kHz: 12.5, 11,
+  11, 12.8 ms from p to ff; the contact time changes 2-3 times over that range), so it is not the hammer. A partial
+  through the fitted body reaches half its power within ~1 ms of arrival above 500 Hz (90 % in 4-9 ms); the initial
+  body did the same (built minimum-phase). A resonant board rings up over its modes' time constant: rises of 8-35 ms
+  are Q ~20-50, a soundboard's damping.
+- The 1 kHz band's rise already matches in R2-R4, and the treble's 0.5-1 kHz carries an excess in the first 8 ms
+  (R6 1 kHz +9.6 dB) that is a transient, not a missing ring-up.
+- **Onset timing.** Per strike (pairs of notes of the same key), N0 re MIDI scatters 6.4-6.7 ms in R2-R5 and 4.4-4.8
+  in R6-R7 in the recordings; the model with the jitter off scatters 2.3-3.0 ms (detection): the jitter that matches is
+  5.7-6.1 ms in R2-R5, 3.3-4.3 in R6-R7, not the 3.3 ms of step 3 (review 5 expected less, not more).
+
+**What was built from it.** Config `body_ring_ms` (`room.Room`): each octave band of the body convolved with a
+decaying noise kernel of time constant tau (a delta where 0); the kernel's resonant fine structure is divided out at
+the strings' partial frequencies (`Room.ring_gain`), so the partials keep their fitted levels and gain the ring-up,
+while the noises see a resonant board. Over many frequencies a partial's power through it builds as 1 - exp(-2t/tau)
+(`tests/test_model.py`). Scanned at 4, 8, 16, 32 ms from 500 Hz up on the bench (`runs/phase5/ring_scan/`): 2-8 kHz
+fit best at 16 ms (rise within a few ms of the recordings in R3-R7, from 4-11 ms short), 500 Hz at 32 (R5's excess
+gone, R3's halved), 1 kHz splits by register, and 16 ms at 8 kHz takes away the knock's first milliseconds in R4-R5.
+Kept: 500 Hz 32 ms, 1 kHz 6, 2 and 4 kHz 16, 8 kHz 6 (`0/0/0/0/32/6/16/16/6`); 21 of 29 register × band cells closer
+(`runs/phase5/ring_check/`). The jitter set per register to 5.7/6.1/5.7/6.0/3.3 ms.
+
+### 16.2 The medians on isolated notes
+
+**The onset fit** (`scripts/fit_notes.py --fit onset`, `runs/phase5/onset_fit/`): from phase 4 with the ring-up and
+the jitter, the attack's parts and the prompt decay (per-key prompt loss and b1, the bridge conductance over frequency)
+on the first 40 ms re the early window (0-8, 8-20, 20-40 ms, each side at its own N0), the energy between the partials
+in the attack and the early and sustain levels; 600 steps on the 819 calibration notes. Held out (383 notes): 3.430 →
+3.424 dB. The prompt and string losses came down ~15 % over the keyboard, the treble thump's low decay lengthened to
+44-51 ms (the long low ringing of 10.4 item 1, a first sign); the excess in the first 8 ms at 0.5-1 kHz barely moved
+(R3 500 Hz +3.1 → +2.5 dB, R6 1 kHz +8.5 → +7.9): no noise part takes it, so it is likely the strings' own onset.
+
+**A per-partial term** (`NoteTerm` option `partials`: the levels of the note's own partials 1-12, power within f0/4
+of each, counted where a partial stands 6 dB over its own background; `tests/test_notefit.py`) and **the decay fit**
+(`--fit decay`: per-key prompt loss, b1, b3, the loss exponent, the bridge conductance, on each partial's level at
+50-150, 150-300 and 300-480 ms, the later re the first, the band levels as a guard; `runs/phase5/decay_fit/`, then
+at 3x the rate and a third of the regulariser `decay_fit2/`): held out 3.734 → 3.712 → 3.695 dB. The bridge
+conductance at 87-175 Hz came down by up to a third, the bass and tenor strings' losses by ~10 %. **The fundamental's
+early fade did not move** (R3 partial 1: 1.6 dB more drop than the piano between 50-150 and 150-300 ms, before and
+after), and the reason is not in the strings: rendered alone without the room, partial 1 of MIDI 47/50/55 decays at
+its modal rate (−4.7/−5.0/−5.9 dB/s against −5.5/−5.9/−6.7); with the body alone −11.3/−9.7/−10.3; with the hall alone
+anything from −13 to +11 (each partial falls differently on the reverberant field). The body's low bands ring ~130 ms
+(Q 50 at 125 Hz): after the onset that ringing dies away and reads as a fast early fade.
+
+**The body's Q per band** (config `body_q_max` now one value per band of `room.Q_BANDS`): on the R3 notes
+(`runs/phase5/body_q/`), Q 20 at 62.5-250 Hz takes the fundamental's early decay from 6.8 to 1.3 dB/s too fast (Q 10
+overshoots: +4.2) and brings partials 1-5, 7, 8 within ±1.4 dB at 0.9 s.
+
+### 16.3 Per strike, per partial
+
+Config `strike_partial_decay` (sd of the log of each partial's prompt decay rate, its energy over 0.3 s kept) and
+`strike_after` (sd of a random part of each partial's aftersound amplitudes re the key's, either sign, the mean power
+kept), drawn per strike and partial after the per-note draws (`tests/test_model.py`). In the model the aftersound
+starts 19-22 dB under the prompt in R3 and the prompt decays at 10-14 dB/s, so the slow stage takes over only after
+~2.4 s: within the first second every strike of a key decays alike.
+
+Scanned on the R3 notes (`runs/phase5/spread/`, `scripts/spread_scan.py`: per feature the median over partials 1-12 of
+log2 of the model's spread across notes over the recordings'): the ring-up alone already brings the early-decay spread
+to the piano's (each partial gets its own build-up). The late-decay spread stays at about half the piano's for every
+setting tried (prompt decay sd 0.3-0.6, aftersound 2-5), although the draws reach the renders (one key struck 8
+times: partials' late decays vary 2-6 dB/s with the decay draw, 5-9 dB/s in partials 1-2 with the aftersound draw).
+With 40-56 notes per cell, differences under ~0.3 in the scan are noise. Kept: prompt decay 0.3, aftersound 4 (the
+fluctuation and peak-time spreads closer). Left: the late decay's variety, likely slow beating (0.3-2 Hz, unison
+mistuning) that a 0.5-1 s window reads as a slope.
+
+### 16.4 The sympathetic bank and the pedal halo
+
+Scanned at +0, 10, 20 and 30 dB on the bench (`runs/phase5/bank_scan/`; a temporary config gain): E1 does not move
+in R2-R3 (R3 down − up −2.4 … −2.7 dB, recordings 0.0). Driven by the strings, the bank answers at or next to the
+struck partials, which E1 leaves out; driving it with the attack's noises and the knock impulse too (they reach the
+bridge as the strings do) added only 1.4 dB between the partials in a test (narrow resonances take little of a
+broadband drive). Both were reverted. **The E1 gap is not a missing halo**: with the pedal down the model is about
+right in R3-R4 (R3 −9.6 vs −10.4 dB), and the excess is with the pedal up (R3 −7.2 vs −10.4, R4 −3.9 vs −7.7: 3-4 dB
+too much between the partials at 100-400 ms; step 4 had it already). Not looked into: the attack's tails, phantoms
+falling between partials.
+
+### 16.5 What the music losses say
+
+On 32 test excerpts before training (`runs/phase5/attribution/`, variation off, against phase 4): the ring-up costs
++0.053 in total (fine +0.051, attack +0.034; from 2 kHz up alone +0.016, at 0.5-1 kHz alone +0.028), the note fits
++0.005 ± 0.011 (neutral), Q 20 at 125-250 Hz +0.033 ± 0.015 (band +0.031). The ring-up gives the board a resonant fine
+structure (a random ripple of a few dB over 10-30 Hz) on everything that is not a partial; the piano's board has one
+too, at its own frequencies, and a per-bin log L1 (the fine term) scores a model with its own ripple worse than one
+with none, as the per-strike variation cost distance in 12.7. The Q change costs in the band term, which this does not
+explain. Trained anyway (16.6): the run can re-fit levels and the body around both, and the note measures afterwards
+say whether the gains on notes survive; listening decides between the two.
+
+### 16.6 One run on music
+
+`runs/phase5/train_run/` (`chain.sh`): from `decay_fit2/` with the ring-up, Q 20 at 125-250 Hz (the first start, Q 20
+at 62.5-250 Hz, was stopped at step 25 to attribute its validation: `train_aborted/`), the per-partial spreads (on in
+rendering only), the attack's parts and the strings' decays frozen, otherwise as phase 4: 50 min, 1,347 steps.
+Validation 1.062 at the start, 0.945-0.950 from step 750 (phase 4: 0.928 → 0.923).
+
+**On 96 test excerpts** (`compare.md`, 2 seeds, variation off), phase 5 − phase 4: total +0.027 ± 0.005, band +0.012,
+fine +0.029, attack +0.014, log-mel +0.15 ± 0.03 dB (both seeds agree). Training took back two thirds of what the
+changes cost before it (+0.08); the rest is the price of the ring-up's fine structure and the Q change under these
+terms (16.5).
+
+**On the notes and in music** (variation on; model − recording):
+- **The attack in music is no longer too abrupt in the bass and tenor** (E4, 8 kHz flux contrast; recordings 0.3, 0.5,
+  0.5, 2.4, 4.2, 3.6 dB in R2-R7): phase 4 → phase 5 1.2 → 0.2, 1.1 → 0.9, 2.1 → 1.2, 5.5 → 4.1, 6.4 → 4.5, 9.6 → 7.9;
+  at 4 kHz R2 3.0 → 1.0 (0.6), R4 3.6 → 2.0 (2.1); the 250 Hz contrast now near the piano's (R2 2.0 → 3.5, recording
+  4.1; R5 1.5 → 3.7, 4.9). Phase 4's smooth noise envelopes had not moved E4 (14.3); the board's ring-up does.
+- **The onsets** (`onset/`, scored as 16.1): 19 of 28 register × band cells closer than phase 4; R3 500 Hz rise 15 → 3
+  ms short, R4 500 Hz still 17 short, R3 4 kHz now 7 ms long.
+- **E1 down − up**: R2 −3.7 → −0.5 dB (recording +1.9), R3 −3.1 → −0.8 (0.0).
+- **The R3 notes** (`r3_profile/`): the early-decay spread across notes now the piano's (log2 ratio −0.26 → −0.05), the
+  late decay's still half (−1.06 → −1.15); **the fundamental's fast early fade is back** (−9.7 dB/s re the piano;
+  −1.3 before training with Q 20 at 62.5-250 Hz): the run, or leaving 62.5 Hz at Q 50, undid it; partials 6-8 at 0.9 s
+  3-6 dB loud.
+
+Listening: `samples/phase5/` (8 × 12 s and the demo, the 2 × 20 s excerpts of phase 4, the 12 R3 notes against phase
+5).

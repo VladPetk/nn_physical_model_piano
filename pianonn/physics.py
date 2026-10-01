@@ -408,6 +408,13 @@ class PianoPhysics(nn.Module):
         alpha_after = (b1[..., None] + b3[..., None] * 1e6 * (fn / 1000.0) ** p) * decay_scale
         bridge = (self.prior_prompt_ratio[ki] - 1) * b1 * torch.exp(bounded(self.raw_prompt[ki], 1.5))
         alpha_prompt = alpha_after + (bridge[..., None] * self.bridge_conductance(fn, cond)) * decay_scale
+        keep_partial = None
+        if "strike_partial_decay" in ctx:  # each partial's prompt decay per strike, its energy over the first 0.3 s kept
+            def e_of(al):
+                return -torch.expm1(-2 * al * STRIKE_LEVEL_SECONDS) / (2 * al)
+            a0 = alpha_prompt
+            alpha_prompt = alpha_prompt * torch.exp(ctx["strike_partial_decay"])
+            keep_partial = torch.sqrt(e_of(a0) / e_of(alpha_prompt))
         alpha = torch.cat([alpha_prompt[..., None], alpha_after[..., None].expand(*alpha_after.shape, cfg.n_modes - 1)], -1)
 
         # excitation: bridge force = gain(v) * hammer pulse spectrum * signed strike-position comb * colouration
@@ -438,9 +445,16 @@ class PianoPhysics(nn.Module):
             e_var, e_0 = energy(hammer, alpha_prompt), energy(h0, alpha_prompt * torch.exp(-s_decay))
             gain = gain * torch.where(e_var > 0, torch.sqrt(e_0 / e_var.clamp(min=1e-30)), torch.ones_like(e_var))
         base = gain[..., None] * hammer * comb * torch.exp(log_shape)
+        if keep_partial is not None:
+            base = base * keep_partial
         soft_after = torch.exp(soft * (self.soft_log_after_prior[ki] + bounded(self.soft_log_after, 1.0)))
         after = torch.exp(self.prior_log_after[ki][..., None] + bounded(self.raw_after[ki], 1.5)) * soft_after[..., None]
-        amp = base[..., None] * torch.cat([torch.ones_like(after[..., :1]), after], -1)[..., None, :]
+        after = after[..., None, :]  # [B, K, 1, M - 1]
+        if "strike_after" in ctx:
+            # the strings never meet the hammer alike: each partial's aftersound gets a random part on top of its key's
+            # (either sign, so a beat may start at its minimum): a factor (1 + s z) / sqrt(1 + s^2) [B, K, P, M - 1]
+            after = after * ctx["strike_after"]
+        amp = base[..., None] * torch.cat([torch.ones_like(base[..., None]), after.expand(*base.shape, after.shape[-1])], -1)
 
         n_active = self.n_strings[ki].clamp(min=2)  # monochords still have two polarisations
         mode_ok = torch.arange(cfg.n_modes, device=ki.device) < n_active[..., None]

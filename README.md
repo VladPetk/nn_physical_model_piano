@@ -262,7 +262,14 @@ In short, on one year (RTX 3090):
   irregular), but the notes are too much alike (the spread of the partials' late decays across notes 3–8 dB/s against
   6–24 in the recordings), the fundamental fades too fast early (−15 vs −6 dB/s) and the middle partials peak 15–35 ms
   too soon. A/B files in [`samples/r3_notes/`](samples/r3_notes/).
-- **Next: phase 5** (below; `docs/tone_measures.md` 16).
+- **Phase 5** (`docs/tone_measures.md` 16): an onset measure found the model's notes switch on where the piano's build up
+  over 10-35 ms, the same at every velocity: the soundboard's ring-up, now in the body (config `body_ring_ms`). After
+  one run the attack in music is no longer too abrupt in the bass and tenor (E4) and the onsets are closer in most
+  registers; the distances on test excerpts read +0.027 against phase 4, which per-bin terms charge for any fine
+  structure not at the recording's own frequencies. Also: the onset jitter re-measured (~6 ms), per-partial strike
+  variation, the decays fitted on isolated notes with a per-partial term; the fundamental's early fade is the body's
+  low-band ringing (fixed on notes, back after training); the pedal-halo gap is an excess with the pedal up. Checkpoint
+  `runs/phase5/train_run/train/last.pt`; listening in [`samples/phase5/`](samples/phase5/).
 
 The prior is calibrated against the literature (the KTH *Five Lectures on the Acoustics of the Piano*,
 arXiv and Zenodo papers) and against 260 recorded notes of a Steinway B, analysed with the same code as the
@@ -298,15 +305,21 @@ Each step is checked on the note bench with re-renders; one training run comes a
 - [ ] 5. All years: mine isolated notes per year (B, stretch, velocity curve, damper delay, T60); the per-key stretch
       offset is still shared across conditions.
 Phase 5 (`docs/tone_measures.md` 16), one round with one training run at the end:
-- [ ] 1. The first 20 ms: an onset measure (band onsets at a few ms, rise and arrival order per band, the brightness
-      over the first 30 ms, waveforms), on the R3 notes, the bench registers and music onsets (E4's abrupt attack); the
-      onset jitter re-set from it (review 5, 3.1).
-- [ ] 2. The medians on isolated notes: the tone's build-up (middle partials peak 15-35 ms early) and the fundamental's
-      early decay (-15 vs -6 dB/s), with a per-partial track term in the note fit, plus what item 1 finds.
-- [ ] 3. Per-strike, per-partial variation of the unison's excitation (the notes are too much alike, 15), its spread set
-      by a variance match.
-- [ ] 4. The sympathetic bank's level from E1; the quiet stretches' deficit split by pedal state.
-- [ ] 5. One training run, the bench, A/B on the same notes and excerpts.
+- [x] 1. The first 20 ms (`measures.onset_profile`, `scripts/onset_profile.py`, 16.1): the model's tone switches on
+      where the piano's builds up over 8-35 ms, the same at every velocity: the board's ring-up, missing from the fitted
+      body. Built: config `body_ring_ms` (a decaying noise kernel per octave band of the body, its fine structure divided
+      out at the partials). The onset jitter matches at 5.7-6.1 ms per strike in R2-R5, not 3.3.
+- [x] 2. The medians on isolated notes (16.2): `--fit onset` and `--fit decay` (a per-partial note term); small held-out
+      gains (3.734 → 3.695 dB). The fundamental's fast early fade is the body's low-band ringing, not the strings:
+      config `body_q_max` per band, Q 20 at 125-250 Hz.
+- [x] 3. Per strike and partial (16.3): config `strike_partial_decay`, `strike_after`; the late decay still varies about
+      half as much as the piano's.
+- [x] 4. The sympathetic bank (16.4): its level does not move the pedal halo (E1), and the E1 gap is an excess with the
+      pedal up, not a missing halo; nothing changed.
+- [x] 5. One training run (16.6): +0.027 ± 0.005 on 96 test excerpts against phase 4 (the ring-up's fine structure and
+      the Q change under the per-bin terms, 16.5), but the attack in music is no longer too abrupt in the bass and tenor
+      (E4 8 kHz R2-R4 1.2/1.1/2.1 → 0.2/0.9/1.2 dB, recordings 0.3/0.5/0.5) and closer in the treble; the fundamental's
+      early fade came back in training. Listening in [`samples/phase5/`](samples/phase5/).
 Then: all years (5 above), the residual's read-out and budget, texture.
 
 - [ ] Deferred on measurement: pitch glide (~1.5–3 cents at *ff*), duplex strings. Later: felt model at note-on,

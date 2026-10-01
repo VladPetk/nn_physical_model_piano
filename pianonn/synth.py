@@ -467,14 +467,16 @@ R3_NOISE_BASE = -12.0
 # per-strike variation (config ``strike_*``, docs/tone_measures.md 12.7): the dimensions, the MIDI pitches of their
 # per-register knots (R2..R6 centres) and the clip of the normal draws
 STRIKE_DIMS = ("level_db", "log_fc", "knock_db", "log_decay", "decay_tilt", "onset_ms")
+# drawn per partial (and per aftersound mode), after the per-note dimensions, so that those keep their draws
+STRIKE_PARTIAL_DIMS = ("partial_decay", "after")
 STRIKE_KNOTS = (37.5, 53.0, 65.5, 77.5, 86.0)
 STRIKE_CLIP = 2.5
 
 
-def strike_sd_table(cfg):
+def strike_sd_table(cfg, dims=STRIKE_DIMS):
     """``[dims, 88]``: the sd of each per-strike dimension per key, or None when every one is off."""
     rows = []
-    for d in STRIKE_DIMS:
+    for d in dims:
         v = getattr(cfg, "strike_" + d)
         if isinstance(v, str):
             v = [float(x) for x in v.split("/") if x.strip()]
@@ -511,6 +513,11 @@ class NeuralPhysicalPiano(nn.Module):
         sd = strike_sd_table(cfg)
         self.strike_on = sd is not None
         self.register_buffer("strike_sd", sd if sd is not None else torch.zeros(len(STRIKE_DIMS), N_KEYS), persistent=False)
+        psd = strike_sd_table(cfg, STRIKE_PARTIAL_DIMS)
+        self.strike_partial_on = psd is not None
+        self.strike_on = self.strike_on or self.strike_partial_on
+        self.register_buffer("strike_partial_sd", psd if psd is not None else torch.zeros(len(STRIKE_PARTIAL_DIMS), N_KEYS),
+                             persistent=False)
 
     def n_frames(self, n_samples: int) -> int:
         return n_samples // self.cfg.hop + 2
@@ -522,7 +529,16 @@ class NeuralPhysicalPiano(nn.Module):
             return None
         z = torch.randn(*ki.shape, len(STRIKE_DIMS), generator=generator, device=ki.device)
         x = z.clamp(-STRIKE_CLIP, STRIKE_CLIP) * self.strike_sd.T[ki]
-        return {d: x[..., i] for i, d in enumerate(STRIKE_DIMS)}
+        out = {d: x[..., i] for i, d in enumerate(STRIKE_DIMS)}
+        if self.strike_partial_on:  # [B, N, P] and [B, N, P, M - 1]
+            P, M = self.cfg.n_partials, self.cfg.n_modes
+            zd = torch.randn(*ki.shape, P, generator=generator, device=ki.device).clamp(-STRIKE_CLIP, STRIKE_CLIP)
+            za = torch.randn(*ki.shape, P, M - 1, generator=generator, device=ki.device).clamp(-STRIKE_CLIP, STRIKE_CLIP)
+            sd = self.strike_partial_sd.T[ki]
+            out["partial_decay"] = zd * sd[..., 0, None]
+            sa = sd[..., 1, None, None]  # the random part's sd re the key's aftersound; the mean power is kept
+            out["after"] = (1 + za * sa) / torch.sqrt(1 + sa ** 2)
+        return out
 
     @staticmethod
     def with_strike(ctx, var, zero):
@@ -536,6 +552,9 @@ class NeuralPhysicalPiano(nn.Module):
         out["impulse_db"] = var["knock_db"]  # the level reaches the impulse through gain_db
         for d in ("log_fc", "log_decay", "decay_tilt"):  # level-neutral: PianoPhysics.modes keeps the early energy
             out["strike_" + d] = var[d]
+        for d in STRIKE_PARTIAL_DIMS:
+            if d in var:
+                out["strike_" + d] = var[d]
         return out
 
     def key_rolls(self, ki, onset, release, u, mask, F):
@@ -786,6 +805,8 @@ class NeuralPhysicalPiano(nn.Module):
         if var is not None:
             onset = onset + var["onset_ms"] / 1000
         modes = self.physics.modes(ki, u, soft_on, cond, note_ctx, phantoms=cfg.n_phantoms > 0)
+        if cfg.use_room and self.room.ring_on:  # the board's ring-up keeps the partials' levels (config body_ring_ms)
+            modes["amp"] = modes["amp"] * self.room.ring_gain(modes["freq"][..., :1]).rsqrt()
         m = mask[..., None]
         modes["amp"] = modes["amp"] * m[..., None]
         if "ph_amp" in modes:

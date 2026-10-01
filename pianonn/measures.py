@@ -966,6 +966,74 @@ def partial_profile(x, sr, t_on, freqs, t_end, win=0.04, hop=0.005, bg=(-0.45, -
     return out
 
 
+ONSET_WINDOWS = ((0.0, 0.005), (0.005, 0.01), (0.01, 0.02), (0.02, 0.04))
+
+
+def onset_profile(x, sr, t_on, f0, bands=KNOCK_BANDS, span=(-0.02, 0.12), ref=(0.05, 0.1), bg=(-0.08, -0.03),
+                  smooth=None, step=0.0005, windows=ONSET_WINDOWS):
+    """The first tens of ms of one note, per octave band (docs/tone_measures.md 16, item 1).
+
+    Each band's power (``band_envelope``: a zero-phase band filter, summed over channels) minus its background (the
+    mean over ``bg``, s re ``t_on``), divided by the band's own mean over ``ref``: the band's envelope re its level
+    once the note has settled, so a band that arrives late or overshoots shows whatever the spectral balance. The
+    envelope is averaged over ``smooth`` s (default per band: one period of f0 where the band holds two partials or
+    more, since they beat at their spacing, else the band's own resolution 1 / (0.7 c); at least 1 ms) and sampled
+    every ``step`` s over ``span``. Returns ``t`` [F] (s re ``t_on``), ``P`` [F, B] (linear, re ``ref``),
+    ``ref_db`` [B] (each band's ``ref`` level re the note's total at 0.2-8 kHz in ``ref``, dB) and per band [B]:
+    - ``peak`` (dB re ``ref``) and ``t_peak`` (s) over -5..60 ms: the attack's prominence over the settled note;
+    - ``arrival`` (s): where the envelope first reaches 10 % of that peak, from -10 ms;
+    - ``rise`` (s): from 10 % to 90 % of the peak;
+    - ``win`` [W, B]: the mean level (dB re ``ref``) in each window of ``windows`` (s re ``t_on``), unsmoothed.
+    A band whose peak is not 6 dB over its background, or whose ``ref`` level is not, reads NaN."""
+    t_lo = min(span[0], bg[0]) - 0.03
+    t_hi = max(span[1], ref[1]) + 0.03
+    a = int(round((t_on + t_lo) * sr))
+    seg = x[max(a, 0): max(a, 0) + int(round((t_hi - t_lo) * sr))]
+    t_seg = (np.arange(len(seg)) + max(a, 0)) / sr - t_on
+    t = np.arange(span[0], span[1] + step / 2, step)
+    B = len(bands)
+    out = {"t": t, "P": np.full((len(t), B), np.nan), "ref_db": np.full(B, np.nan)}
+    for key in ("peak", "t_peak", "arrival", "rise"):
+        out[key] = np.full(B, np.nan)
+    out["win"] = np.full((len(windows), B), np.nan)
+    if len(seg) < sr * 0.05:
+        return out
+
+    def mean_in(e, lo, hi):
+        m = (t_seg >= lo) & (t_seg < hi)
+        return float(e[m].mean()) if m.any() else float("nan")
+
+    tot = mean_in(band_envelope(seg, sr, 200.0, min(8000.0, 0.45 * sr), 1.0 / sr), *ref)
+    for j, c in enumerate(bands):
+        lo, hi = c / math.sqrt(2), min(c * math.sqrt(2), 0.45 * sr)
+        if lo >= hi:
+            continue
+        sm = smooth if smooth is not None else max(0.001, 1.0 / f0 if hi > 2 * f0 else 1.0 / (0.7 * c))
+        raw = band_envelope(seg, sr, lo, hi, 1.0 / sr)
+        e = band_envelope(seg, sr, lo, hi, sm)
+        b, r = mean_in(raw, *bg), mean_in(raw, *ref)
+        if not r > 4 * b or not r > 0:
+            continue
+        out["ref_db"][j] = _db(r / tot) if tot > 0 else float("nan")
+        P = (np.interp(t, t_seg, e) - b) / (r - b)
+        out["P"][:, j] = P
+        for w, (w0, w1) in enumerate(windows):
+            v = (mean_in(raw, w0, w1) - b) / (r - b)
+            out["win"][w, j] = _db(v) if v > 0 else float("nan")
+        pk = (t >= -0.005) & (t <= 0.06)
+        i = np.argmax(np.where(pk, P, -np.inf))
+        if P[i] * (r - b) < 3 * b:  # the peak not 6 dB over the background
+            continue
+        out["peak"][j], out["t_peak"][j] = _db(P[i]), t[i]
+        k0 = np.nonzero(t >= -0.01)[0][0]
+        up10 = np.nonzero(P[k0: i + 1] >= 0.1 * P[i])[0]
+        up90 = np.nonzero(P[k0: i + 1] >= 0.9 * P[i])[0]
+        if len(up10) and len(up90):
+            out["arrival"][j] = t[k0 + up10[0]]
+            out["rise"][j] = t[k0 + up90[0]] - t[k0 + up10[0]]
+    return out
+
+
 def non_tonal(x, sr, t_on, partials, windows=((-0.003, 0.04), (0.1, 0.4), (0.5, 0.95)), bands=(125,) + OCTAVES):
     """The energy away from the note's partials (bins farther than max(70 Hz, f0 / 4) from every partial, as N6), per
     octave band and window (s re ``t_on``), in dB re the note's whole energy in the same window: the knock, the

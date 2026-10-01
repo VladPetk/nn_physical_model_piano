@@ -130,6 +130,21 @@ def octave_masks(n, sr, bands):
     return torch.stack(masks)
 
 
+def band_values(v, name):
+    """A config value per band of ``Q_BANDS``: one number for all, or one per band (a list or "/"-separated string)."""
+    if isinstance(v, str):
+        v = [float(x) for x in v.split("/") if x.strip()]
+    v = [float(v)] * len(Q_BANDS) if isinstance(v, (int, float)) else [float(x) for x in v]
+    assert len(v) == len(Q_BANDS), f"{name}: one value or one per band of {Q_BANDS}"
+    return torch.tensor(v, dtype=torch.float64)
+
+
+def ring_taus(cfg):
+    """The ring-up time constants (s) per band of ``Q_BANDS`` from config ``body_ring_ms``, or None when off."""
+    t = band_values(cfg.body_ring_ms, "body_ring_ms") / 1000
+    return t if bool((t > 0).any()) else None
+
+
 def band_carriers(sr, seconds, seed=1):
     """White noise split into octave bands (raised-cosine crossovers, bands sum to the original)."""
     g = torch.Generator().manual_seed(seed)
@@ -178,10 +193,54 @@ class Room(nn.Module):
         # mains hum: sinusoids at MAINS_HZ x (1, 2, 3), RMS dBFS per channel (-200 = none until measured)
         self.register_buffer("hum_ref_db", torch.full((C, ch, HUM_LINES), -200.0))
         self.raw_hum = nn.Parameter(torch.zeros(C, ch, HUM_LINES))
-        if cfg.body_q_max > 0:
+        self._ring_setup(cfg)
+        q = band_values(cfg.body_q_max, "body_q_max")
+        self.q_on = bool((q > 0).any())
+        if self.q_on:
             Lb = self.body.shape[-1]
             self.register_buffer("q_masks", octave_masks(2 * Lb, sr, Q_BANDS).float(), persistent=False)
-            self.register_buffer("q_sigma", math.pi * torch.tensor(Q_BANDS) / cfg.body_q_max, persistent=False)
+            # a band left at 0 is not capped
+            sigma = torch.where(q > 0, math.pi * torch.tensor(Q_BANDS, dtype=torch.float64) / q.clamp(min=1e-9), torch.zeros_like(q))
+            self.register_buffer("q_sigma", sigma.float(), persistent=False)
+
+    def _ring_setup(self, cfg):
+        """Buffers of the board's ring-up (config ``body_ring_ms``): ``ring_kernel [ch, Lk]`` and ``ring_power [G]``,
+        the kernels' power over frequency (mean over the channels, on a fine grid of ``ring_df`` Hz), or None."""
+        tau = ring_taus(cfg)
+        self.ring_on = tau is not None
+        if not self.ring_on:
+            return
+        sr, ch = cfg.sample_rate, cfg.channels
+        Lk = int(round(min(0.25, 6 * float(tau.max())) * sr))
+        n_k = 4 * Lk  # the band split is zero-phase: compute long, keep t >= 0 (its pre-ringing is ~1 / bandwidth)
+        t = torch.arange(Lk, dtype=torch.float64) / sr
+        masks = octave_masks(n_k, sr, Q_BANDS).double()  # [bands, n_k // 2 + 1]
+        kernels = []
+        for c in range(ch):
+            g = torch.Generator().manual_seed(4321 + c)
+            noise = torch.randn(Lk, generator=g, dtype=torch.float64)
+            K = torch.ones(n_k // 2 + 1, dtype=torch.complex128)  # a delta, exact where no band rings
+            for b, tb in enumerate(tau.tolist()):
+                if tb <= 0:
+                    continue
+                Nb = torch.fft.rfft(noise * torch.exp(-t / tb), n_k)
+                band = masks[b] > 0.5
+                K = K + masks[b] * (Nb / Nb[band].abs().pow(2).mean().sqrt() - 1)  # unit mean power in its band
+            kernels.append(torch.fft.irfft(K, n_k)[:Lk])
+        k = torch.stack(kernels)
+        n = 1 << 19
+        self.ring_df = sr / n
+        power = (torch.fft.rfft(k, n).abs() ** 2).mean(0)
+        self.register_buffer("ring_kernel", k.float(), persistent=False)
+        self.register_buffer("ring_power", power.float(), persistent=False)
+
+    def ring_gain(self, freq):
+        """The kernels' power at ``freq`` (Hz, any shape; linear interpolation on the fine grid): what the ring-up adds
+        to a partial at that frequency, to be divided out."""
+        x = (freq / self.ring_df).clamp(0, self.ring_power.shape[0] - 2)
+        i = x.floor().long()
+        w = x - i
+        return self.ring_power[i] * (1 - w) + self.ring_power[i + 1] * w
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         old = prefix + "floor_db"  # checkpoints before round 2: an unbounded learned floor
@@ -227,8 +286,10 @@ class Room(nn.Module):
         hall = self._hall(cond)
         hall = torch.cat([hall[..., :1] + 1.0, hall[..., 1:]], -1)  # + delta: the direct sound
         body = self.body[cond]
-        if self.cfg.body_q_max > 0:
+        if self.q_on:
             body = self.limit_q(body)
+        if self.ring_on:  # the board's ring-up: each channel's body through its own kernel
+            body = fft_convolve(body, self.ring_kernel[None].expand(body.shape[0], -1, -1))[..., : body.shape[-1]]
         body = body * torch.pow(10.0, self.mic_gain_db[cond] / 20)[..., None]
         return fft_convolve(torch.cat([body, body.new_zeros(*body.shape[:2], hall.shape[-1])], -1), hall)
 
