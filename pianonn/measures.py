@@ -899,6 +899,91 @@ def room_measures(x, sr, t_stop, t_end, floor=None, bands=(125,) + OCTAVES, smoo
     return out
 
 
+def partial_profile(x, sr, t_on, freqs, t_end, win=0.04, hop=0.005, bg=(-0.45, -0.1), min_snr_db=6.0):
+    """T1/T2 on one note: each partial's level over the note and what it does (docs/tone_measures.md 15).
+
+    ``freqs[K]`` (Hz, the note's own partials), tracked with ``partial_tracks`` (a ``win`` s Hann window, so level
+    changes up to ~12 Hz are followed) from 30 ms before ``t_on`` to ``t_on + t_end`` (s re the clip). A point counts
+    where it stands ``min_snr_db`` over the partial's level in the background window ``bg`` (s re ``t_on``); a value
+    needs 60 % of its window counted, else NaN. Returns ``t`` [F] (s re ``t_on``), ``L`` [F, K] dB, ``bg`` [K] dB and,
+    per partial [K]:
+    - ``peak`` (dB) and ``t_peak`` (s) over -10..150 ms;
+    - ``early`` and ``late``: the decay (dB/s, a line fitted to the counted points) over 50-350 ms and 500 ms to
+      ``t_end``: a two-stage decay shows as ``early`` steeper than ``late``;
+    - ``fluct`` (dB rms) and ``beat`` (Hz): the track from 80 ms to ``t_end`` minus a cubic in time (which takes the
+      smooth decay, the two-stage knee included), its rms and its strongest periodicity between 1.2 and 12 Hz
+      (slower beating than about one cycle in the window reads as part of the decay); ``periodic``: the share of the
+      residual's power within 0.6 Hz of that rate (one steady beat: near 1; irregular fluctuation: low).
+    The decays are fitted jointly with a sinusoid at ``beat`` where the window holds a full cycle: a unison's strings
+    start in phase, so a line alone reads the same part of the beat's cycle every time. A beat slower than one cycle
+    per window (3.3 Hz for ``early``) still biases it."""
+    t, L = partial_tracks(x, sr, t_on - 0.03, t_on + t_end, freqs, win, hop)
+    t = t - t_on
+    _, Lb = partial_tracks(x, sr, t_on + bg[0], t_on + bg[1], freqs, win, 0.02)
+    bgl = 10 * np.log10(np.mean(10 ** (Lb / 10), 0) + 1e-30) if len(Lb) else np.full(len(freqs), -300.0)
+    valid = L >= bgl[None] + min_snr_db
+    K = len(freqs)
+    out = {"t": t, "L": L, "bg": bgl}
+    for key in ("peak", "t_peak", "early", "late", "fluct", "beat", "periodic"):
+        out[key] = np.full(K, np.nan)
+
+    def fit(k, a, b):
+        """The decay over [a, b]: a line, jointly with a sinusoid at the partial's beat rate when the window holds a
+        full cycle of a beat that shows (a line alone reads a 6 Hz beat of +-2.3 dB on -10 dB/s as -18)."""
+        sel = (t >= a) & (t <= b)
+        ok = sel & valid[:, k]
+        if sel.sum() < 4 or ok.sum() < 0.6 * sel.sum():
+            return np.nan
+        tt = t[ok]
+        X = [np.ones_like(tt), tt]
+        f = out["beat"][k]
+        if np.isfinite(f) and out["fluct"][k] > 0.3 and f * (b - a) >= 1.0:
+            X += [np.sin(2 * np.pi * f * tt), np.cos(2 * np.pi * f * tt)]
+        coef = np.linalg.lstsq(np.stack(X, 1), L[ok, k], rcond=None)[0]
+        return float(coef[1])
+
+    for k in range(K):
+        pk = (t >= -0.01) & (t <= 0.15)
+        if pk.any() and valid[pk, k].any():
+            i = np.argmax(np.where(valid[pk, k], L[pk, k], -np.inf))
+            out["peak"][k], out["t_peak"][k] = L[pk, k][i], t[pk][i]
+        sel = (t >= 0.08) & (t <= t_end - win / 2)
+        if sel.sum() >= 40 and valid[sel, k].mean() >= 0.9:
+            tt, ll = t[sel], L[sel, k]
+            r = ll - np.polyval(np.polyfit(tt, ll, 3), tt)
+            out["fluct"][k] = float(np.sqrt(np.mean(r ** 2)))
+            n_fft = 1 << int(math.ceil(math.log2(len(r) * 16)))
+            S = np.abs(np.fft.rfft(r * np.hanning(len(r)), n_fft))
+            hz = np.fft.rfftfreq(n_fft, hop)
+            band = (hz >= 1.2) & (hz <= 12.0)
+            j = np.argmax(np.where(band, S, -1.0))
+            out["beat"][k] = float(hz[j])
+            near = np.abs(hz - hz[j]) <= 0.6  # the main lobe of the Hann window over the residual (~0.8 s): +-0.5 Hz
+            out["periodic"][k] = float((S[near] ** 2).sum() / max((S[hz <= 25.0] ** 2).sum(), 1e-30))
+        out["early"][k] = fit(k, 0.05, 0.35)
+        if t_end >= 0.75:
+            out["late"][k] = fit(k, 0.5, t_end - win / 2)
+    return out
+
+
+def non_tonal(x, sr, t_on, partials, windows=((-0.003, 0.04), (0.1, 0.4), (0.5, 0.95)), bands=(125,) + OCTAVES):
+    """The energy away from the note's partials (bins farther than max(70 Hz, f0 / 4) from every partial, as N6), per
+    octave band and window (s re ``t_on``), in dB re the note's whole energy in the same window: the knock, the
+    noise and (pedal down) the halo against the tone. ``{(window, band): dB}``; NaN where a band keeps no bins."""
+    out = {}
+    f0 = float(partials[0])
+    for a, b in windows:
+        seg = _segment(x, sr, t_on + a, t_on + b)
+        n_fft = 1 << int(math.ceil(math.log2(max(len(seg), 2) * 2)))
+        P, hz = _power(seg, n_fft), np.fft.rfftfreq(n_fft, 1 / sr)
+        away = ~near_partials(hz, partials, max(70.0, 0.25 * f0))
+        tot = P[(hz >= 50) & (hz < 0.45 * sr)].sum()
+        for c in bands:
+            m = band_mask(hz, c / math.sqrt(2), c * math.sqrt(2)) * away
+            out[((a, b), c)] = 10 * math.log10(max((P * m).sum(), 1e-30) / max(tot, 1e-30)) if m.sum() > 2 else float("nan")
+    return out
+
+
 def channel_measures(x, sr, t_on, bands=OCTAVES, max_lag=0.003):
     """P4 image of one note's clip (onset at ``t_on`` s), per octave band: ``P4 iacc early/late`` the largest
     normalised cross-correlation of the two channels within ``max_lag`` s, over 0-30 ms (direct sound and first

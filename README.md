@@ -257,6 +257,11 @@ In short, on one year (RTX 3090):
   and R6 (R6 N4 +9.5 → +3.7 dB), but in music the attack is as abrupt as before (E4), and the bank sits 32–45 dB under
   the strings, so the pedal halo gap is unchanged. Checkpoint `runs/phase4/train_run/train/last.pt`; listening in
   [`samples/phase4/`](samples/phase4/).
+- **Isolated tenor notes, partial by partial** (`docs/tone_measures.md` 15, `scripts/note_profile.py`): on 56 isolated
+  R3 notes the average model note is close (partial levels within ±2 dB at 50–900 ms, beating as strong, fast and
+  irregular), but the notes are too much alike (the spread of the partials' late decays across notes 3–8 dB/s against
+  6–24 in the recordings), the fundamental fades too fast early (−15 vs −6 dB/s) and the middle partials peak 15–35 ms
+  too soon. A/B files in [`samples/r3_notes/`](samples/r3_notes/).
 - **Open:** the physics above, then texture (a GAN branch had no measurable effect in 500 steps) and listening.
 
 The prior is calibrated against the literature (the KTH *Five Lectures on the Acoustics of the Piano*,

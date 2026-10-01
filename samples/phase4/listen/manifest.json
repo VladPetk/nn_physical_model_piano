@@ -2,7 +2,7 @@
  "sample_rate": 24000,
  "seconds": 12.0,
  "split": "test",
- "format": "flac",
+ "format": "wav",
  "order": [
   "recording",
   "step4",

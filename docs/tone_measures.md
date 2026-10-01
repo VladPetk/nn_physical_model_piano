@@ -4,7 +4,7 @@ A design for round 3: derive what we measure, and what we train on, from what a 
 0–8 are the design; sections 9–11 report what has been built, how each measure was validated and what it found
 (status 2026-09-30). The physics it points to is in 10.4, revised in 11.4; section 12 is phase 3: its order and its
 steps so far (per-key B, the strike comb's sign; the body's Q and the hall); section 13 the learned residual and its ceiling; section 14 phase 4 (the attack in three parts, a gain per piece, the
-whole-excerpt level term, a cheap sympathetic bank).
+whole-excerpt level term, a cheap sympathetic bank); section 15 isolated tenor notes partial by partial.
 
 ## 0. Why
 
@@ -1274,3 +1274,54 @@ at the edge of the resolution.
 
 Listening: `listen/` (8 × 12 s, soft to loud, and the demo) and `listen_long/` (2 × 20 s), step 4 against phase 4,
 the per-strike variation on.
+
+## 15. Isolated tenor notes, partial by partial (2026-10-01)
+
+The owner, listening to `samples/phase4/listen_long/0_ab.wav`: the lower notes played slowly under a texture (D3–B2,
+MIDI 47–50, velocity 64–74, pedal down) sound like "a complex synth wave with a custom attack envelope"; the decay,
+the timbre and the attack differ. Notes inside music overlap others and the pedal, so the measurement is on isolated
+notes of the same register (R3) and the excerpt stays the listening check.
+
+**What was built.** `measures.partial_profile` (T1/T2 of the design): each partial's level over the note (a 40 ms
+Hann window every 5 ms at the partial's own frequency, so level changes up to ~12 Hz are followed), and per partial
+the peak time, the decay over 50–350 ms and over 0.5–1 s (fitted jointly with a sinusoid at the partial's beat rate
+where the window holds a full cycle: the strings of a unison start in phase, and a line alone read a 6 Hz beat of
+±2.3 dB on −10 dB/s as −18), the fluctuation around a cubic in time (dB rms), its strongest rate (1.2–12 Hz) and its
+periodicity (the share of the fluctuation at that one rate). `measures.non_tonal`: the energy away from the partials
+per octave band, re the note's energy in the same window. Both are checked on synthetic notes with known decays,
+knee, beat and irregular fluctuation (`tests/test_measures.py`). `scripts/note_profile.py` finds the notes, renders
+them with the model in context and writes the report, figures and A/B files.
+
+**The notes** (`runs/phase4/r3_profile/`): 2018, MIDI 47–59, velocity ≥ 50, no other onset 0.3 s before or 1.0 s
+after: 56 (49 from training pieces; isolated notes are rare in this repertoire: 4 at mf–f stay clear for 1.6 s).
+42 sound to 1 s (key held or pedal down); 14 are released earlier and count up to their release. Model: phase 4,
+per-strike variation on. Medians over notes; n per cell 10–56.
+
+**What it found** (model − recording, paired medians unless noted):
+- **The average note is close.** Each partial's level re the note's at 50, 300 and 900 ms is within ±2 dB for most
+  of partials 1–12 (`tracks.png`); the beating is as strong (fluctuation 0.5–0.8 dB rms on both sides), as fast
+  (2–3 Hz) and as (ir)regular (periodicity 0.3–0.4 on both), in as many partials (20–50 %).
+- **The notes are too much alike.** Across notes, the spread (IQR) of each partial's decay after 0.5 s is 6–24 dB/s in
+  the recordings and 3–8 dB/s in the model, for 11 of 12 partials; the spread of the two-stage contrast is 1.5–3 times
+  smaller in partials 7–12, and of the fluctuation in partials 10–12 4–5 times smaller. Every model note of the
+  register decays its partials in much the same way; the piano's do not. The per-strike variation scales all of a
+  note's decays together (`strike_log_decay`, `strike_decay_tilt`), and a partial's decay in the model is a smooth
+  function of its number. A candidate, not checked: in the piano a partial's decay depends on the bridge's
+  admittance at its frequency, which is peaky (the board's modes), so each note's partials land on different peaks;
+  the recordings' decays plotted against absolute frequency across notes would show it.
+- **The fundamental fades too fast:** partial 1 decays at −14.6 against −6.4 dB/s over 50–350 ms (paired −8.4, n
+  30) and ends ~4 dB low at 0.9 s; partial 6 too slowly after 0.5 s (paired +9.4, n 15; +5.7 dB at 0.9 s).
+- **The middle partials peak too early:** partials 2–4 and 8 reach their maximum 15–35 ms sooner than in the
+  recordings (the piano's 3rd and 4th peak at 68 and 105 ms, the model's at 40 and 25); the spread is large (IQR
+  40–110 ms). Together with N4's faster rise (R3 −10 ms) this is the attack building up too fast.
+- **Between the partials:** in the attack window 2.7 dB weak at 500 Hz; afterwards 1–2.7 dB too much at 125–500 Hz
+  and 2–4 kHz.
+
+**What this does not see.** The first ~20 ms (the 40 ms window smears the onset; N4 rise and N6 cover it coarsely);
+beats slower than ~1.2 Hz and the knee beyond 1 s (the notes are clear for only 1 s); the stereo image per partial
+(each partial radiates from a different part of the board; `channel_measures` is per band); and everything the
+context adds (pedal halo, overlapping notes), which these notes exclude by design. The recordings' spread includes
+measurement noise (earlier notes ringing under the pedal, the room), but the model's renders carry the same contexts.
+
+Listening: `samples/r3_notes/` (12 of the notes sounding to 1 s, soft to loud; each recording and the model's render,
+its level matched over the first 0.5 s; `ab.wav` plays every pair in turn).

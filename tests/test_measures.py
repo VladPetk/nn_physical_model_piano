@@ -314,3 +314,33 @@ def test_extra_peaks():
     # a tone 15 cents from a partial is "near"; one at 2 f_3 (36 Hz under partial 6) is a phantom
     m = M.extra_peaks(synth(extra=[(ps[2] * 2 ** (15 / 1200), 0.03), (2 * ps[2], 0.03)], **kw), SR, 0.7, ps)
     assert m["N12 n near"] == 1 and m["N12 n phantom"] == 1, m["N12 peaks"]
+
+
+def test_partial_profile_reads_two_stage_decay_beating_and_the_attack():
+    """Known answers: partial 1 decays in two stages (a 60 dB/s part, 0.7 of the amplitude, and a 5 dB/s part: the
+    knee at ~0.15 s), partial 2 at a steady 10 dB/s and beats at 6 Hz (a second string 6 Hz up at 0.3 of its amplitude:
+    +-2.3 dB), partial 3 is steady."""
+    sr, t_on, dur = SR, 0.6, 2.0
+    t = np.arange(int(dur * sr)) / sr
+    tau = np.clip(t - t_on, 0, None)
+    on = (t >= t_on).astype(float)
+    p1 = 0.7 * np.exp(-tau * 60 / 8.686) + 0.3 * np.exp(-tau * 5 / 8.686)  # dB/s / 8.686 = nepers/s
+    x = on * p1 * np.sin(2 * np.pi * 150 * t)
+    x = x + on * np.exp(-tau * 10 / 8.686) * 0.5 * (np.sin(2 * np.pi * 301 * t) + 0.3 * np.sin(2 * np.pi * 307 * t))
+    x = x + on * 0.2 * np.sin(2 * np.pi * 452 * t)
+    x = x + 1e-6 * np.random.default_rng(0).standard_normal(len(t))
+    x = np.stack([x, x], 1)
+    pr = M.partial_profile(x, sr, t_on, np.array([150.0, 301.0, 452.0]), 1.2)
+    assert pr["early"][0] < -12 and abs(pr["late"][0] + 5) < 1.5  # the knee: steep, then slow
+    assert abs(pr["early"][1] + 10) < 1.5 and abs(pr["late"][1] + 10) < 1.5
+    assert abs(pr["beat"][1] - 6.0) < 0.3 and pr["fluct"][1] > 1.0 and pr["periodic"][1] > 0.7
+    assert pr["fluct"][2] < 0.2 and abs(pr["early"][2]) < 0.5
+    assert 0 <= pr["t_peak"][0] < 0.03  # a decaying partial peaks as the 40 ms window fills
+    # irregular fluctuation: three weak strings at incommensurate offsets
+    y = on * np.exp(-tau * 10 / 8.686) * 0.5 * (np.sin(2 * np.pi * 301 * t) + 0.25 * np.sin(2 * np.pi * 302.3 * t)
+                                                + 0.25 * np.sin(2 * np.pi * 305.1 * t + 1.0) + 0.2 * np.sin(2 * np.pi * 308.9 * t + 2.0))
+    y = np.stack([y, y], 1) + 1e-6
+    pi = M.partial_profile(y, sr, t_on, np.array([301.0]), 1.2)
+    assert pi["periodic"][0] < pr["periodic"][1] - 0.2
+    nt = M.non_tonal(x, sr, t_on, np.array([150.0, 301.0, 452.0, 603.0]))
+    assert nt[((0.1, 0.4), 1000)] < -60  # nothing but partials

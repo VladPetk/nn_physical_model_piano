@@ -11,6 +11,7 @@ dependencies = ["torch>=2.1", "numpy", "scipy", "soundfile", "pretty_midi"]
 
 [project.optional-dependencies]
 dev = ["pytest"]
+plots = ["matplotlib"]  # figures of the measurement scripts (scripts/note_profile.py)
 
 [tool.setuptools.packages.find]
 include = ["pianonn*"]
