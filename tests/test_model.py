@@ -473,3 +473,90 @@ def test_aware_residual_gradients():
     for name in ["context.curve_head.1.weight", "context.onset_head.2.weight", "context.mix_head.2.weight"]:
         g = dict(m.named_parameters())[name].grad
         assert g is not None and torch.isfinite(g).all() and g.abs().sum() > 0, name
+
+
+def _parts_model(**kw):
+    cfg = small_cfg(**{"sample_rate": 24000, "hop": 120, "noise_bands": 32, "use_sympathetic": False,
+                       "attack_model": "parts", **kw})
+    m = NeuralPhysicalPiano(cfg)
+    m.noise.init_parts()
+    return m
+
+
+def test_attack_parts_start_with_the_knock_noise_energy():
+    """With the thump and the precursor silenced, the parts' knock carries the old knock noise's energy in every band
+    below its cap: init_parts keeps the decays, and each kernel keeps the step-onset exponential's energy."""
+    m = _parts_model()
+    nb = m.noise
+    with torch.no_grad():
+        nb.thump_log_gain.fill_(-30.0)
+        nb.thump_spec.fill_(-30.0)
+        nb.prec_spec.fill_(-30.0)
+    sr, n = 24000, 24000
+    ki = torch.tensor([[15, 39, 63, 80]])
+    u = torch.tensor([[0.3, 0.6, 0.8, 0.5]])
+    onset = torch.tensor([[0.05, 0.2, 0.31, 0.4]])
+    w = torch.ones_like(u)
+    with torch.no_grad():
+        m.cfg.attack_model = "noise"  # the old knock noise, from the same parameters
+        old, _ = nb.event_power(ki, u, onset, onset + 9.0, w, w * 0, {}, 0, n, False)
+        m.cfg.attack_model = "parts"
+        new = nb.attack_power(ki, u, onset, onset, w, {}, 0, n)
+    below = nb.centers <= m.cfg.knock_max_hz
+    ratio = new.sum((0, 2))[below] / old.sum((0, 2))[below]
+    assert ((ratio - 1).abs() < 0.02).all(), ratio
+    assert new[..., : int(0.05 * sr)].abs().max() < 1e-6 * new.max()  # nothing before the first strike (float32 FFT round-off, ~-73 dB)
+
+
+def test_attack_parts_leave_the_top_octave_empty():
+    """Smooth onsets and capped spectra: the parts put nothing near the top (the old step onset spread every band's
+    onset over all frequencies)."""
+    m = _parts_model(use_room=False, use_impulse=False)
+    nb = m.noise
+    sr, n = 24000, 12000
+    ki, u, onset = torch.tensor([[39, 63]]), torch.tensor([[0.9, 0.9]]), torch.tensor([[0.1, 0.25]])
+    w = torch.ones_like(u)
+    white = torch.randn(1, n)
+    with torch.no_grad():
+        p = nb.attack_power(ki, u, onset, onset + 0.003, w, {}, 0, n)
+        y = (nb.band_split(white, 0, n) * p.clamp(min=0).sqrt()).sum(1)[0]
+    S = torch.fft.rfft(y).abs() ** 2
+    f = torch.fft.rfftfreq(n, 1 / sr)
+    top = S[f > 2 * m.cfg.precursor_max_hz].sum() / S[(f > 500) & (f < 2000)].sum()
+    assert 10 * math.log10(float(top)) < -40
+
+
+def test_attack_parts_block_rendering_and_gradients():
+    m = _parts_model(sample_rate=8000, hop=40, noise_bands=16)
+    with torch.no_grad():
+        m.noise.thump_raw_tau.fill_(3.0)  # ~0.4 s: the thump's kernel spans the block boundaries
+    n = 16000
+    perf = make_perf(m, n, [(60, 0.1, 0.5, 80), (36, 0.3, 1.5, 100), (90, 1.2, 1.4, 60), (36, -0.2, 1.8, 70)])
+    with torch.no_grad():
+        a = m(perf, n, residual=False, generator=torch.Generator().manual_seed(0))["audio"]
+        b = m(perf, n, residual=False, block_seconds=0.37, generator=torch.Generator().manual_seed(0))["audio"]
+    assert torch.allclose(a, b, atol=1e-5), (a - b).abs().max()
+    m(perf, n, residual=False)["audio"].pow(2).sum().backward()
+    for name in ("knock", "knock_raw_tau", "knock_raw_rise", "thump_spec", "thump_reg", "thump_vel", "thump_raw_tau",
+                 "prec_spec", "prec_reg", "prec_vel", "prec_raw_tau"):
+        g = getattr(m.noise, name).grad
+        assert g is not None and torch.isfinite(g).all() and g.abs().sum() > 0, name
+
+
+def test_cheap_sympathetic_bank_matches_the_full_rate_one_and_renders_in_blocks():
+    """The decimated bank (resonators at sr / 4) gives the full-rate bank's response for the same keys and partials
+    (energy within 1 dB), and blocks of a multiple of 4 samples render as one pass."""
+    kw = dict(use_noise=False, use_impulse=False, use_room=False, symp_lo_midi=21, symp_hi_midi=59, symp_max_hz=800.0,
+              symp_partials=6)
+    full = NeuralPhysicalPiano(small_cfg(**kw))
+    cheap = NeuralPhysicalPiano(small_cfg(**kw, symp_decimate=4))
+    cheap.load_state_dict(full.state_dict())
+    n = 16000
+    perf = make_perf(full, n, [(48, 0.1, 0.5, 90), (55, 0.3, 1.5, 100), (60, 1.0, 1.4, 70)], sustain=1.0)
+    with torch.no_grad():
+        a = full(perf, n, residual=False)["symp"]
+        b = cheap(perf, n, residual=False)["symp"]
+        c = cheap(perf, n, residual=False, block_seconds=0.37)["symp"]
+    assert torch.allclose(b, c, atol=1e-4 * float(b.abs().max())), (b - c).abs().max()  # float32 round-off: ~1e-5
+    ea, eb = float(a[..., 4000:].pow(2).sum()), float(b[..., 4000:].pow(2).sum())
+    assert abs(10 * math.log10(eb / ea)) < 1.0, (ea, eb)

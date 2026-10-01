@@ -90,6 +90,11 @@ class PianoLoss(nn.Module):
       (harmonic detail: partial levels inside a band, strike-position notches, beating).
     * ``attack``: log band energies in 1/3-octave bands from 400 Hz at a 256-point window and 2.7 ms hop,
       only in frames from 5 ms before to 40 ms after an onset.
+    * ``level`` (``level_weight`` > 0; off by default, so the evaluation's tables keep their terms): L1 of the log of
+      each band's energy summed over the whole excerpt, in the ``band`` term's bands. Per frame, a log band energy is
+      median-seeking over frames, so where the recording's energy is more concentrated in time than the model's its
+      optimum falls below the energy match (the 4 kHz gap, docs/round2_results.md 2); summed over the excerpt, the
+      optimum is the energy match whatever the time structure.
 
     The floor of every log is white noise at ``floor_db`` dBFS (bins far below any recording's floor do not
     count, review 3, F1). ``forward(pred, target, onsets=None, onset_mask=None)`` with ``[B, ch, T]`` audio and
@@ -99,10 +104,11 @@ class PianoLoss(nn.Module):
     GROUPS = ((8192, 0.0, 200.0), (2048, 200.0, 1600.0), (512, 1600.0, 1e9))  # (n_fft, band centres from, to)
 
     def __init__(self, sr, weights=(1.0, 0.25, 0.5), floor_db=-80.0, hop=240, f_lo=30.0, f_hi=11000.0,
-                 fine_sizes=(4096, 1024), fine_max_hz=2000.0, hp_hz=20.0):
+                 fine_sizes=(4096, 1024), fine_max_hz=2000.0, hp_hz=20.0, level_weight=0.0):
         super().__init__()
         self.sr, self.hop, self.floor_db, self.hp_hz = sr, hop, floor_db, hp_hz
         self.w_band, self.w_fine, self.w_attack = weights
+        self.w_level = level_weight
         self.fine_sizes, self.fine_max_hz = fine_sizes, fine_max_hz
         f_hi = min(f_hi, 0.45 * sr)
         n_bands = int(math.floor(6 * math.log2(f_hi / f_lo))) + 1
@@ -124,9 +130,12 @@ class PianoLoss(nn.Module):
     def _eps(self, n, mask):
         return 10 ** (self.floor_db / 10) * 0.375 * n * mask.sum(-1)[:, None]  # white floor in each band
 
+    def _bands(self, x, n, mask, n_bins, hop):
+        """Band energies per frame ``[N, bands, frames]``."""
+        return torch.einsum("kf,nft->nkt", mask, _mag(x, n, hop)[:, :n_bins] ** 2)
+
     def _log_bands(self, x, n, mask, n_bins, hop):
-        P = _mag(x, n, hop)[:, :n_bins] ** 2
-        return torch.log10(torch.einsum("kf,nft->nkt", mask, P) + self._eps(n, mask))
+        return torch.log10(self._bands(x, n, mask, n_bins, hop) + self._eps(n, mask))
 
     def terms(self, pred, target, onsets=None, onset_mask=None):
         """Per-example terms ``{name: [B]}`` (mean over channels, bands and frames)."""
@@ -135,11 +144,18 @@ class PianoLoss(nn.Module):
         target = highpass(target, self.sr, self.hp_hz).reshape(-1, target.shape[-1])
         per_ex = lambda v: v.reshape(B, -1).mean(1)
         out = {}
-        bands = []
+        bands, levels = [], []
         for gi, n, n_bins in self.groups:
             m = getattr(self, f"mask{gi}")
-            bands.append((self._log_bands(pred, n, m, n_bins, self.hop) - self._log_bands(target, n, m, n_bins, self.hop)).abs())
+            Ep, Et = self._bands(pred, n, m, n_bins, self.hop), self._bands(target, n, m, n_bins, self.hop)
+            eps = self._eps(n, m)
+            bands.append((torch.log10(Ep + eps) - torch.log10(Et + eps)).abs())
+            if self.w_level:
+                lv = lambda E: torch.log10(E.sum(-1) + eps[:, 0] * E.shape[-1])
+                levels.append((lv(Ep) - lv(Et)).abs())
         out["band"] = per_ex(torch.cat(bands, 1).mean((1, 2)))
+        if self.w_level:
+            out["level"] = per_ex(torch.cat(levels, 1).mean(1))
         if self.w_fine:
             fine = []
             for n in self.fine_sizes:
@@ -165,7 +181,7 @@ class PianoLoss(nn.Module):
 
     def forward(self, pred, target, onsets=None, onset_mask=None, per_example=False):
         t = self.terms(pred, target, onsets, onset_mask)
-        w = {"band": self.w_band, "fine": self.w_fine, "attack": self.w_attack}
+        w = {"band": self.w_band, "fine": self.w_fine, "attack": self.w_attack, "level": self.w_level}
         total = sum(w[k] * v for k, v in t.items())
         if per_example:
             return total, t

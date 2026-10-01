@@ -13,7 +13,10 @@ Validation reports the held-out loss with the residual on and off: the gap is wh
 still leaves unexplained. Audio of fixed validation excerpts is written at every dump.
 
 The loss is :class:`pianonn.losses.PianoLoss` (round 2: log band energies, a fine term below 2 kHz and an
-onset-window term; the trial's spectral-convergence term set the level ~1.8 dB low). ``--no-residual`` runs
+onset-window term; the trial's spectral-convergence term set the level ~1.8 dB low; ``--level-weight`` adds its
+whole-excerpt level term). ``--piece-gain`` fits a free gain per training piece (a nuisance, averaging zero, not used
+in validation or evaluation): at equal key and velocity the pieces of one year differ by ~2 dB, and without it the
+level parameters follow each batch's pieces (docs/tone_measures.md 12.5, 12.9). ``--no-residual`` runs
 stage 2 without the residual (the control for its gain), and ``--adv-with-stage2`` adds the GAN in stage 2:
 the discriminator judges the audio, but its gradients reach only the noise bank and the residual
 (``GAN_PARAMS``), through a view of the output in which everything else is detached.
@@ -37,6 +40,7 @@ from torch.utils.data import DataLoader  # noqa: E402
 from .config import PianoConfig  # noqa: E402
 from .data import MaestroSegments, SyntheticPerformances, collate
 from .dsp import bounded
+from .notefit import PieceLevels
 from .losses import (LogMelLoss, MultiResolutionDiscriminator, MultiResolutionSTFTLoss, OnsetLoss, PianoLoss,
                      band_energies, discriminator_loss, generator_adv_loss, highpass)
 from .synth import ContextNet, NeuralPhysicalPiano
@@ -65,6 +69,8 @@ def lr_scale(name):
     cents need larger steps than nats, and thousands of FIR taps must move slower than the physics."""
     if name == "room.body":
         return 0.03
+    if name == "piece_gain":
+        return 50.0  # each of 2018's 70 training pieces is in ~1 batch in 9 (batch 8): it must reach ~2 dB within a 30-min run
     if name.startswith(DB_PARAMS):
         return 20.0
     if name.startswith(CENTS_PARAMS):
@@ -241,6 +247,12 @@ def main(argv=None):
                     help="the onset term compares the attack re the same onset's early window (30-100 ms; 12.8)")
     ap.add_argument("--onset-pool", type=float, default=0.0,
                     help="the onset term's pool runs across steps, decaying by this factor per step (e.g. 0.99; 12.8)")
+    ap.add_argument("--level-weight", type=float, default=0.0,
+                    help="weight of PianoLoss's whole-excerpt level term (log band energies summed over the excerpt; "
+                         "its optimum is the energy match whatever the time structure); 0 = off")
+    ap.add_argument("--piece-gain", action="store_true",
+                    help="fit a free gain (dB, averaging zero) per training piece, applied to the rendered audio before "
+                         "every loss term; validation and evaluation render without it")
     ap.add_argument("--freeze", nargs="*", default=[], help="parameter-name prefixes kept frozen in every stage")
     ap.add_argument("--cfg", nargs="*", default=[], metavar="KEY=VALUE",
                     help="model config overrides, e.g. bridge_end_comb=1 body_q_max=50 (pianonn.config.PianoConfig)")
@@ -329,13 +341,18 @@ def main(argv=None):
                         persistent_workers=args.workers > 0, pin_memory=device.type == "cuda",
                         prefetch_factor=4 if args.workers > 0 else None)
 
-    recon = PianoLoss(cfg.sample_rate, weights=args.loss_weights).to(device)
+    recon = PianoLoss(cfg.sample_rate, weights=args.loss_weights, level_weight=args.level_weight).to(device)
     old_loss = MultiResolutionSTFTLoss()  # the trial's loss, reported for continuity
     mel_loss = LogMelLoss(cfg.sample_rate).to(device) if args.mel_weight > 0 else None
     onset_loss = (OnsetLoss(cfg.sample_rate, relative=args.onset_relative, pool_decay=args.onset_pool).to(device)
                   if args.onset_weight > 0 else None)
     onset_val = (onset_loss, args.onset_weight) if onset_loss is not None else None
-    opt = torch.optim.Adam(param_groups(model, args.lr))
+    pieces = PieceLevels(len(dataset.pieces)).to(device) if args.piece_gain and teacher is None else None
+    groups = param_groups(model, args.lr)
+    if pieces is not None:
+        groups.append({"params": [pieces.db], "lr": args.lr * lr_scale("piece_gain"), "name": "piece_gain",
+                       "base_lr": args.lr * lr_scale("piece_gain")})
+    opt = torch.optim.Adam(groups)
     disc = disc_opt = None
     if args.adv_start >= 0 or args.adv_with_stage2:
         disc = MultiResolutionDiscriminator().to(device)
@@ -347,6 +364,10 @@ def main(argv=None):
 
         state = torch.load(args.resume, map_location=device)
         load_weights(model, state["model"], log=log)
+        if pieces is not None and "piece_gain" in state:
+            saved = dict(zip(state["piece_gain"]["ids"], state["piece_gain"]["db"].tolist()))
+            with torch.no_grad():
+                pieces.db.copy_(torch.tensor([saved.get(p["id"], 0.0) for p in dataset.pieces], device=device))
         try:
             opt.load_state_dict(state["opt"])
         except ValueError as e:  # parameter set changed: restart the optimiser's moments
@@ -416,8 +437,11 @@ def main(argv=None):
     amp_ctx = lambda: torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp)
 
     def save(tag):
+        extra = {} if pieces is None else {"piece_gain": {"ids": [p["id"] for p in dataset.pieces],
+                                                          "db": (pieces.db - pieces.db.mean()).detach().cpu()}}
         torch.save({"cfg": cfg.to_dict(), "model": model.state_dict(), "opt": opt.state_dict(), "step": step,
-                    "stage": stage, "best": best, "elapsed": elapsed(), "args": vars(args)}, os.path.join(args.out, f"{tag}.pt"))
+                    "stage": stage, "best": best, "elapsed": elapsed(), "args": vars(args), **extra},
+                   os.path.join(args.out, f"{tag}.pt"))
 
     use_residual = lambda: stage >= 2 and not args.no_residual
 
@@ -474,6 +498,8 @@ def main(argv=None):
         extras = (("residual_out",) if residual else ()) + (("texture_view",) if gan else ())
         with amp_ctx():
             out = model(batch, n, residual=residual, extras=extras)
+        if pieces is not None:  # the recording's level for this piece: a nuisance, discarded at evaluation
+            out["audio"] = out["audio"] * (10 ** (pieces(batch["piece"]) / 20))[:, None, None]
         pred, tgt = out["audio"][..., s:].float(), target[..., s:].float()
 
         logs = {}
@@ -539,6 +565,8 @@ def main(argv=None):
 
         if step % args.log_every == 0:
             vals = {k: float(v.detach()) for k, v in logs.items()}
+            if pieces is not None:
+                vals["piece_sd"] = float(pieces.db.std())
             dt = time.time() - t_last
             t_last = time.time()
             mem = torch.cuda.max_memory_allocated() / 2**30 if device.type == "cuda" else 0.0

@@ -3,7 +3,8 @@
 A design for round 3: derive what we measure, and what we train on, from what a piano note is made of. Sections
 0–8 are the design; sections 9–11 report what has been built, how each measure was validated and what it found
 (status 2026-09-30). The physics it points to is in 10.4, revised in 11.4; section 12 is phase 3: its order and its
-steps so far (per-key B, the strike comb's sign; the body's Q and the hall); section 13 the learned residual and its ceiling.
+steps so far (per-key B, the strike comb's sign; the body's Q and the hall); section 13 the learned residual and its ceiling; section 14 phase 4 (the attack in three parts, a gain per piece, the
+whole-excerpt level term, a cheap sympathetic bank).
 
 ## 0. Why
 
@@ -1111,10 +1112,14 @@ ceilings are, if anything, low.) For scale: step 4 gained 0.028 over the round-2
   strike-to-strike variation no context can predict; how much, this check cannot say.
 - The decay and tilt corrections sit at their bounds for 35 % and 42 % of notes (per-note variant).
 
-What is open is how much of the ceiling a predictor from the context can reach. Next checks, proposed: (1) the
-current net retrained on the frozen physics with no budget and no decay overlap (whether the training regime is the
-limit); (2) if that stays small, a predictor that sees the physics' own render and each note's state, with per-note
-outputs that vary over time.
+What is open is how much of the ceiling a predictor from the context can reach. **This ceiling answers a different
+question** (review 5, 4.2): the free outputs were fitted to each excerpt's realised recording, so they include the
+strike-to-strike variation no context predicts. The fitted per-note level spreads 3.1 dB (sd) where the piano's own
+spread at equal key and velocity is 1.5–2.3 dB, so a quarter to a half of that output's variance is unpredictable by
+construction, and the features' |ρ| ≤ 0.14 says the predictable part is small. A reachable ceiling needs a fit that
+cannot see the realisation (free outputs fitted on training pieces, predicted from context on held-out ones); not
+done. The owner chose to go straight to (2) below rather than retrain the current net: a predictor that sees the
+physics' own render and each note's state, with per-note outputs that vary over time (13.2).
 
 ### 13.2 A residual that sees the physics (first run)
 
@@ -1145,8 +1150,9 @@ residual 0.7161, 0.7064, 0.7077, 0.6987, 0.7052 at steps 200–1000 (the checks 
 | the aware residual, `last.pt` (1,000 steps) | −0.010 ± 0.004 | −0.006 ± 0.002 | −0.005 ± 0.002 | −0.006 ± 0.004 | −0.06 ± 0.03 |
 | the aware residual, `best.pt` (step 800) | −0.004 ± 0.006 | −0.003 ± 0.003 | −0.004 ± 0.002 | −0.000 ± 0.005 | −0.01 ± 0.03 |
 
-- Twice the old residual's gain, in an eighth of its steps; still about 7 % of the per-note ceiling (−0.136 on the
-  first 24 of these excerpts, 13.1).
+- Twice the old residual's gain, in an eighth of its steps. Against 13.1's per-note ceiling (−0.136 on the first 24
+  of these excerpts) it is 7 %, but that ceiling includes what no predictor can reach (13.1), so the reachable
+  fraction is unknown.
 - `best.pt`, picked on validation, is worse on test than `last.pt`: at this size the 64 validation segments cannot rank
   checkpoints.
 - Whether more training would take it further, this run cannot say: validation is flat within its noise after step
@@ -1159,7 +1165,10 @@ dB), the GRU residual −0.007 ± 0.004. On the training pieces it gains about 1
 gap to the ceiling is not overfitting; whether it is too few steps, too little capacity or what cannot be predicted
 from the context, this does not separate.
 
-### 13.3 Can it express the ceiling? A memorisation test
+### 13.3 Capacity only: a memorisation test
+
+This shows what the network can express, not what it carries over to new pieces: any network of this size fitted to 8
+excerpts of 2 s would be expected to get close to a per-excerpt free fit (review 5, 4.2).
 
 `scripts/residual_ceiling.py --variants aware --max-batches 1` (`runs/residual/memorise/`): the aware residual of 13.2,
 from its 30-min weights, trained on the first 8 test excerpts alone (400 steps, lr 1e-3, a fresh noise draw per step),
@@ -1175,8 +1184,93 @@ then scored on the noise seeds of 13.1, against the free outputs fitted to the s
 | **the aware residual, fitted to these 8** | **0.489** | 0.247 | 0.514 | 0.227 | 2.47 |
 
 Fitted to them, the network goes past the free per-note and per-frame outputs and gets 86 % of the way to both
-together (−0.238 ± 0.028 of −0.275), its loss still falling at 400 steps. So the architecture can express nearly all of
-the ceiling: its capacity and output path (20 ms control, ±12 dB groups, its features) are not what holds it at
-−0.010 on new excerpts. What is left is whether the corrections carry over from piece to piece: too few steps or too
+together (−0.238 ± 0.028 of −0.275), its loss still falling at 400 steps. So its capacity and output path (20 ms
+control, ±12 dB groups, its features) are not what holds it at −0.010 on new excerpts. What is left is whether the corrections carry over from piece to piece: too few steps or too
 little data for that, or corrections no context predicts (strike-to-strike variation). A longer run that tracks the
 training and test pieces side by side would separate the first from the last.
+
+## 14. Phase 4: the attack in three parts, training hygiene, a cheap sympathetic bank (2026-10-01)
+
+After review 5 (`docs/reviews/review_5_phase3.md`) the owner chose: rebuild the attack, add a gain per piece and the
+whole-excerpt level term, turn on a cheap sympathetic bank for the bass and tenor, then one training run, the bench
+and a listening set. No control run and no per-change ablations: the bench attributes the physics constituent by
+constituent, and a control could only change how much of step 4's gain is credited to steps 1–3, which would not
+change what is kept.
+
+### 14.1 What was built
+
+- **A gain per training piece** (`train.py --piece-gain`; `notefit.PieceLevels`): a free level in dB per training
+  piece, averaging zero, applied to the render before every loss term, learning at 50 times the base rate (each of
+  2018's 70 training pieces is in about one batch in nine); not used in validation or evaluation. At equal key and
+  velocity the pieces differ by ~2 dB (12.5); without it the level parameters followed each batch's pieces (12.9).
+- **The whole-excerpt level term** (`PianoLoss(level_weight=)`, `train.py --level-weight`): L1 of the log of each band's
+  energy summed over the excerpt, in the band term's bands. Checked on a synthetic target whose energy comes in bursts
+  against a steady prediction of equal energy (`tests/test_losses.py`): the per-frame band term's optimum is below
+  −6 dB (the edge of the scan), the level term's +0.1 dB.
+- **The attack in three parts** (config `attack_model="parts"`, `synth.NoiseBank`; 10.4 item 1, review 5 3.2): the
+  knock noise (its per-key spectrum rolled off above 2.5 kHz at −40 dB/oct), the key-bottom thump (its own spectrum up
+  to 2 kHz, a level per register), and a string-borne precursor (up to 5 kHz, a decay of 0.3–5 ms, its own velocity
+  slope). Each part has, per band, a smooth rise of at least half a period of the band's centre, then an exponential
+  decay; the knock's and the thump's decays are per register (knots at MIDI 21, 65, 108) and band, the thump's up to
+  0.5 s for the treble board's low ringing. The step onset after the band split is gone. Each kernel keeps the energy
+  of the step-onset exponential with the same decay. Rendered as event trains per band and register convolved with
+  the kernels (FFT): no per-note envelopes, so long decays are free and the step uses less memory than step 4 (9 vs 11
+  GB). Tests: the converted knock keeps the old one's energy per band within 2 %; nothing above 10 kHz (−40 dB re 0.5–2
+  kHz); blocks render as one pass; gradients reach every new parameter.
+- **A cheap sympathetic bank** (config `symp_lo_midi`, `symp_hi_midi`, `symp_max_hz`, `symp_decimate`): only the
+  strings of MIDI 21–59 respond, their first 16 partials below 2.5 kHz, at a quarter of the sample rate (the drive
+  low-passed by a 128-tap Kaiser FIR and decimated, the response interpolated back; the filters' histories carry
+  across blocks). Against the full-rate bank on the same keys: energy within 1 dB. With it on, a training step takes
+  2.2 s instead of 1.5.
+
+### 14.2 The attack fitted on isolated notes
+
+`scripts/fit_notes.py --fit parts --init-attack-parts` (`runs/phase4/attack_fit/`): from step 4, the parts set from its
+knock and thump, then fitted on the 819 calibration notes (600 steps; the knock windows of 12.5 plus the energy between
+the partials at 30–100 and 100–400 ms). Evaluation notes (383), mean abs over 7,700–7,900 cells:
+
+| model | mean abs (dB) | shape (dB) |
+|---|---|---|
+| step 4 (`step4_baseline/`) | 3.064 | 2.972 |
+| step 4, attack converted to the parts, before the fit | 3.073 | – |
+| fitted, the precursor started at the knock's dark spectrum (`fit_dark_precursor/`) | 3.012 | 2.927 |
+| fitted, the precursor started flat above 1 kHz (`fit/`, the one used) | 2.997 | 2.905 |
+
+- The conversion and the caps cost nothing on isolated notes (+0.009 dB); the fit gains 0.07 dB over step 4.
+- Between the partials in the attack window, R3–R4 read 4–7 dB weak at 4–8 kHz in step 4 already and still do; in R5
+  the knock's cap took away energy step 4 had there (8 kHz: +2.9 → −3.5 dB after the fit). The precursor does not
+  fill 4–8 kHz: the fit lowered its 4 kHz level and shortened it to 0.8 ms (velocity slope 76 dB/u).
+- **The treble thump's long low ringing did not appear:** its low-band decays stay at 20–25 ms in every register
+  (bound 0.5 s); the notes' 100–400 ms windows do not ask for it.
+
+### 14.3 One run on music
+
+`runs/phase4/train_run/` (`chain.sh`): from `attack_fit/fit/model.pt` with step 4's per-strike spreads, the parts, B,
+the tuning and the hall frozen, the bank on, the piece gains and the level term (weight 0.5), the onset term as in step
+4; stage 1 only (no tables, no residual), 50 min = 1,322 steps, lr 5e-4, warm-up 200, cosine decay over the second
+half. Validation (64 segments; its total includes the new term): 0.928 at the start, 0.909–0.949 along the way, 0.923
+at the end. The piece gains end with an sd of 1.5 dB.
+
+**On 96 test excerpts** (`compare.md`, 2 seeds, variation off), phase 4 − step 4: total −0.0027 ± 0.0026, band −0.0015
+± 0.0012, fine −0.0018 ± 0.0014, attack −0.0015 ± 0.0027, log-mel −0.02 ± 0.01 dB (both seeds agree). A small gain,
+at the edge of the resolution.
+
+**On the bench** (`bench/report.md`, evaluation notes and 24 music excerpts, variation on; model − recording, step 4
+→ phase 4):
+- The high attack on isolated notes comes down where it was worst: N4 percussive 8 kHz R2 +7.0 → +3.9, R5 +8.4 → +6.9,
+  R6 +9.5 → +3.7 dB (R3–R4 unchanged at +5 to +6); N6 knock 8 kHz R6 +10.9 → +5.4, 4 kHz R6 +6.8 → +3.1, 250 Hz R6
+  +10.2 → +3.3 dB. The knock at 1 kHz in mf–f: −2.2 → −1.7 dB.
+- **In music the attack is as abrupt as before** (E4, 8 kHz flux contrast; recordings 0.3, 0.5, 0.5, 2.4, 4.2, 3.6 dB in
+  R2–R7): 1.2 → 1.2, 1.0 → 1.1, 2.0 → 2.1, 5.9 → 5.5, 7.6 → 6.4, 8.8 → 9.6. The smooth rises and the knock's cap did
+  not change it, so the abrupt high onset in music comes from elsewhere: the partials' own onset, the knock impulse, or
+  the onset jitter and timing; not checked.
+- **The pedal halo is unchanged** (E1, down − up between the partials): R2 −2.5 → −3.7 dB, R3 −3.2 → −3.1 (recordings
+  +1.9, 0.0). The bank is far too quiet to matter: on 16 test excerpts its output sits 32–45 dB under the strings,
+  pedal down or up, and training moved its gain by under 1 dB. Its coupling (a gain of 0.02–0.04 on the share of
+  each string's losses that goes through the bridge; resonances ~1 Hz wide against the drive's inharmonic partials)
+  gives a response a band-level loss cannot see, so the gain gets no gradient worth the name. Setting its level from
+  E1 (a scan of the gain on the bench) is the obvious next step; not done.
+- Texture statistics (P3) and level are unchanged within a few tenths of a dB.
+
+Listening: `listen/` (8 × 12 s, soft to loud, and the demo) and `listen_long/` (2 × 20 s), step 4 against phase 4,
+the per-strike variation on.

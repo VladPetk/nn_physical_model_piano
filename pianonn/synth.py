@@ -97,15 +97,54 @@ class SympatheticBank(nn.Module):
     alpha_after`` (the bridge part of its decay). The resonant gain is then
     ``G * kappa / alpha``: the fraction of the string's losses that go through
     the bridge, not an accident of the register.
+
+    A cheaper bank (docs/tone_measures.md 14): only the keys ``symp_lo_midi``..``symp_hi_midi`` respond, only their
+    partials below ``symp_max_hz`` (0: all up to 0.45 sr), and with ``symp_decimate`` = D > 1 the resonators run at
+    sr / D: the drive is low-passed (Kaiser FIR, causal) and decimated, the response interpolated back with the same
+    filter. The filters' histories carry across blocks, so blocks of a multiple of D samples render as one pass.
     """
+
+    TAPS = 128  # the decimation filter: ~60 dB stopband, ~0.7 kHz transition at 24 kHz
 
     def __init__(self, cfg: PianoConfig):
         super().__init__()
         self.cfg = cfg
         self.log_gain = nn.Parameter(torch.log(0.262 * key_curve([(0, 0.08), (12, 0.12), (30, 0.15), (67, 0.15), (87, 0.10)])))
+        self.register_buffer("keys", torch.arange(cfg.symp_lo_midi - LOWEST_MIDI, cfg.symp_hi_midi - LOWEST_MIDI + 1),
+                             persistent=False)
+        D = cfg.symp_decimate
+        if D > 1:
+            nyq = cfg.sample_rate / (2 * D)
+            fc = 0.5 * (cfg.symp_max_hz + nyq) if 0 < cfg.symp_max_hz < nyq else 0.9 * nyq
+            n = torch.arange(self.TAPS, dtype=torch.float64) - (self.TAPS - 1) / 2
+            h = 2 * fc / cfg.sample_rate * torch.sinc(2 * fc / cfg.sample_rate * n)
+            h = h * torch.kaiser_window(self.TAPS, periodic=False, beta=5.65, dtype=torch.float64)
+            self.register_buffer("lowpass", (h / h.sum()).float(), persistent=False)
+
+    def _decimate(self, x, hist):
+        """Low-pass and keep every D-th sample of ``x[..., L]`` (causal FIR; ``hist``: the previous TAPS - 1 inputs)."""
+        D, T = self.cfg.symp_decimate, self.TAPS
+        lead = x.shape[:-1]
+        xx = torch.cat([hist if hist is not None else x.new_zeros(*lead, T - 1), x], -1)
+        y = torch.nn.functional.conv1d(xx.reshape(-1, 1, xx.shape[-1]), self.lowpass.flip(-1)[None, None], stride=D)
+        return y.reshape(*lead, -1), xx[..., -(T - 1):]
+
+    def _interpolate(self, u, carry, length):
+        """Back to the full rate: zero-stuff by D and filter with D x the low-pass; ``carry`` is the previous block's
+        overhang."""
+        D = self.cfg.symp_decimate
+        y = torch.nn.functional.conv_transpose1d(u[:, None], (D * self.lowpass)[None, None], stride=D)[:, 0]
+        if carry is not None:
+            n = min(carry.shape[-1], y.shape[-1])
+            y = torch.cat([y[:, :n] + carry[:, :n], y[:, n:]], -1)
+            if carry.shape[-1] > n:
+                y = torch.cat([y, carry[:, n:]], -1)
+        if y.shape[-1] < length:
+            y = torch.nn.functional.pad(y, (0, length - y.shape[-1]))
+        return y[:, :length], y[:, length:]
 
     def _block(self, drive, es, freq, alpha, alpha_damp, gin, state):
-        sr = self.cfg.sample_rate
+        sr = self.cfg.sample_rate / self.cfg.symp_decimate
         decay = (alpha[..., None] + es[:, :, None, :] * alpha_damp[..., None]).clamp(max=1000.0) / sr
         omega = (2 * math.pi / sr) * freq[..., None].expand_as(decay)
         log_a = torch.complex(-decay, omega)
@@ -114,21 +153,35 @@ class SympatheticBank(nn.Module):
         return y.real.sum((1, 2)), state
 
     def forward(self, bridge, own, key_modes, engagement, start, state=None):
-        """``bridge[B,L]`` total string signal, ``own[B,88,L]`` per-key share, for frame-grid samples ``[start, start+L)``."""
+        """``bridge[B,L]`` total string signal, ``own[B,88,L]`` per-key share, for frame-grid samples ``[start, start+L)``.
+        Returns ``(y[B, L], state)``; pass the state to the next block."""
         cfg = self.cfg
-        S = cfg.symp_partials
-        freq = key_modes["freq"][..., :S, 0]
-        alpha = key_modes["alpha"][..., :S, 0]
-        kappa = (alpha - key_modes["alpha"][..., :S, 1]).clamp(min=0)
-        alpha_damp = key_modes["alpha_damp"][..., :S]
-        valid = (freq < 0.45 * cfg.sample_rate).to(freq.dtype)
-        gin = self.log_gain.exp()[None, :, None] * kappa / cfg.sample_rate * valid
-        drive = bridge[:, None, :] - own
-        es = frames_to_samples(engagement, start, bridge.shape[-1], cfg.hop)
-        args = (drive, es, freq, alpha, alpha_damp, gin, state)
+        S, D, k = cfg.symp_partials, cfg.symp_decimate, self.keys
+        state = state or {}
+        sr = cfg.sample_rate / D
+        freq = key_modes["freq"][:, k, :S, 0]
+        alpha = key_modes["alpha"][:, k, :S, 0]
+        kappa = (alpha - key_modes["alpha"][:, k, :S, 1]).clamp(min=0)
+        alpha_damp = key_modes["alpha_damp"][:, k, :S]
+        top = min(cfg.symp_max_hz, 0.45 * sr) if cfg.symp_max_hz > 0 else 0.45 * sr
+        valid = (freq < top).to(freq.dtype)
+        gin = self.log_gain.exp()[k][None, :, None] * kappa / sr * valid
+        drive = bridge[:, None, :] - own[:, k]
+        L = bridge.shape[-1]
+        if D > 1:
+            pad = (-L) % D  # only the last block may be ragged
+            drive, state["hist"] = self._decimate(torch.nn.functional.pad(drive, (0, pad)), state.get("hist"))
+            es = frames_to_samples(engagement[:, k], start // D, drive.shape[-1], cfg.hop / D)
+        else:
+            es = frames_to_samples(engagement[:, k], start, L, cfg.hop)
+        args = (drive, es, freq, alpha, alpha_damp, gin, state.get("rec"))
         if cfg.checkpoint and torch.is_grad_enabled():
-            return checkpoint(self._block, *args, use_reentrant=False)
-        return self._block(*args)
+            y, state["rec"] = checkpoint(self._block, *args, use_reentrant=False)
+        else:
+            y, state["rec"] = self._block(*args)
+        if D > 1:
+            y, state["carry"] = self._interpolate(y, state.get("carry"), L)
+        return y, state
 
 
 def _key_bottom_delay(v):
@@ -144,6 +197,25 @@ def _key_bottom_delay(v):
 def _dark_bands(centers, corner, base):
     """Log-amplitude band levels: flat up to ``corner`` Hz, then -12 dB/oct."""
     return base - 2 * math.log(2) * torch.log2(centers / corner).clamp(min=0)
+
+
+# the attack's per-register knots (key indices: MIDI 21, 65, 108) for ``attack_model="parts"``
+ATTACK_KNOTS = (0, 44, 87)
+
+
+def knot_weights(knots, n=N_KEYS):
+    """``[n, len(knots)]`` piecewise-linear (hat) weights over the key index: each row sums to one."""
+    return torch.stack([key_curve([(k, float(i == j)) for j, k in enumerate(knots)], n) for i in range(len(knots))], 1)
+
+
+def _span(raw, lo, hi):
+    """A value in ``(lo, hi)``, log-uniform in a sigmoid of ``raw``."""
+    return lo * (hi / lo) ** torch.sigmoid(raw)
+
+
+def _span_inv(v, lo, hi):
+    x = (torch.log(torch.as_tensor(v, dtype=torch.float32) / lo) / math.log(hi / lo)).clamp(1e-4, 1 - 1e-4)
+    return torch.log(x / (1 - x))
 
 
 def _interp_bands(x, n_out):
@@ -170,6 +242,20 @@ class NoiseBank(nn.Module):
 
     The residual's attack component (R2) is a second, slower noise event per note with a
     learned level, spectrum and decay time.
+
+    ``cfg.attack_model = "parts"`` (docs/tone_measures.md 10.4 item 1, review 5 section 3.2) replaces the knock noise
+    and the thump, which shared one spectrum and one step-onset envelope per key, with three parts, each an envelope
+    per band (a smooth rise, then an exponential decay) and per register (knots ``ATTACK_KNOTS``):
+    - the knock noise, its per-key spectrum rolled off above ``knock_max_hz`` (-40 dB/oct): the fitted knock's 4-8
+      kHz is the bench's percussive excess (10.3), and nothing in the piano's attack puts broadband noise there;
+    - the key-bottom thump (structure-borne), its own spectrum up to ``thump_max_hz``, a level per register and a
+      decay per register and band (the treble board's low modes ring 0.2-0.5 s, Bank);
+    - the string-borne precursor (the longitudinal wave, Askenfelt 1993): a burst of ~1-2 ms up to
+      ``precursor_max_hz``, with its own velocity slope (it grows with the blow faster than the tone).
+    The rise per band is at least half a period of the band's centre: a step onset, applied after the band split,
+    spread every band's onset over all frequencies (12.5). Each kernel is scaled to the energy of the step-onset
+    exponential with the same decay, so the levels keep their meaning. Rendered as event trains per band and register
+    convolved with the kernels (FFT), so long decays cost no per-note envelopes.
     """
 
     MARGIN = 4096  # overlap-save context; longer than the lowest band filter's ringing
@@ -194,6 +280,107 @@ class NoiseBank(nn.Module):
         # R2 attack noise: starts 40 dB under the knock (nearly neutral), 40 ms decay (x/e from the context net)
         self.att = nn.Parameter(_dark_bands(centers, 600.0, -4.38 - 4.6).repeat(N_KEYS, 1))
         self._masks = {}
+        # attack_model="parts" (used only then; init_parts() sets them from the knock and thump above)
+        R = len(ATTACK_KNOTS)
+        self.register_buffer("knot_w", knot_weights(ATTACK_KNOTS))
+        self.register_buffer("rise_floor", (0.5 / centers).clamp(min=2.5e-4))
+        self.knock_raw_tau = nn.Parameter(_span_inv(0.008, *self.SPANS["knock"]).repeat(R, nb))
+        self.knock_raw_rise = nn.Parameter(torch.full((nb,), -2.5))  # ~1.1 x the floor
+        self.thump_spec = nn.Parameter(_dark_bands(centers, 300.0, -4.38 + math.log(0.7)))
+        self.thump_reg = nn.Parameter(torch.zeros(R))
+        self.thump_vel = nn.Parameter(torch.tensor(4.2))
+        self.thump_raw_tau = nn.Parameter(_span_inv(0.008, *self.SPANS["thump"]).repeat(R, nb))
+        self.thump_raw_rise = nn.Parameter(torch.full((nb,), -2.5))
+        self.prec_spec = nn.Parameter(_dark_bands(centers, 2000.0, -4.38))
+        self.prec_reg = nn.Parameter(torch.zeros(R))
+        self.prec_vel = nn.Parameter(torch.tensor(8.4))
+        self.prec_raw_tau = nn.Parameter(_span_inv(0.001, *self.SPANS["precursor"]).reshape(()))
+
+    # decay time constants (amplitude, s) of the parts: (lo, hi)
+    SPANS = {"knock": (0.001, 0.1), "thump": (0.002, 0.5), "precursor": (0.0003, 0.005)}
+    KERNEL_MAX = {"knock": 0.5, "thump": 2.0, "precursor": 0.03}  # s
+
+    @torch.no_grad()
+    def init_parts(self):
+        """Set the parts (``attack_model="parts"``) from the fitted knock noise and thump: the same energy per band and
+        decay; the thump's spectrum is the knock's mean over the keys (a level per register), the precursor starts at the
+        knock's mean level at 1 kHz, flat from 1 kHz up and falling at 12 dB/oct below (the "bite" above 1 kHz, F1),
+        with the knock's velocity slope + 20 dB/u (the tone's is ~40) and a 1 ms decay; the rises start near their
+        floors."""
+        dev = self.knock.device
+        taus = self.taus(torch.arange(N_KEYS, device=dev))
+        knots = list(ATTACK_KNOTS)
+        self.knock_raw_tau.copy_(_span_inv(taus["knock"][knots].cpu(), *self.SPANS["knock"]).to(dev)[:, None]
+                                 .expand_as(self.knock_raw_tau))
+        mean = self.knock.mean(0)
+        low = self.centers <= self.cfg.thump_max_hz
+        self.thump_spec.copy_(mean + self.thump_log_gain)
+        self.thump_reg.copy_((self.knock[knots][:, low] - mean[low]).mean(1))
+        self.thump_vel.copy_(self.knock_vel.mean())
+        self.thump_raw_tau.fill_(float(_span_inv(float(taus["thump"]), *self.SPANS["thump"])))
+        at_1k = mean[int(torch.argmin((torch.log2(self.centers / 1000.0)).abs()))]
+        self.prec_spec.copy_(at_1k - 2 * math.log(2) * torch.log2(1000.0 / self.centers).clamp(min=0))
+        self.prec_reg.copy_((self.knock[knots] - mean).mean(1))
+        self.prec_vel.copy_(self.knock_vel.mean() + 20 / 20 * math.log(10))
+        self.knock_raw_rise.fill_(-2.5)
+        self.thump_raw_rise.fill_(-2.5)
+        self.prec_raw_tau.fill_(float(_span_inv(0.001, *self.SPANS["precursor"])))
+
+    def _cap(self, spec, max_hz):
+        """Log amplitudes rolled off above ``max_hz`` at -40 dB per octave."""
+        return spec - (40 / 20 * math.log(10)) * torch.log2(self.centers / max_hz).clamp(min=0)
+
+    def part_kernels(self, name):
+        """Power envelopes ``[R or 1, bands, Lk]`` of one part, each scaled to the energy of a step-onset exponential
+        with the same decay (``tau / 2``)."""
+        cfg = self.cfg
+        if name == "precursor":
+            tau_d = _span(self.prec_raw_tau, *self.SPANS[name]).reshape(1, 1).expand(1, len(self.centers))
+            tau_r = self.rise_floor[None]
+        else:
+            raw_tau, raw_rise = ((self.knock_raw_tau, self.knock_raw_rise) if name == "knock"
+                                 else (self.thump_raw_tau, self.thump_raw_rise))
+            tau_d = _span(raw_tau, *self.SPANS[name])
+            tau_r = (self.rise_floor * torch.exp(1.5 + bounded(raw_rise, 1.5)))[None]
+        Lk = int(math.ceil(min(self.KERNEL_MAX[name], float(3.5 * tau_d.max() + 6 * tau_r.max())) * cfg.sample_rate))
+        d = torch.arange(Lk, device=tau_d.device, dtype=tau_d.dtype) / cfg.sample_rate
+        a = (1 - torch.exp(-d / tau_r[..., None])) ** 2 * torch.exp(-d / tau_d[..., None])
+        p = a ** 2
+        return p * (0.5 * tau_d / (p.sum(-1) / cfg.sample_rate).clamp(min=1e-12))[..., None]
+
+    def attack_power(self, ki, u, onset, thump_at, w_on, ctx, start, length):
+        """Per-band power ``[B, bands, length]`` of the parts (``attack_model="parts"``) for samples ``[start,
+        start + length)``: event trains per band and register convolved with ``part_kernels``."""
+        cfg = self.cfg
+        sr, K = cfg.sample_rate, len(self.centers)
+        zero = torch.zeros_like(u)
+        base = ctx.get("log_knock", zero)  # log amplitude per note (the context net's and the strike's)
+        reg = lambda v: self.knot_w[ki] @ v  # per-register values at each note's key
+        knock = self._cap(self.knock[ki], cfg.knock_max_hz) + (self.knock_vel[ki] * (u - 0.6) + base)[..., None]
+        if "knock_spec" in ctx:
+            knock = knock + log_f_bumps(ctx["knock_spec"], self.centers, hi=sr / 2)
+        thump = (self._cap(self.thump_spec, cfg.thump_max_hz)
+                 + (reg(self.thump_reg) + self.thump_vel * (u - 0.6) + base)[..., None])
+        prec = (self._cap(self.prec_spec, cfg.precursor_max_hz)
+                + (reg(self.prec_reg) + self.prec_vel * (u - 0.6) + base)[..., None])
+        out = torch.zeros(ki.shape[0], K, length, device=ki.device, dtype=u.dtype)
+        for name, level, t_ev, max_hz, per_reg in (("knock", knock, onset, cfg.knock_max_hz, True),
+                                                   ("thump", thump, thump_at, cfg.thump_max_hz, True),
+                                                   ("precursor", prec, onset, cfg.precursor_max_hz, False)):
+            kb = int((self.centers <= 2 * max_hz).sum())  # bands above are 40 dB down or more
+            kern = self.part_kernels(name)[:, :kb]  # [R', kb, Lk]
+            Lk = kern.shape[-1]
+            T = -(-(Lk + length) // 4096) * 4096  # the train starts T - length before ``start``: no wrap-around
+            idx = torch.round(t_ev.detach() * sr).long() - (start + length - T)  # [B, N]
+            ok = (idx >= 0) & (idx < T)
+            amp = torch.exp(2 * level[..., :kb]) * (w_on * ok)[..., None]  # [B, N, kb]
+            amp = amp[:, :, None, :] * (self.knot_w[ki][..., None] if per_reg else 1.0)  # [B, N, R', kb]
+            B, N, Rp = amp.shape[:3]
+            pos = idx.clamp(0, T - 1)[:, None, :].expand(B, Rp * kb, N)
+            train = amp.new_zeros(B, Rp * kb, T).scatter_add(2, pos, amp.reshape(B, N, Rp * kb).transpose(1, 2))
+            y = torch.fft.irfft(torch.fft.rfft(train.view(B, Rp, kb, T), T) * torch.fft.rfft(kern, T), T)
+            out[:, :kb] = out[:, :kb] + y[..., T - length:].sum(1)
+        return out
 
     def taus(self, ki):
         return {"knock": torch.exp(self.prior_knock_log_tau[ki] + bounded(self.raw_knock_tau[ki], 1.0)),
@@ -248,11 +435,12 @@ class NoiseBank(nn.Module):
         knock = self.knock[ki] + (self.knock_vel[ki] * (u - 0.6) + ctx.get("log_knock", zero))[..., None]
         if "knock_spec" in ctx:
             knock = knock + log_f_bumps(ctx["knock_spec"], self.centers, hi=cfg.sample_rate / 2)
-        env_on = (self._env(t, onset, taus["knock"])
-                  + self.thump_log_gain.exp() ** 2 * self._env(t, thump_at, taus["thump"].expand_as(onset)))
         env_off = self._env(t, release, taus["release"])
-        power = (torch.einsum("bnk,bnl->bkl", torch.exp(2 * knock) * weight_on[..., None], env_on)
-                 + torch.einsum("bnk,bnl->bkl", torch.exp(2 * self.release[ki]) * weight_off[..., None], env_off))
+        power = torch.einsum("bnk,bnl->bkl", torch.exp(2 * self.release[ki]) * weight_off[..., None], env_off)
+        if cfg.attack_model != "parts":  # the parts are rendered by attack_power
+            env_on = (self._env(t, onset, taus["knock"])
+                      + self.thump_log_gain.exp() ** 2 * self._env(t, thump_at, taus["thump"].expand_as(onset)))
+            power = power + torch.einsum("bnk,bnl->bkl", torch.exp(2 * knock) * weight_on[..., None], env_on)
         if not residual:
             return power, None
         att = self.att[ki] + (self.knock_vel[ki] * (u - 0.6) + ctx.get("att_level", zero))[..., None]
@@ -516,6 +704,9 @@ class NeuralPhysicalPiano(nn.Module):
             t0, t1 = s0 / sr, (s0 + L) / sr
             power = pedal_bands * frames_to_samples(pedal_env, s0, L, hop)[:, None]
             res = frames_to_samples(r3, s0, L, hop) if r3 is not None else None
+            if cfg.attack_model == "parts":
+                thump_at = onset + _key_bottom_delay(hammer_velocity(u) if speed is None else speed)
+                power = power + self.noise.attack_power(ki, u, onset, thump_at, w_on, ctx, s0, L)
             sel = ((onset < t1) & (torch.maximum(onset, release) + NoiseBank.EVENT_WINDOW > t0) & mask).any(0).nonzero().squeeze(1)
             if sel.numel():
                 sub = {k: v[:, sel] for k, v in ctx.items()}

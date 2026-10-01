@@ -20,6 +20,13 @@ Parameter sets (``--fit``):
   flat-topped as N6's, every band, below f0 too): its level re the early window (the attack's excess over the tone)
   and the energy between the partials (the knock alone, as N6), with the early window as a guard. Step 2b: what is
   left after it is what new attack physics has to explain.
+- ``parts``: the attack in three parts (``attack_model="parts"``, ``synth.NoiseBank``; docs/tone_measures.md 14): the
+  knock noise (per-key spectrum and velocity slope, a rise per band, a decay per register and band), the thump (its
+  spectrum, level per register, velocity slope, rise and decays), the precursor (spectrum, level per register,
+  velocity slope, decay) and the knock impulse's per-key level and velocity slope, on the ``knock`` windows plus the
+  energy between the partials in the early (30-100 ms) and sustain (100-400 ms) windows, where the treble board's low
+  ringing shows. ``--init-attack-parts`` first sets the parts from the checkpoint's knock noise and thump
+  (``NoiseBank.init_parts``) and switches ``attack_model`` to "parts".
 
 The per-key tables move by a piecewise-linear correction with knots every ``--key-step`` keys (0: every key free);
 with 1-20 notes per key a free table follows single notes. A free level per piece, averaging zero, is fitted
@@ -53,13 +60,17 @@ LEVEL = ("physics.gain_db", "physics.raw_vel_slope", "physics.cond_vel_curve", "
 BRIGHT = ("physics.raw_log_tc", "physics.raw_order", "physics.cond_log_tc")
 KNOCK = ("noise.knock", "noise.knock_vel", "noise.raw_knock_tau", "noise.thump_log_gain", "noise.raw_thump_tau",
          "physics.raw_impulse_db", "physics.raw_impulse_vel")
-FITS = {"velmap": ("physics.cond_vel_map",) + LEVEL + BRIGHT, "nomap": LEVEL + BRIGHT, "knock": KNOCK}
+PARTS = ("noise.knock", "noise.knock_vel", "noise.knock_raw_tau", "noise.knock_raw_rise", "noise.thump_spec",
+         "noise.thump_reg", "noise.thump_vel", "noise.thump_raw_tau", "noise.thump_raw_rise", "noise.prec_spec",
+         "noise.prec_reg", "noise.prec_vel", "noise.prec_raw_tau", "physics.raw_impulse_db", "physics.raw_impulse_vel")
+FITS = {"velmap": ("physics.cond_vel_map",) + LEVEL + BRIGHT, "nomap": LEVEL + BRIGHT, "knock": KNOCK, "parts": PARTS}
 # the attack's excess over the tone (attack re early, every band), the energy between the partials (the knock without
 # the partials' onset), and the early window as a guard: a band-level term alone let the knock noise stand in for high
 # partials the tone lacks (step 2b, first run)
 ATTACK = {"attack re early": (-0.003, 0.033, {"flat": 0.7, "rel": "early", "all_bands": True}),
           "attack gaps": (-0.003, 0.033, {"flat": 0.7, "gaps": True}), "early": NF.WINDOWS["early"]}
-WINDOWS = {"velmap": NF.WINDOWS, "nomap": NF.WINDOWS, "knock": ATTACK}
+WINDOWS = {"velmap": NF.WINDOWS, "nomap": NF.WINDOWS, "knock": ATTACK,
+           "parts": {**ATTACK, "early gaps": (0.03, 0.10, {"gaps": True}), "sustain gaps": (0.10, 0.40, {"gaps": True})}}
 PER_KEY = ("physics.gain_db", "physics.raw_vel_slope", "physics.raw_log_tc", "physics.raw_order", "noise.knock",
            "noise.knock_vel", "noise.raw_knock_tau", "physics.raw_impulse_db")
 MAP_VEL = (20, 32, 48, 64, 80, 96, 112)
@@ -67,6 +78,41 @@ MAP_VEL = (20, 32, 48, 64, 80, 96, 112)
 
 def fmt_table(rows, head):
     return ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)] + ["| " + " | ".join(r) + " |" for r in rows]
+
+
+def parts_tables(model, snap, now):
+    """Report lines: the parts' decays per register and band, rises, levels and velocity slopes, before → after."""
+    from pianonn.synth import ATTACK_KNOTS, _span
+
+    nb = model.noise
+    db = 20 / math.log(10)
+    centers = nb.centers.cpu().numpy()
+    show = [i for i, f in enumerate(centers) if 80 <= f <= 6000][::3]
+    head = ["", "register (MIDI)"] + [f"{centers[i]:.0f} Hz" for i in show]
+    rows = []
+    for part, lo_hi in (("knock", nb.SPANS["knock"]), ("thump", nb.SPANS["thump"])):
+        for r, k in enumerate(ATTACK_KNOTS):
+            t0 = _span(snap[f"noise.{part}_raw_tau"][r], *lo_hi).cpu().numpy() * 1000
+            t1 = _span(now[f"noise.{part}_raw_tau"][r], *lo_hi).cpu().numpy() * 1000
+            rows.append([f"{part} decay (ms)", str(k + 21)] + [f"{t0[i]:.1f} → {t1[i]:.1f}" for i in show])
+        r0 = (nb.rise_floor * torch.exp(1.5 + bounded(snap[f"noise.{part}_raw_rise"], 1.5))).cpu().numpy() * 1000
+        r1 = (nb.rise_floor * torch.exp(1.5 + bounded(now[f"noise.{part}_raw_rise"], 1.5))).cpu().numpy() * 1000
+        rows.append([f"{part} rise (ms)", "all"] + [f"{r0[i]:.2f} → {r1[i]:.2f}" for i in show])
+    for part, spec, cap in (("thump", "thump_spec", model.cfg.thump_max_hz), ("precursor", "prec_spec", model.cfg.precursor_max_hz)):
+        a = nb._cap(snap[f"noise.{spec}"], cap).cpu().numpy() * db
+        b = nb._cap(now[f"noise.{spec}"], cap).cpu().numpy() * db
+        rows.append([f"{part} spectrum (dB)", "mean key"] + [f"{a[i]:+.1f} → {b[i]:+.1f}" for i in show])
+    lines = fmt_table(rows, head) + [""]
+    for name, key, scale in (("thump level per register (dB)", "noise.thump_reg", db),
+                             ("precursor level per register (dB)", "noise.prec_reg", db),
+                             ("thump velocity slope (dB/u)", "noise.thump_vel", db),
+                             ("precursor velocity slope (dB/u)", "noise.prec_vel", db)):
+        a, b = snap[key].reshape(-1).cpu() * scale, now[key].reshape(-1).cpu() * scale
+        lines.append(f"- {name}: " + ", ".join(f"{float(x):+.1f} → {float(y):+.1f}" for x, y in zip(a, b)))
+    t0 = float(_span(snap["noise.prec_raw_tau"], *nb.SPANS["precursor"])) * 1000
+    t1 = float(_span(now["noise.prec_raw_tau"], *nb.SPANS["precursor"])) * 1000
+    lines.append(f"- precursor decay: {t0:.2f} → {t1:.2f} ms")
+    return lines
 
 
 def save_eval(path, ev):
@@ -89,6 +135,9 @@ def main():
     ap.add_argument("--knock-max-hz", type=float, default=0.0,
                     help="keep the knock noise's spectrum above this frequency as it is (0: fit every band): between the "
                          "partials, an isolated note's attack rarely stands over its background at 4-8 kHz")
+    ap.add_argument("--init-attack-parts", action="store_true",
+                    help="set the attack's parts from the checkpoint's knock noise and thump and switch attack_model to "
+                         "'parts' before fitting (NoiseBank.init_parts)")
     ap.add_argument("--max-notes", type=int, default=0, help="cap the notes of each group (smoke runs)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -109,6 +158,10 @@ def main():
     with open(args.bench or f"runs/measurements/bench_{'_'.join(map(str, args.years))}.json") as f:
         bench = json.load(f)
     label, model, _ = load_variant(args.model, device=dev, log=log)
+    if args.init_attack_parts:
+        model.cfg.attack_model = "parts"
+        model.noise.init_parts()
+        log("attack parts set from the knock noise and thump (attack_model=parts)")
     cfg, cond = model.cfg, year_to_condition(args.years[0])
     table = M.partial_table(model, cond, dev)
     groups = {}
@@ -254,12 +307,14 @@ def main():
                    ("order x", lambda d: torch.exp(bounded(d["physics.raw_order"], 0.9))),
                    ("gain dB", lambda d: d["physics.gain_db"]),
                    ("velocity slope dB/u", lambda d: 40.0 * torch.exp(bounded(d["physics.raw_vel_slope"], 0.7))))
-        if args.fit == "knock":  # the noise tables are log amplitudes: x 20 / ln 10 for dB
+        if args.fit in ("knock", "parts"):  # the noise tables are log amplitudes: x 20 / ln 10 for dB
             per_key = tuple((f"knock noise {f} Hz dB", lambda d, f=f: d["noise.knock"][:, near(f)] * 20 / math.log(10))
                             for f in (250, 1000, 4000, 8000)) + (
                 ("knock noise velocity slope dB/u", lambda d: d["noise.knock_vel"] * 20 / math.log(10)),
                 ("knock noise decay x", lambda d: torch.exp(bounded(d["noise.raw_knock_tau"], 1.0))),
                 ("knock impulse dB", lambda d: bounded(d["physics.raw_impulse_db"], 20.0)))
+        if args.fit == "parts":
+            per_key = per_key[:2] + per_key[4:5] + per_key[6:]  # capped above 2.5 kHz; the per-key decay is unused
         for name, fn in per_key:
             a, b_ = fn(snap), fn(now)
             d = (b_ / a) if name.endswith("x") else (b_ - a)
@@ -276,6 +331,8 @@ def main():
         if n in names:
             scal.append(f"`{n}` (raw): {show(snap[n])} → {show(params[n].detach())}")
     L += [""] + [f"- {s}" for s in scal]
+    if args.fit == "parts":
+        L += ["", "## The attack's parts", ""] + parts_tables(model, snap, now)
     text = "\n".join(L) + "\n"
     with open(os.path.join(args.out, "report.md"), "w", encoding="utf-8") as f:
         f.write(text)

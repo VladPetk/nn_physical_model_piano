@@ -244,3 +244,24 @@ def test_onset_loss_running_pool_settles_at_the_energy_match_of_the_stream():
     batch, pool = settle(OnsetLoss(sr)), settle(OnsetLoss(sr, pool_decay=0.95))
     assert abs(pool - match) < 1.0, (pool, match)
     assert abs(batch - match) > 2.0, (batch, match)
+
+
+def test_level_term_optimum_is_the_energy_match_where_the_band_term_is_not():
+    """The recording's energy comes in bursts (decaying events), the prediction's is steady, the totals are equal: the
+    right gain is 0 dB. The per-frame band term is median-seeking over frames and wants the prediction quieter; the
+    whole-excerpt level term's optimum is the energy match."""
+    sr, n = 16000, 32000
+    t, p = shaped_noise(4, n, sr, 1), shaped_noise(4, n, sr, 2)
+    time = torch.arange(n) / sr
+    env = torch.exp(-((time % 0.25) / 0.03))  # an event every 250 ms, decaying with a 30 ms time constant
+    t = t * env
+    t = t * (p.pow(2).sum(-1, keepdim=True) / t.pow(2).sum(-1, keepdim=True)).sqrt()  # same energy per channel
+    gains = torch.arange(-6.0, 6.01, 0.5)
+    band = PianoLoss(sr, weights=(1.0, 0.0, 0.0))
+    level = PianoLoss(sr, weights=(0.0, 0.0, 0.0), level_weight=1.0)
+    lb = [float(band(p * 10 ** (g / 20), t)[0]) for g in gains]
+    ll = [float(level(p * 10 ** (g / 20), t)[0]) for g in gains]
+    assert parabolic(gains.numpy(), lb) < -1.5
+    assert abs(parabolic(gains.numpy(), ll)) < 0.3
+    assert set(level.terms(p, t)) == {"band", "level"}
+    assert "level" not in PianoLoss(sr).terms(p, t)  # off by default: the evaluation's tables keep their terms

@@ -19,6 +19,12 @@ class PianoConfig:
     n_phantoms: int = 16  # phantom-partial pairs per series (2f_j and f_j + f_j+1), 0 = off
     n_conditions: int = 16
     symp_partials: int = 4  # partials per key in the sympathetic resonator bank
+    # the bank's responding keys (MIDI, inclusive), its partials' ceiling (0: up to 0.45 of its rate) and decimation
+    # (resonators at sample_rate / symp_decimate); the defaults are the full bank of rounds 1-3
+    symp_lo_midi: int = 21
+    symp_hi_midi: int = 108
+    symp_max_hz: float = 0.0
+    symp_decimate: int = 1
     body_seconds: float = 0.3  # learnable soundboard/case FIR (bridge force -> pressure), one per channel
     hall_seconds: float = 2.5  # parametric per-year hall tail
     noise_bands: int = 32
@@ -34,6 +40,13 @@ class PianoConfig:
     use_context: bool = True
     use_room: bool = True  # body + hall; off = dry bridge-force signal
     use_floor: bool = True  # stationary microphone/hall noise floor per condition (review 3, F1)
+    # the attack's noises: "noise" (rounds 1-3: knock noise and key-bottom thump sharing one spectrum and a step-onset
+    # envelope per key) or "parts" (knock noise, thump and string-borne precursor, each with an envelope per band and
+    # register and a spectrum capped at the frequency below; synth.NoiseBank, docs/tone_measures.md 14)
+    attack_model: str = "noise"
+    knock_max_hz: float = 2500.0
+    thump_max_hz: float = 2000.0
+    precursor_max_hz: float = 5000.0
     # strike comb as the force at the bridge end: sin(n pi (1 - x0)) = (-1)^(n+1) sin(n pi x0) with x0 measured from
     # the agraffe. Same partial levels, but the first transverse pulse reaches the bridge after (1 - x0) T/2 instead
     # of x0 T/2 (off: the round-1/2 models, whose comb is the agraffe-end force)

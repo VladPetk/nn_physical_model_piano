@@ -246,9 +246,17 @@ In short, on one year (RTX 3090):
 - **A residual that sees the physics** (13.2, `pianonn/residual.py`, `residual_kind=aware`): each note's expected energy per
   octave group of partials, attention across the sounding notes, a gain curve per group over each note's life inside
   the oscillator bank. 30 min on the frozen step-4 physics: −0.010 ± 0.004 on 96 test excerpts (the GRU residual
-  −0.005), about 7 % of the per-note ceiling.
-  Fitted to 8 excerpts alone it reaches 86 % of the full ceiling there (13.3): the architecture can express it; whether
-  the corrections carry over to new pieces is open.
+  −0.005); the reachable fraction is unknown, since the ceiling includes strike-to-strike variation no context
+  predicts (review 5). Fitted to 8 excerpts alone it reaches 86 % of the full ceiling there (13.3): capacity only;
+  whether the corrections carry over to new pieces is open.
+- **Phase 4** (`docs/tone_measures.md` 14): the attack in three parts (knock noise capped at 2.5 kHz, a thump to 2 kHz,
+  a string-borne precursor; smooth rises and decays per band and register; config `attack_model=parts`), fitted on
+  isolated notes (held out 3.064 → 2.997 dB) and frozen; a gain per training piece and the whole-excerpt level term
+  (`--piece-gain --level-weight`); a cheap sympathetic bank (MIDI 21–59, partials below 2.5 kHz, at 6 kHz). One 50-min
+  run: −0.003 ± 0.003 on 96 test excerpts against step 4; the 8 kHz attack excess on isolated notes drops in R2, R5
+  and R6 (R6 N4 +9.5 → +3.7 dB), but in music the attack is as abrupt as before (E4), and the bank sits 32–45 dB under
+  the strings, so the pedal halo gap is unchanged. Checkpoint `runs/phase4/train_run/train/last.pt`; listening in
+  [`samples/phase4/`](samples/phase4/).
 - **Open:** the physics above, then texture (a GAN branch had no measurable effect in 500 steps) and listening.
 
 The prior is calibrated against the literature (the KTH *Five Lectures on the Acoustics of the Piano*,

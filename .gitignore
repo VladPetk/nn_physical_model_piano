@@ -12,3 +12,6 @@ data/
 !samples/*.wav
 .claude/
 CLAUDE.md
+
+!samples/**/*.wav
+!samples/**/*.flac
