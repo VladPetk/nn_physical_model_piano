@@ -17,6 +17,10 @@ once and reduces them with batched matrix products, which is several times faste
 
 The cycle count is formed in float64 and only its fractional part is kept, so the phase stays
 exact minutes into a piece (review 3, F11).
+
+Optionally each note's oscillators are split into ``G`` overlapping groups by frequency (weights ``W[P, G, Q]``,
+summing to 1 over ``G``), and each group follows its own gain curve ``m[P, G, L]`` (the physics-aware residual's
+time-varying spectral shape): ``y = ramp * sum_q a_q E_q sin(phi_q) * sum_g W_gq m_g``. Gradients reach ``m`` too.
 """
 
 import math
@@ -51,22 +55,27 @@ def _modes(freq, alpha, adamp, rs_nats, tau64, tau, tc, D, S, want_cos):
 
 class OscBank(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, freq, alpha, amp, adamp, tc, c_note, c_onset, rs_nats, onset, rs_delay, t0, sr):
+    def forward(ctx, freq, alpha, amp, adamp, tc, c_note, c_onset, rs_nats, onset, rs_delay, t0, sr, W=None, m=None):
         L = c_note.shape[-1]
         tau64, tau, x, ramp, Draw, D, S = _common(t0, sr, L, onset, tc, c_note, c_onset, rs_delay, freq.dtype)
         Ms, _ = _modes(freq, alpha, adamp, rs_nats, tau64, tau, tc, D, S, want_cos=False)
-        y = torch.bmm(amp[:, None, :], Ms)[:, 0] * ramp
-        ctx.save_for_backward(freq, alpha, amp, adamp, tc, c_note, c_onset, rs_nats, onset, rs_delay)
+        if m is None:
+            y = torch.bmm(amp[:, None, :], Ms)[:, 0] * ramp
+        else:
+            y = (torch.bmm(W * amp[:, None, :], Ms) * m).sum(1) * ramp
+        ctx.save_for_backward(freq, alpha, amp, adamp, tc, c_note, c_onset, rs_nats, onset, rs_delay, W, m)
         ctx.t0, ctx.sr = t0, sr
         return y
 
     @staticmethod
     def backward(ctx, gy):
-        freq, alpha, amp, adamp, tc, c_note, c_onset, rs_nats, onset, rs_delay = ctx.saved_tensors
+        freq, alpha, amp, adamp, tc, c_note, c_onset, rs_nats, onset, rs_delay, W, m = ctx.saved_tensors
         L = c_note.shape[-1]
         tau64, tau, x, ramp, Draw, D, S = _common(ctx.t0, ctx.sr, L, onset, tc, c_note, c_onset, rs_delay, freq.dtype)
         Ms, Mc = _modes(freq, alpha, adamp, rs_nats, tau64, tau, tc, D, S, want_cos=True)
         G = gy * ramp
+        if m is not None:
+            return _grouped_backward(gy, G, ramp, x, tau, Draw, D, S, tc, freq, amp, adamp, W, m, Ms, Mc)
         rel = tau - 0.5 * tc[:, None]
         R = torch.bmm(Ms, torch.stack([G, G * tau, G * D], -1))  # [P, Q, 3]
         d_amp = R[..., 0]
@@ -82,9 +91,49 @@ class OscBank(torch.autograd.Function):
         d_c_note = -G * yd * (Draw > 0)
         d_c_onset = -d_c_note.sum(-1)
         d_rs = -(G * S * ys).sum(-1)
-        return d_freq, d_alpha, d_amp, d_adamp, d_tc, d_c_note, d_c_onset, d_rs, None, None, None, None
+        return d_freq, d_alpha, d_amp, d_adamp, d_tc, d_c_note, d_c_onset, d_rs, None, None, None, None, None, None
 
 
-def osc_bank(freq, alpha, amp, adamp, tc, c_note, c_onset, rs_nats, onset, rs_delay, t0, sr):
-    """``[P, Q]`` oscillators, ``[P]`` note scalars, ``c_note[P, L]``, ``rs_delay[P, R]`` -> ``y[P, L]``."""
-    return OscBank.apply(freq, alpha, amp, adamp, tc, c_note, c_onset, rs_nats, onset, rs_delay, t0, sr)
+def _grouped_backward(gy, G, ramp, x, tau, Draw, D, S, tc, freq, amp, adamp, W, m, Ms, Mc):
+    """The backward with group gain curves: each oscillator's sample weight is ``M_q = sum_g W_gq m_g``, so every
+    reduction over samples runs once per group (``Gm = G * m_g``) and is folded back over the groups with ``W``."""
+    Gn = m.shape[1]
+    Gm = G[:, None, :] * m  # [P, G, L]
+    rel = tau - 0.5 * tc[:, None]
+    WT = W.transpose(1, 2)  # [P, Q, G]
+    R = torch.bmm(Ms, torch.cat([Gm, Gm * tau[:, None], Gm * D[:, None]], 1).transpose(1, 2))  # [P, Q, 3G]
+    d_amp = (WT * R[..., :Gn]).sum(-1)
+    d_alpha = -amp * (WT * R[..., Gn:2 * Gn]).sum(-1)
+    d_adamp = -amp * (WT * R[..., 2 * Gn:]).sum(-1)
+    d_freq = (2 * math.pi) * amp * (WT * torch.bmm(Mc, (Gm * rel[:, None]).transpose(1, 2))).sum(-1)
+    Wa = W * amp[:, None, :]
+    Y = torch.bmm(Wa, Ms)  # [P, G, L]: each group's sum before its gain
+    ys = (Y * m).sum(1)
+    yd = (torch.bmm(Wa * adamp[:, None, :], Ms) * m).sum(1)
+    yc = (torch.bmm(Wa * freq[:, None, :], Mc) * m).sum(1)
+    dramp_dtc = torch.where(x < 1, -0.5 * math.pi * torch.sin(math.pi * x.clamp(max=1)) * tau / tc[:, None] ** 2,
+                            torch.zeros_like(x))
+    d_tc = (gy * dramp_dtc * ys).sum(-1) - math.pi * (G * yc).sum(-1)
+    d_c_note = -G * yd * (Draw > 0)
+    d_c_onset = -d_c_note.sum(-1)
+    d_rs = -(G * S * ys).sum(-1)
+    d_m = G[:, None, :] * Y
+    return d_freq, d_alpha, d_amp, d_adamp, d_tc, d_c_note, d_c_onset, d_rs, None, None, None, None, None, d_m
+
+
+def osc_bank(freq, alpha, amp, adamp, tc, c_note, c_onset, rs_nats, onset, rs_delay, t0, sr, W=None, m=None):
+    """``[P, Q]`` oscillators, ``[P]`` note scalars, ``c_note[P, L]``, ``rs_delay[P, R]`` -> ``y[P, L]``; optionally
+    group weights ``W[P, G, Q]`` (no gradient) and group gain curves ``m[P, G, L]``."""
+    return OscBank.apply(freq, alpha, amp, adamp, tc, c_note, c_onset, rs_nats, onset, rs_delay, t0, sr, W, m)
+
+
+def group_weights(freq, centers):
+    """Soft frequency groups ``[..., G, Q]`` for oscillators at ``freq[..., Q]``: raised-cosine bands one octave
+    apart in log f (``centers`` must be octaves), summing to 1; flat below the first centre and above the last."""
+    lf = torch.log2(freq.clamp(min=1.0))[..., None, :]
+    c = torch.log2(torch.as_tensor(centers, dtype=freq.dtype, device=freq.device))[:, None]
+    d = (lf - c).clamp(-1, 1)
+    w = torch.cos(0.5 * math.pi * d) ** 2
+    w[..., 0, :] = torch.where(lf[..., 0, :] < c[0], torch.ones_like(w[..., 0, :]), w[..., 0, :])
+    w[..., -1, :] = torch.where(lf[..., 0, :] > c[-1], torch.ones_like(w[..., -1, :]), w[..., -1, :])
+    return w

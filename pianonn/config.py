@@ -54,6 +54,16 @@ class PianoConfig:
     strike_log_decay: object = 0.0  # log of every decay rate of the note
     strike_decay_tilt: object = 0.0  # log decay rate per octave re 1 kHz: the high partials' early decay
     strike_onset_ms: object = 0.0  # the sound's onset re the MIDI note-on
+    # the learned residual: "gru" (ContextNet: MIDI only, per-note corrections fixed at the onset) or "aware"
+    # (residual.AwareResidual: sees each note's expected energy per octave group of partials from the physics, lets
+    # the sounding notes attend to each other, and gives each note a gain curve per group over time)
+    residual_kind: str = "gru"
+    res_groups: int = 8  # octave groups of partials, centred 62.5 Hz ... 8 kHz
+    res_control: int = 4  # frames per control step of the aware residual (4 x hop = 20 ms)
+    res_dim: int = 96
+    res_heads: int = 4
+    res_layers: int = 2
+    res_curve_db: float = 12.0  # bound of the per-group gain curves
     checkpoint: bool = True
 
     def to_dict(self):

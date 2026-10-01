@@ -238,6 +238,17 @@ In short, on one year (RTX 3090):
   still too strong, the onset rise too fast in R4–R5, phantoms weak in R2. The residual adds 0.005; rendered with the
   per-strike variation on, the distances read 0.032 higher (a random model under median-seeking terms). Checkpoint
   `runs/phase3/step4/train/last.pt`; listening in `runs/phase3/step4/listen/` (the per-strike variation on).
+- **The residual's ceiling** (`docs/tone_measures.md` 13): the context net sees the MIDI history but not what the physics
+  renders, fixes each note's corrections at its onset, and trained late under a budget; it adds 0.006 on test. Free
+  outputs in its own language, fitted per test excerpt on the frozen step-4 model and scored on unseen noise seeds,
+  take off 0.136 per note, 0.219 per frame, 0.268 both (24 excerpts): the output language is not the limit. The gain is
+  per note (a constant correction gives none); how much of it the context can predict is open.
+- **A residual that sees the physics** (13.2, `pianonn/residual.py`, `residual_kind=aware`): each note's expected energy per
+  octave group of partials, attention across the sounding notes, a gain curve per group over each note's life inside
+  the oscillator bank. 30 min on the frozen step-4 physics: −0.010 ± 0.004 on 96 test excerpts (the GRU residual
+  −0.005), about 7 % of the per-note ceiling.
+  Fitted to 8 excerpts alone it reaches 86 % of the full ceiling there (13.3): the architecture can express it; whether
+  the corrections carry over to new pieces is open.
 - **Open:** the physics above, then texture (a GAN branch had no measurable effect in 500 steps) and listening.
 
 The prior is calibrated against the literature (the KTH *Five Lectures on the Acoustics of the Piano*,

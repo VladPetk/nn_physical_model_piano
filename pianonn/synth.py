@@ -22,7 +22,8 @@ from torch.utils.checkpoint import checkpoint
 from .config import PianoConfig
 from .dsp import bounded, fft_convolve, frames_to_samples, linear_recurrence, sample_curve, sample_keyed
 from .physics import LOWEST_MIDI, N_KEYS, PianoPhysics, hammer_velocity, key_curve, log_f_bumps
-from .oscbank import osc_bank
+from .oscbank import group_weights, osc_bank
+from .residual import AwareResidual
 from .room import Room
 
 class ContextNet(nn.Module):
@@ -314,7 +315,8 @@ class NeuralPhysicalPiano(nn.Module):
         super().__init__()
         self.cfg = cfg = cfg or PianoConfig()
         self.physics = PianoPhysics(cfg)
-        self.context = ContextNet(cfg)
+        self.context = (AwareResidual(cfg, ContextNet.NOTE, ContextNet.FRAME) if cfg.residual_kind == "aware"
+                        else ContextNet(cfg))
         self.symp = SympatheticBank(cfg)
         self.noise = NoiseBank(cfg)
         self.room = Room(cfg)
@@ -407,14 +409,15 @@ class NeuralPhysicalPiano(nn.Module):
             sets.append((modes["ph_freq"], modes["ph_alpha"], modes["ph_amp"], modes["ph_alpha_damp"]))
         return sets
 
-    def render_strings(self, modes, ki, onset, mask, C, hist, rs_delay, pan, start, length, per_key=False):
+    def render_strings(self, modes, ki, onset, mask, C, hist, rs_delay, pan, start, length, per_key=False, curves=None):
         """String (bridge-force) signal ``[B, ch, L]`` for samples ``[start, start+length)``, optionally also
         per key (mono) ``[B,88,L]``. ``hist`` = samples of control history before sample 0 on the frame grid.
 
         Per chunk, only the (example, note) pairs that are still audible are rendered: the activity test
         bounds each note's envelope at the chunk start with its dampers and pedals (review 3, F12). Pairs are
         sorted by how many oscillators they need (treble notes need few) and rendered in slices that keep
-        the ``[pairs, oscillators, samples]`` work under ``cfg.bank_elements``."""
+        the ``[pairs, oscillators, samples]`` work under ``cfg.bank_elements``. ``curves``: the aware residual's
+        log gain per note and octave group of partials ``[B, N, G, C]`` at its control frames."""
         cfg = self.cfg
         sr, hop = cfg.sample_rate, cfg.hop
         B, N = ki.shape
@@ -427,6 +430,9 @@ class NeuralPhysicalPiano(nn.Module):
         bi = torch.arange(B, device=ki.device).repeat_interleave(N)
         row = bi * N_KEYS + kf
         C_rows = C.reshape(B * N_KEYS, -1)
+        if curves is not None:
+            c_flat, c_hop = curves.reshape(BN, *curves.shape[2:]), cfg.res_control * hop
+            centers = self.context.centers
         c_onset = sample_keyed(C, ki, onset.clamp(min=-hist / sr) + hist / sr, sr, hop).reshape(BN)
         with torch.no_grad():
             log_amps = [torch.log(st[2].abs() + 1e-30) for st in sets]
@@ -449,6 +455,7 @@ class NeuralPhysicalPiano(nn.Module):
                 continue
             P = idx.numel()
             c_note = frames_to_samples(C_rows.index_select(0, row[idx]), s0 + hist, L, hop)  # [P, L]
+            m_note = torch.exp(frames_to_samples(c_flat.index_select(0, idx), s0, L, c_hop)) if curves is not None else None
             y = C.new_zeros(P, L)
             for si, (freq, alpha, amp, adamp) in enumerate(sets):
                 nv = n_valid[si][idx]
@@ -461,8 +468,11 @@ class NeuralPhysicalPiano(nn.Module):
                     sl = order[i: i + cnt]
                     pid = idx[sl]
                     sel = lambda x: x.index_select(0, pid)
+                    grp = ((group_weights(sel(freq)[:, :hi].detach(), centers), m_note.index_select(0, sl))
+                           if curves is not None else ())
                     ys = osc_bank(sel(freq)[:, :hi], sel(alpha)[:, :hi], sel(amp)[:, :hi], sel(adamp)[:, :hi], sel(tc),
-                                  c_note.index_select(0, sl), sel(c_onset), sel(rs_nats), sel(on), sel(rsd), s0 / sr, sr)
+                                  c_note.index_select(0, sl), sel(c_onset), sel(rs_nats), sel(on), sel(rsd), s0 / sr, sr,
+                                  *grp)
                     y = y.index_add(0, sl, ys)
                     i += cnt
             out.append(C.new_zeros(B, ch, L).index_add(0, bi[idx], y[:, None, :] * pan_f[idx][:, :, None]))
@@ -565,8 +575,18 @@ class NeuralPhysicalPiano(nn.Module):
         C = torch.cat([engagement.new_zeros(B, N_KEYS, 1), torch.cumsum(engagement[..., :-1], -1) * hop / sr], -1)
 
         soft_on = sample_curve(pedals[:, 1], onset.clamp(min=-t_hist) + t_hist, sr, hop)
-        ctx, frame_ctx = {}, None
-        if residual:
+        ctx, frame_ctx, curves = {}, None, None
+        if residual and cfg.residual_kind == "aware":
+            with torch.no_grad():  # what the physics alone would play: the residual's view, not steered through
+                modes0 = self.physics.modes(ki, u, soft_on, cond, None, phantoms=cfg.n_phantoms > 0)
+                modes0["amp"] = modes0["amp"] * mask[..., None, None]
+                if "ph_amp" in modes0:
+                    modes0["ph_amp"] = modes0["ph_amp"] * mask[..., None]
+                rs0 = self.next_strikes(ki, onset, mask)
+            ctx, frame_ctx, curves = self.context(onset_roll, key_down, pedals, ki, u, onset, offset, mask, cond, H,
+                                                  n_samples, self._flat_sets(modes0), modes0["restrike"], rs0, C,
+                                                  engagement)
+        elif residual:
             ctx, frame_ctx = self.context(onset_roll, key_down, pedals, ki, u, (onset + t_hist) * sr / hop, cond, H)
         # per-strike variation: the keys and the context net follow the MIDI, the sound starts at the jittered onset;
         # ``out["ctx"]`` stays the context net's own (the residual budget penalises it)
@@ -590,7 +610,8 @@ class NeuralPhysicalPiano(nn.Module):
         strings, symp, state = [], [], None
         for s0 in range(0, n_samples, block):
             L = min(block, n_samples - s0)
-            s, own = self.render_strings(modes, ki, onset, mask, C, H * hop, rs_delay, pan, s0, L, per_key=cfg.use_sympathetic)
+            s, own = self.render_strings(modes, ki, onset, mask, C, H * hop, rs_delay, pan, s0, L, per_key=cfg.use_sympathetic,
+                                         curves=curves)
             strings.append(s)
             if cfg.use_sympathetic:
                 y, state = self.symp(own.sum(1), own, key_modes, engagement, s0 + H * hop, state)
@@ -653,4 +674,6 @@ class NeuralPhysicalPiano(nn.Module):
             view = fft_convolve(view, ir.detach()) if cfg.use_room else view
             out["audio_texture"] = view + fl.detach() if fl is not None else view
         out["ctx"], out["frame_ctx"] = ctx, frame_ctx
+        if curves is not None:
+            out["curves"] = curves
         return out

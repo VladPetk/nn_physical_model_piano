@@ -270,6 +270,30 @@ def test_osc_bank_gradients_match_autograd():
                                     rtol=1e-4)
 
 
+def test_osc_bank_group_gains():
+    """With group gain curves (the physics-aware residual): gains of 1 give the plain bank's output, and the
+    hand-written backward, the curves' gradient included, agrees with finite differences."""
+    from pianonn.oscbank import group_weights, osc_bank
+
+    torch.manual_seed(0)
+    P, Q, L, sr, Gn = 3, 5, 64, 2000.0, 3
+    d = dict(dtype=torch.float64)
+    inputs = ((100 + 300 * torch.rand(P, Q, **d)), (0.5 + 3 * torch.rand(P, Q, **d)), torch.randn(P, Q, **d),
+              (1 + 5 * torch.rand(P, Q, **d)), (0.004 + 0.01 * torch.rand(P, **d)),
+              torch.cumsum(torch.rand(P, L, **d), -1) / sr, 0.001 * torch.rand(P, **d), 0.5 + torch.rand(P, **d))
+    onset = torch.tensor([0.0, 0.005, -0.01], **d)
+    rs_delay = torch.tensor([[0.012, math.inf], [math.inf, math.inf], [0.02, 0.025]], **d)
+    W = group_weights(inputs[0], [125.0, 250.0, 500.0])
+    assert torch.allclose(W.sum(1), torch.ones(P, Q, **d))
+    plain = osc_bank(*inputs, onset, rs_delay, 0.0, sr)
+    ones = osc_bank(*inputs, onset, rs_delay, 0.0, sr, W, torch.ones(P, Gn, L, **d))
+    assert torch.allclose(plain, ones, atol=1e-12)
+    m = (0.5 + torch.rand(P, Gn, L, **d))
+    inputs = tuple(x.requires_grad_() for x in inputs + (m,))
+    assert torch.autograd.gradcheck(lambda *a: osc_bank(*a[:-1], onset, rs_delay, 0.0, sr, W, a[-1]), inputs,
+                                    eps=1e-7, atol=1e-5, rtol=1e-4)
+
+
 def test_damper_delay_is_learnable():
     """The release edge is fractional in frames, so the loss has a gradient w.r.t. the per-condition damper delay."""
     cfg = small_cfg(use_noise=False, use_sympathetic=False)
@@ -415,3 +439,37 @@ def test_strike_brightness_and_decay_keep_the_note_level():
         assert torch.tensor(lv).abs().max() < 0.3, (kw, lv)
         if "strike_log_decay" not in kw:
             assert torch.tensor(ce).std() > 50, (kw, ce)
+
+
+def _aware_setup():
+    m = NeuralPhysicalPiano(small_cfg(residual_kind="aware", use_sympathetic=False, res_dim=32, res_heads=4))
+    n = 8000
+    perf = make_perf(m, n, [(60, 0.1, 0.5, 80), (43, -0.3, 0.8, 100), (100, 0.2, 0.3, 40), (60, 0.4, 0.9, 90),
+                            (30, -2.0, -1.0, 60)], sustain=lambda t: (t > 0.6).float())
+    return m, perf, n
+
+
+def test_aware_residual_starts_neutral_and_scales_exactly():
+    """The physics-aware residual starts at zero output (the strings as without it); a gain of 2 on every octave group
+    (the groups sum to one per partial) doubles the strings exactly."""
+    m, perf, n = _aware_setup()
+    with torch.no_grad():
+        base = m(perf, n, residual=False)["strings"]
+        out = m(perf, n, residual=True)
+        assert out["curves"].shape[:3] == (1, 5, m.cfg.res_groups)
+        assert torch.allclose(out["strings"], base, atol=1e-6)
+        bound = m.cfg.res_curve_db * math.log(10) / 20
+        m.context.curve_head[-1].bias.fill_(bound * math.atanh(math.log(2) / bound))
+        doubled = m(perf, n, residual=True)["strings"]
+    assert torch.allclose(doubled, 2 * base, atol=1e-5)
+
+
+def test_aware_residual_gradients():
+    """Gradients reach every output head of the aware residual (through the oscillator bank for the curves)."""
+    m, perf, n = _aware_setup()
+    out = m(perf, n, residual=True)
+    assert torch.isfinite(out["audio"]).all()
+    out["audio"].pow(2).mean().backward()
+    for name in ["context.curve_head.1.weight", "context.onset_head.2.weight", "context.mix_head.2.weight"]:
+        g = dict(m.named_parameters())[name].grad
+        assert g is not None and torch.isfinite(g).all() and g.abs().sum() > 0, name

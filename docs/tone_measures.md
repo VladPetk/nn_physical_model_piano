@@ -3,7 +3,7 @@
 A design for round 3: derive what we measure, and what we train on, from what a piano note is made of. Sections
 0–8 are the design; sections 9–11 report what has been built, how each measure was validated and what it found
 (status 2026-09-30). The physics it points to is in 10.4, revised in 11.4; section 12 is phase 3: its order and its
-steps so far (per-key B, the strike comb's sign; the body's Q and the hall).
+steps so far (per-key B, the strike comb's sign; the body's Q and the hall); section 13 the learned residual and its ceiling.
 
 ## 0. Why
 
@@ -1065,3 +1065,118 @@ redistributed with velocity (the velocity curve +4 dB at the softest segment, �
 `scripts/listen_page.py`): 8 × 12 s test excerpts soft to loud and the demo score, 2 × 20 s, 3 × 45 s; the recording,
 the round-2 control, the step-3 model and step 4, rendered as the model renders (the per-strike variation on). Not yet
 listened to by the owner.
+
+## 13. The residual (2026-10-01)
+
+The context net (`ContextNet`, `pianonn/synth.py`) adds 0.005 to the step-4 model on test (12.9). How it is built
+(read in the code): a one-layer GRU (128) over the piano roll (onset velocities, key-down curves, three pedals) with 12 s
+of history, so it sees the MIDI before the window; it does not see what the physics renders (no partial levels, decay
+state or spectrum, and a key embedding of its own rather than the physics' per-key values). Its per-note outputs are
+read once, at the note's onset frame, and stay fixed for the note's life; its only time-varying outputs are 16 band
+gains (±6 dB) on the whole dry mix and a noise path. Every output is a bounded knob the physics already has (gain,
+contact time, decay, tilt, six log-f bumps, knock, a slow attack noise). In step 4 it trained only in stage 2, which
+began together with the cosine decay (~8,300 steps at a falling rate), under the residual budget, alongside per-key
+tables that take whatever is the same at every strike of a key.
+
+### 13.1 The ceiling of its output language
+
+`scripts/residual_ceiling.py` (`runs/residual/ceiling/`): the step-4 model frozen, the per-strike variation off, its
+context net replaced by free outputs per test excerpt in the net's own language and bounds, fitted by Adam on the
+training loss (150 steps, a fresh noise draw per step, no budget) and scored on render-noise seeds the fit never saw.
+24 test excerpts (the first 24 of `compare.md`'s), mean ± 2 se over excerpts, variant − physics:
+
+| variant | total | band | fine | attack | log-mel (dB) |
+|---|---|---|---|---|---|
+| physics (absolute) | 0.7015 | 0.3663 | 0.5978 | 0.3716 | 3.25 |
+| the trained net | −0.006 ± 0.006 | −0.003 ± 0.003 | −0.003 ± 0.004 | −0.006 ± 0.004 | −0.04 ± 0.04 |
+| free per-note outputs | −0.136 ± 0.019 | −0.076 ± 0.011 | −0.053 ± 0.007 | −0.095 ± 0.018 | −0.66 ± 0.10 |
+| free per-frame outputs | −0.219 ± 0.015 | −0.128 ± 0.011 | −0.070 ± 0.009 | −0.146 ± 0.020 | −0.83 ± 0.07 |
+| both | −0.268 ± 0.020 | −0.155 ± 0.015 | −0.106 ± 0.011 | −0.173 ± 0.023 | −1.05 ± 0.09 |
+
+(The residual's paths on at zero output: +0.001 ± 0.002. The fits were still falling slowly at 150 steps, so these
+ceilings are, if anything, low.) For scale: step 4 gained 0.028 over the round-2 control.
+
+- **The output language is not what holds the residual back.** Per-note corrections alone, fixed over each note's life,
+  could take off ~20 times what the net does. The per-frame variant is a generous bound: free band gains every 5 ms can
+  trace an excerpt's envelope in a way no predictor from MIDI could.
+- **The gain is per note, not a shared bias.** Of each per-note output's variance, 8–23 % is one value per excerpt
+  (`outputs.md`; the knock 23 %). Every note given the medians of the fitted outputs scores +0.009 ± 0.014 against the
+  physics (`constant.md`): no gain. (The medians per output are not the best joint constant; a fitted constant was not
+  tried.)
+- **Simple context features barely rank the corrections** (595 notes struck in the loss windows, Spearman): |ρ| ≤ 0.14
+  against velocity, pitch, keys down, the gap to the previous onset and to the same key's previous onset, except the
+  contact time against the same key's gap (−0.22: re-struck keys want to be brighter) and the size (not the sign) of
+  the spectral bumps against pitch and velocity (−0.63, −0.38). The fitted per-note level spreads by 3.1 dB (sd); the
+  piano's own strike-to-strike level spread on isolated notes is 1.5–2.3 dB (12.7). So part of the ceiling is likely
+  strike-to-strike variation no context can predict; how much, this check cannot say.
+- The decay and tilt corrections sit at their bounds for 35 % and 42 % of notes (per-note variant).
+
+What is open is how much of the ceiling a predictor from the context can reach. Next checks, proposed: (1) the
+current net retrained on the frozen physics with no budget and no decay overlap (whether the training regime is the
+limit); (2) if that stays small, a predictor that sees the physics' own render and each note's state, with per-note
+outputs that vary over time.
+
+### 13.2 A residual that sees the physics (first run)
+
+Built (`pianonn/residual.py`, config `residual_kind=aware`; tests in `tests/test_model.py`). Per control frame (20 ms) over
+the rendered window, for every note that sounds there:
+- **What it sees:** the note's expected energy in 8 octave groups of partials (62.5 Hz–8 kHz), computed from the physics'
+  modal parameters without the residual (amplitudes, decay rates, the damper integral, re-strikes; no oscillators
+  rendered, no gradient), the same summed over all notes, the difference of the two, the note's age, whether its key is
+  held, its damper, the pedals, its key and velocity, the excerpt's level, and a GRU's summary of the MIDI history
+  (12 s).
+- **How:** two layers of attention across the sounding notes at each frame, each followed by a GRU over the note's own
+  frames (causal).
+- **What it changes:** per note, a gain curve for each octave group of partials (±12 dB), applied inside the oscillator
+  bank (`osc_bank` with group weights, its analytic backward extended and gradchecked): the note's spectral shape over
+  time. Also the onset-time outputs of `ContextNet.NOTE`, read at the note's first frame, and the per-frame mix outputs
+  of `ContextNet.FRAME`. Every output layer starts at zero; 470k parameters.
+
+**The run** (`runs/residual/aware/`): the step-4 physics, room and noise frozen (the residual attack noise `noise.att`
+trains), the residual from scratch, no budget, lr 1e-3 (5e-4 for the residual), warm-up 100 steps, cosine decay over
+the second half, 30 min = 1,000 steps at 1.8 s per step (10.8 GB). Validation, 64 segments, physics 0.7199: with the
+residual 0.7161, 0.7064, 0.7077, 0.6987, 0.7052 at steps 200–1000 (the checks move by about ±0.005).
+
+**On 96 test excerpts** (`compare.md`, 2 seeds, variation off; difference from physics alone, mean ± 2 se):
+
+| | total | band | fine | attack | log-mel (dB) |
+|---|---|---|---|---|---|
+| the GRU residual (step 4, ~8,300 steps) | −0.005 ± 0.004 | −0.003 ± 0.002 | −0.002 ± 0.002 | −0.004 ± 0.003 | −0.02 ± 0.02 |
+| the aware residual, `last.pt` (1,000 steps) | −0.010 ± 0.004 | −0.006 ± 0.002 | −0.005 ± 0.002 | −0.006 ± 0.004 | −0.06 ± 0.03 |
+| the aware residual, `best.pt` (step 800) | −0.004 ± 0.006 | −0.003 ± 0.003 | −0.004 ± 0.002 | −0.000 ± 0.005 | −0.01 ± 0.03 |
+
+- Twice the old residual's gain, in an eighth of its steps; still about 7 % of the per-note ceiling (−0.136 on the
+  first 24 of these excerpts, 13.1).
+- `best.pt`, picked on validation, is worse on test than `last.pt`: at this size the 64 validation segments cannot rank
+  checkpoints.
+- Whether more training would take it further, this run cannot say: validation is flat within its noise after step
+  400. Not yet looked at: which outputs it uses, and how large its curves are.
+
+**In-sample** (`compare_train.md`: 96 excerpts of the training pieces, the same seeds; the windows are not those the
+run drew, the pieces are): the aware residual −0.016 ± 0.004 (band −0.009, fine −0.007, attack −0.012, log-mel −0.09
+dB), the GRU residual −0.007 ± 0.004. On the training pieces it gains about 1.6 times what it gains on test (the GRU
+1.4 times): small either way. The residual is far from fitting even the pieces it trained on, so after 1,000 steps the
+gap to the ceiling is not overfitting; whether it is too few steps, too little capacity or what cannot be predicted
+from the context, this does not separate.
+
+### 13.3 Can it express the ceiling? A memorisation test
+
+`scripts/residual_ceiling.py --variants aware --max-batches 1` (`runs/residual/memorise/`): the aware residual of 13.2,
+from its 30-min weights, trained on the first 8 test excerpts alone (400 steps, lr 1e-3, a fresh noise draw per step),
+then scored on the noise seeds of 13.1, against the free outputs fitted to the same 8 excerpts (13.1's first batch):
+
+| | total | band | fine | attack | log-mel (dB) |
+|---|---|---|---|---|---|
+| physics | 0.727 | 0.376 | 0.592 | 0.406 | 3.41 |
+| the aware residual as trained (13.2) | 0.714 | 0.370 | 0.590 | 0.393 | 3.33 |
+| free per-note outputs | 0.592 | 0.302 | 0.545 | 0.306 | 2.78 |
+| free per-frame outputs | 0.501 | 0.252 | 0.529 | 0.233 | 2.60 |
+| both | 0.452 | 0.226 | 0.493 | 0.207 | 2.39 |
+| **the aware residual, fitted to these 8** | **0.489** | 0.247 | 0.514 | 0.227 | 2.47 |
+
+Fitted to them, the network goes past the free per-note and per-frame outputs and gets 86 % of the way to both
+together (−0.238 ± 0.028 of −0.275), its loss still falling at 400 steps. So the architecture can express nearly all of
+the ceiling: its capacity and output path (20 ms control, ±12 dB groups, its features) are not what holds it at
+−0.010 on new excerpts. What is left is whether the corrections carry over from piece to piece: too few steps or too
+little data for that, or corrections no context predicts (strike-to-strike variation). A longer run that tracks the
+training and test pieces side by side would separate the first from the last.
