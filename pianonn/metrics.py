@@ -44,19 +44,50 @@ def log_mel_db(sr, device):
     return lambda p, t: torch.stack([10 * mel(p[i:i + 1], t[i:i + 1]) for i in range(p.shape[0])])
 
 
-def make_terms(sr, device, weights=(1.0, 0.25, 0.5)):
+def make_terms(sr, device, weights=(1.0, 0.25, 0.5), level_weight=0.0):
     """``f(pred, target, onsets, onset_mask) -> {name: [B]}``: the new loss and its terms, the trial's loss and its
-    two terms, and log-mel (dB)."""
-    new = PianoLoss(sr, weights=weights).to(device)
+    two terms, and log-mel (dB). With ``level_weight`` also ``new: level`` and ``train total`` (the loss as the runs
+    since phase 4 train on it: ``new: total`` + ``level_weight`` x level); ``new: total`` keeps its old meaning."""
+    new = PianoLoss(sr, weights=weights, level_weight=level_weight).to(device)
     mel = log_mel_db(sr, device)
 
     def terms(p, t, on, om):
         total, parts = new(p, t, on, om, per_example=True)
         sc, lm = old_terms(p, t)
-        return {"new: total": total, **{f"new: {k}": v for k, v in parts.items()},
-                "old: MR-STFT": sc + lm, "old: SC only": sc, "old: log-mag only": lm, "log-mel (dB)": mel(p, t)}
+        out = {"new: total": total, **{f"new: {k}": v for k, v in parts.items()},
+               "old: MR-STFT": sc + lm, "old: SC only": sc, "old: log-mag only": lm, "log-mel (dB)": mel(p, t)}
+        if level_weight:
+            out["train total"], out["new: total"] = total, total - level_weight * parts["level"]
+        return out
 
     return terms
+
+
+def clustered_mean(d, groups):
+    """Mean of ``d`` (per excerpt) and its standard error with excerpts grouped (by piece): excerpts of one piece
+    are not independent, so the error counts the groups, not the excerpts. Returns ``(mean, se, n_groups)``."""
+    d, groups = np.asarray(d, float), np.asarray(groups)
+    ids = np.unique(groups)
+    m = d.mean()
+    sums = np.array([(d[groups == g] - m).sum() for g in ids])
+    G = len(ids)
+    se = math.sqrt(G / max(G - 1, 1) * (sums ** 2).sum()) / len(d) if G > 1 else float("nan")
+    return float(m), se, G
+
+
+def piece_gains_loo(e_model, e_rec, groups):
+    """Gain (dB) per excerpt that matches the model's level to the recording's for its piece, from the piece's
+    *other* excerpts (leave one out), so an excerpt is never scored with a gain fitted on itself. ``e_model``,
+    ``e_rec``: energies per excerpt. Excerpts alone in their piece get 0 dB; returns ``(gains, n_alone)``."""
+    e_model, e_rec, groups = (np.asarray(x) for x in (e_model, e_rec, groups))
+    gains, alone = np.zeros(len(e_model)), 0
+    for i in range(len(e_model)):
+        other = (groups == groups[i]) & (np.arange(len(e_model)) != i)
+        if other.any():
+            gains[i] = 10 * math.log10(e_rec[other].sum() / max(e_model[other].sum(), 1e-30))
+        else:
+            alone += 1
+    return gains, alone
 
 
 def band_split(x, sr, centers=CENTERS):

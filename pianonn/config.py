@@ -89,6 +89,15 @@ class PianoConfig:
     res_heads: int = 4
     res_layers: int = 2
     res_curve_db: float = 12.0  # bound of the per-group gain curves
+    # the aware residual's wider outputs (review 6, 8.2; 0 / 16 = as before): a gain curve per partial for this many
+    # partials (the rest share the last) instead of per octave group; the per-frame noise path in this many bands (the
+    # noise bank has ``noise_bands``); a noise path per note in this many bands, re the note's own expected energy (it
+    # follows the note's decay and dampers); this many random inputs per note, drawn afresh at every render (the
+    # residual can vary from strike to strike, which an energy score can train)
+    res_curve_partials: int = 0
+    res_noise_bands: int = 16
+    res_note_noise: int = 0
+    res_latent: int = 0
     checkpoint: bool = True
 
     def to_dict(self):

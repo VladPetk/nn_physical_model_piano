@@ -14,8 +14,16 @@ could take 0.136 off the test loss where it took 0.006 (docs/tone_measures.md 13
   note's spectral shape over time), the onset-time corrections of ``ContextNet.NOTE`` (knock, attack noise, ...)
   read at the note's first frame, and the per-frame mix outputs of ``ContextNet.FRAME``.
 
-Every output layer starts at zero, so switching it on starts from the physics. The features are computed without
-gradient: the residual cannot steer the physics through them.
+Wider outputs (config ``res_*``, review 6, 8.2; off by default): a gain curve per partial (``res_curve_partials``)
+instead of per octave group; the per-frame noise path in more bands (``res_noise_bands``); a noise path per note
+(``res_note_noise`` bands), its power a level re the note's own expected energy at each control frame, so it follows
+the note's decay, dampers and re-strikes (energy between its partials that comes and goes with it), starting at the
+earliest one control step after the onset (it ramps in over the next, never before the hammer); and random inputs per
+note (``res_latent``, drawn afresh at every render), so the corrections can vary from strike to strike as the takes do.
+
+Every output layer starts at zero, so switching it on starts from the physics (the per-note noise at
+``NOTE_NOISE_BASE``, 60 dB under its note). The features are computed without gradient: the residual cannot steer the
+physics through them.
 """
 
 import math
@@ -24,9 +32,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .dsp import sample_keyed
+from .dsp import frames_to_samples, interp_bands, sample_keyed
 from .oscbank import RESTRIKE_RAMP, group_weights
 from .physics import N_KEYS
+
+NOTE_NOISE_BASE = -60 / 20 * math.log(10)  # the per-note noise at zero output: -60 dB re its note (log amplitude)
+NOTE_NOISE_BOUND = 5.5  # its range around that (log amplitude, +-48 dB)
 
 
 def group_centers(n):
@@ -80,14 +91,19 @@ class AwareResidual(nn.Module):
         self.midi_gru = nn.GRU(H, H, batch_first=True)
         self.key_table = nn.Embedding(N_KEYS, 16)
         self.cond_table = nn.Embedding(cfg.n_conditions, 16)
-        self.tok_in = nn.Sequential(nn.Linear(3 * G + self.N_SCALARS + 32 + H, d), nn.GELU(), nn.Linear(d, d))
+        self.tok_in = nn.Sequential(nn.Linear(3 * G + self.N_SCALARS + 32 + H + cfg.res_latent, d), nn.GELU(),
+                                    nn.Linear(d, d))
         self.layers = nn.ModuleList(_Layer(d, cfg.res_heads) for _ in range(cfg.res_layers))
-        self.curve_head = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, G))
+        self.curve_head = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, cfg.res_curve_partials or G))
         n_note = sum(n for n, _ in note_spec.values())
         n_frame = sum(n for n, _ in frame_spec.values())
         self.onset_head = nn.Sequential(nn.Linear(d + H + 33, d), nn.GELU(), nn.Linear(d, n_note))
         self.mix_head = nn.Sequential(nn.Linear(d + H + G + 16, d), nn.GELU(), nn.Linear(d, n_frame))
-        for head in (self.curve_head, self.onset_head, self.mix_head):
+        heads = [self.curve_head, self.onset_head, self.mix_head]
+        if cfg.res_note_noise:
+            self.noise_head = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, cfg.res_note_noise))
+            heads.append(self.noise_head)
+        for head in heads:
             nn.init.zeros_(head[-1].weight)
             nn.init.zeros_(head[-1].bias)
 
@@ -129,13 +145,17 @@ class AwareResidual(nn.Module):
         eng = engagement[..., f_idx].gather(1, ki[..., None].expand(-1, -1, Cn))
         ped = pedals[..., f_idx]  # [B, 3, C]
         return {"own": db(e), "mix": db(mix), "tau": tau, "started": started, "sounding": sounding, "keep": keep,
-                "held": key_held, "damper": eng, "pedals": ped, "S": S, "level": torch.log10(ref) / 10}
+                "held": key_held, "damper": eng, "pedals": ped, "S": S, "level": torch.log10(ref) / 10,
+                "energy": e.sum(2), "settled": (t[None, None] - K * hop / sr >= onset[..., None]) & mask[..., None]}
 
     def forward(self, onset_roll, key_down, pedals, ki, u, onset, offset, mask, cond, hist_frames, n_samples, sets,
-                restrike, rs_delay, C, engagement):
-        """Returns ``(note, frame, curves)``: ``ContextNet.NOTE`` outputs per note, ``ContextNet.FRAME`` outputs
+                restrike, rs_delay, C, engagement, latent=None):
+        """Returns ``(note, frame, curves)``: ``ContextNet.NOTE`` outputs per note, the frame outputs (``frame_spec``)
         ``[B, bands, F]`` over the window's frames, and log-amplitude gain curves ``[B, N, G, C]`` per note and octave
-        group of partials at the control frames (``res_control * hop`` samples apart, from the window's first)."""
+        group of partials (or partial, ``res_curve_partials``) at the control frames (``res_control * hop`` samples
+        apart, from the window's first). With ``res_note_noise``, ``frame["note_noise"]`` is the per-note noise summed
+        over the notes: power ``[B, noise_bands, F]`` (the noise bank's bands, its units). ``latent``: the random inputs
+        ``[B, N, res_latent]``."""
         cfg = self.cfg
         H = hist_frames
         B, N = ki.shape
@@ -164,10 +184,11 @@ class AwareResidual(nn.Module):
             un[..., None].expand(-1, -1, Cn), (kin.float()[..., None] / (N_KEYS - 1)).expand(-1, -1, Cn),
             f["level"].view(B, 1, 1).expand(-1, Np, Cn), valid.float()[..., None].expand(-1, -1, Cn)], -1)
         assert scal.shape[-1] == self.N_SCALARS
+        extra = [take(latent)[:, :, None].expand(-1, -1, Cn, -1)] if cfg.res_latent else []
         tok = torch.cat([own.transpose(2, 3), mixe.transpose(2, 3), (own - mixe).transpose(2, 3), scal,
                          self.key_table(kin)[:, :, None].expand(-1, -1, Cn, -1),
                          cemb[:, None, None].expand(-1, Np, Cn, -1),
-                         h_ctrl[:, None].expand(-1, Np, -1, -1)], -1)  # [B, Np, C, ...]
+                         h_ctrl[:, None].expand(-1, Np, -1, -1), *extra], -1)  # [B, Np, C, ...]
         z = self.tok_in(tok)
         active = take(f["sounding"]) & valid[..., None]  # [B, Np, C]
         act_k = active.permute(0, 2, 1)  # [B, C, Np] as keys
@@ -180,8 +201,9 @@ class AwareResidual(nn.Module):
         # not gated at the onset: the strings are silent before it, and a gate would ramp the gain in over the
         # first control step of every note
         curves_p = bound * torch.tanh(self.curve_head(z) / bound)  # [B, Np, C, G]
-        curves = curves_p.new_zeros(B, N, Cn, G).scatter(
-            1, order[..., None, None].expand(-1, -1, Cn, G), curves_p * valid[..., None, None].float())
+        Gc = curves_p.shape[-1]
+        curves = curves_p.new_zeros(B, N, Cn, Gc).scatter(
+            1, order[..., None, None].expand(-1, -1, Cn, Gc), curves_p * valid[..., None, None].float())
         curves = curves.transpose(2, 3)  # [B, N, G, C]
 
         # onset-time outputs from each kept note's first frame in the window, with the MIDI state at its onset
@@ -202,5 +224,12 @@ class AwareResidual(nn.Module):
         m = F.interpolate(m.transpose(1, 2), size=(Cn - 1) * K, mode="linear", align_corners=False)[..., :Fw]
         if m.shape[-1] < Fw:
             m = torch.cat([m, m[..., -1:].expand(-1, -1, Fw - m.shape[-1])], -1)
-        frame = _bounded_split(m.transpose(1, 2), self.frame_spec)
-        return note, {k: v.transpose(1, 2) for k, v in frame.items()}, curves
+        frame = {k: v.transpose(1, 2) for k, v in _bounded_split(m.transpose(1, 2), self.frame_spec).items()}
+
+        if cfg.res_note_noise:  # each note's noise: a level per band re its own expected energy, summed over the notes
+            lv = NOTE_NOISE_BOUND * torch.tanh(self.noise_head(z) / NOTE_NOISE_BOUND)  # [B, Np, C, bands]
+            lv = interp_bands(lv.transpose(2, 3), cfg.noise_bands)  # [B, Np, noise_bands, C]
+            on = (take(f["settled"]) & valid[..., None]).float() * take(f["energy"])  # [B, Np, C]
+            pw = (torch.exp(2 * (NOTE_NOISE_BASE + lv)) * on[:, :, None]).sum(1)  # [B, noise_bands, C]
+            frame["note_noise"] = frames_to_samples(pw, 0, Fw, K)  # control steps -> frames, exactly (frame j at j / K)
+        return note, frame, curves

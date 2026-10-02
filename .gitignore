@@ -15,3 +15,5 @@ CLAUDE.md
 
 !samples/**/*.wav
 !samples/**/*.flac
+/samples
+/runs

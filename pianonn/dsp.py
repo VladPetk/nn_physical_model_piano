@@ -61,6 +61,28 @@ def frames_to_samples(x: torch.Tensor, start: int, length: int, hop: int) -> tor
     return x[..., i0] * (1 - w) + x[..., i0 + 1] * w
 
 
+def frames_to_samples_adjoint(g: torch.Tensor, start: int, n_frames: int, hop: int) -> torch.Tensor:
+    """The transpose of ``frames_to_samples``: sample values ``g[..., L]`` (for samples ``[start, start + L)``) summed
+    back onto ``n_frames`` frames with the interpolation's weights (its backward pass)."""
+    L = g.shape[-1]
+    pos = torch.arange(start, start + L, device=g.device, dtype=torch.float64) / hop
+    i0 = pos.floor().long().clamp(0, n_frames - 2)
+    w = (pos - i0).clamp(0, 1).to(g.dtype)
+    out = g.new_zeros(*g.shape[:-1], n_frames)
+    out.index_add_(out.dim() - 1, i0, g * (1 - w))
+    out.index_add_(out.dim() - 1, i0 + 1, g * w)
+    return out
+
+
+def interp_bands(x: torch.Tensor, n_out: int) -> torch.Tensor:
+    """Linearly resample band values ``[..., n_in, F]`` (band axis -2) to ``n_out`` bands."""
+    n_in = x.shape[-2]
+    pos = torch.linspace(0, n_in - 1, n_out, device=x.device)
+    i0 = pos.floor().long().clamp(max=n_in - 2)
+    w = (pos - i0)[:, None]
+    return x[..., i0, :] * (1 - w) + x[..., i0 + 1, :] * w
+
+
 def sample_keyed(x: torch.Tensor, key: torch.Tensor, t: torch.Tensor, sr: int, hop: int) -> torch.Tensor:
     """Read per-key frame curves ``x[B, K, F]`` at per-note times ``t[B, N]`` (seconds) for keys ``key[B, N]``."""
     B, K, F = x.shape

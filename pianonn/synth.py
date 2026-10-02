@@ -20,9 +20,9 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from .config import PianoConfig
-from .dsp import bounded, fft_convolve, frames_to_samples, linear_recurrence, sample_curve, sample_keyed
+from .dsp import bounded, fft_convolve, frames_to_samples, interp_bands, linear_recurrence, sample_curve, sample_keyed
 from .physics import LOWEST_MIDI, N_KEYS, PianoPhysics, hammer_velocity, key_curve, log_f_bumps
-from .oscbank import group_weights, osc_bank
+from .oscbank import RESTRIKE_RAMP, group_weights, osc_bank, partial_group_weights
 from .residual import AwareResidual
 from .room import Room
 
@@ -218,13 +218,7 @@ def _span_inv(v, lo, hi):
     return torch.log(x / (1 - x))
 
 
-def _interp_bands(x, n_out):
-    """Linearly resample band values ``[..., n_in, F]`` (band axis -2) to ``n_out`` bands."""
-    n_in = x.shape[-2]
-    pos = torch.linspace(0, n_in - 1, n_out, device=x.device)
-    i0 = pos.floor().long().clamp(max=n_in - 2)
-    w = (pos - i0)[:, None]
-    return x[..., i0, :] * (1 - w) + x[..., i0 + 1, :] * w
+_interp_bands = interp_bands
 
 
 class NoiseBank(nn.Module):
@@ -463,6 +457,7 @@ class NoiseBank(nn.Module):
 # log amplitude (white-equivalent, dry domain) of the R3 noise path at zero output: ~-104 dB, i.e. below the loss
 # floor after the room, so switching the residual on starts (nearly) neutral; the context net can raise it by 35 dB
 R3_NOISE_BASE = -12.0
+LATENT_SEED = 1_000_003  # the aware residual's random inputs: drawn from the render's seed plus this
 
 # per-strike variation (config ``strike_*``, docs/tone_measures.md 12.7): the dimensions, the MIDI pitches of their
 # per-register knots (R2..R6 centres) and the clip of the normal draws
@@ -505,7 +500,8 @@ class NeuralPhysicalPiano(nn.Module):
         super().__init__()
         self.cfg = cfg = cfg or PianoConfig()
         self.physics = PianoPhysics(cfg)
-        self.context = (AwareResidual(cfg, ContextNet.NOTE, ContextNet.FRAME) if cfg.residual_kind == "aware"
+        frame_spec = dict(ContextNet.FRAME, noise_level=(cfg.res_noise_bands, ContextNet.FRAME["noise_level"][1]))
+        self.context = (AwareResidual(cfg, ContextNet.NOTE, frame_spec) if cfg.residual_kind == "aware"
                         else ContextNet(cfg))
         self.symp = SympatheticBank(cfg)
         self.noise = NoiseBank(cfg)
@@ -518,6 +514,9 @@ class NeuralPhysicalPiano(nn.Module):
         self.strike_on = self.strike_on or self.strike_partial_on
         self.register_buffer("strike_partial_sd", psd if psd is not None else torch.zeros(len(STRIKE_PARTIAL_DIMS), N_KEYS),
                              persistent=False)
+        # the aware residual's gain curves: per octave group of partials (0), or one group per partial for this many
+        # partials (config res_curve_partials; scripts/fit_passages.py sets it for its free outputs)
+        self.curve_partials = cfg.res_curve_partials
 
     def n_frames(self, n_samples: int) -> int:
         return n_samples // self.cfg.hop + 2
@@ -639,7 +638,9 @@ class NeuralPhysicalPiano(nn.Module):
         C_rows = C.reshape(B * N_KEYS, -1)
         if curves is not None:
             c_flat, c_hop = curves.reshape(BN, *curves.shape[2:]), cfg.res_control * hop
-            centers = self.context.centers
+            centers = None if self.curve_partials else self.context.centers
+            f_part = flat(modes["freq"][..., 0]) if self.curve_partials else None  # [BN, partials]: the groups' centres
+            M = modes["freq"].shape[-1]
         c_onset = sample_keyed(C, ki, onset.clamp(min=-hist / sr) + hist / sr, sr, hop).reshape(BN)
         with torch.no_grad():
             log_amps = [torch.log(st[2].abs() + 1e-30) for st in sets]
@@ -662,7 +663,11 @@ class NeuralPhysicalPiano(nn.Module):
                 continue
             P = idx.numel()
             c_note = frames_to_samples(C_rows.index_select(0, row[idx]), s0 + hist, L, hop)  # [P, L]
-            m_note = torch.exp(frames_to_samples(c_flat.index_select(0, idx), s0, L, c_hop)) if curves is not None else None
+            if curves is not None:  # the control frames around this chunk, as log gains (the bank interpolates them)
+                c_lo, c_hi = s0 // c_hop, min(c_flat.shape[-1], (s0 + L - 1) // c_hop + 2)
+                m_note = c_flat[..., c_lo:c_hi].index_select(0, idx)
+            else:
+                m_note = None
             y = C.new_zeros(P, L)
             for si, (freq, alpha, amp, adamp) in enumerate(sets):
                 nv = n_valid[si][idx]
@@ -675,8 +680,15 @@ class NeuralPhysicalPiano(nn.Module):
                     sl = order[i: i + cnt]
                     pid = idx[sl]
                     sel = lambda x: x.index_select(0, pid)
-                    grp = ((group_weights(sel(freq)[:, :hi].detach(), centers), m_note.index_select(0, sl))
-                           if curves is not None else ())
+                    if curves is None:
+                        grp = ()
+                    elif self.curve_partials:
+                        grp = (partial_group_weights(si, sel(freq)[:, :hi].detach(), f_part.index_select(0, pid), M,
+                                                     self.curve_partials), m_note.index_select(0, sl), s0 - c_lo * c_hop,
+                               c_hop)
+                    else:
+                        grp = (group_weights(sel(freq)[:, :hi].detach(), centers), m_note.index_select(0, sl),
+                               s0 - c_lo * c_hop, c_hop)
                     ys = osc_bank(sel(freq)[:, :hi], sel(alpha)[:, :hi], sel(amp)[:, :hi], sel(adamp)[:, :hi], sel(tc),
                                   c_note.index_select(0, sl), sel(c_onset), sel(rs_nats), sel(on), sel(rsd), s0 / sr, sr,
                                   *grp)
@@ -717,6 +729,8 @@ class NeuralPhysicalPiano(nn.Module):
         r3 = None
         if residual and frame_ctx is not None:
             r3 = torch.exp(2 * (R3_NOISE_BASE + _interp_bands(frame_ctx["noise_level"], cfg.noise_bands)))
+            if "note_noise" in frame_ctx:  # the aware residual's per-note noise, summed over the notes
+                r3 = r3 + frame_ctx["note_noise"]
         out, res_out = [], []
         for s0 in range(0, n_samples, block):
             L = min(block, n_samples - s0)
@@ -793,9 +807,14 @@ class NeuralPhysicalPiano(nn.Module):
                 if "ph_amp" in modes0:
                     modes0["ph_amp"] = modes0["ph_amp"] * mask[..., None]
                 rs0 = self.next_strikes(ki, onset, mask)
+            latent = None
+            if cfg.res_latent:  # its own stream: the strike, noise and floor draws of a seed stay as without it
+                g = (None if generator is None else
+                     torch.Generator(device=generator.device).manual_seed(generator.initial_seed() + LATENT_SEED))
+                latent = torch.randn(B, N, cfg.res_latent, generator=g, device=pitch.device)
             ctx, frame_ctx, curves = self.context(onset_roll, key_down, pedals, ki, u, onset, offset, mask, cond, H,
                                                   n_samples, self._flat_sets(modes0), modes0["restrike"], rs0, C,
-                                                  engagement)
+                                                  engagement, latent=latent)
         elif residual:
             ctx, frame_ctx = self.context(onset_roll, key_down, pedals, ki, u, (onset + t_hist) * sr / hop, cond, H)
         # per-strike variation: the keys and the context net follow the MIDI, the sound starts at the jittered onset;
@@ -888,4 +907,17 @@ class NeuralPhysicalPiano(nn.Module):
         out["ctx"], out["frame_ctx"] = ctx, frame_ctx
         if curves is not None:
             out["curves"] = curves
+        # what pianonn.partial_view reads: each note's partials as rendered, its sound onset (s re the window), and what
+        # else shapes its envelope (oscbank: exp(-alpha tau - alpha_damp damp - restrike)) at the control frames from
+        # sample 0: the damper-on time since its onset (s) and the re-strikes of its key so far (nats)
+        with torch.no_grad():
+            Fr = F - H
+            c_key = C.gather(1, ki[..., None].expand(-1, -1, F))[..., H:]  # [B, N, Fr]
+            c_on = sample_keyed(C, ki, onset.clamp(min=-t_hist) + t_hist, sr, hop)
+            t_k = torch.arange(Fr, device=pitch.device, dtype=onset.dtype) * hop / sr
+            S = ((t_k[None, None, None] - onset[..., None, None] - rs_delay[..., None]) / RESTRIKE_RAMP).clamp(0, 1).sum(2)
+        out["partials"] = {"freq": modes["freq"][..., 0].detach(), "amp": modes["amp"].detach(),
+                           "alpha": modes["alpha"].detach(), "onset": onset.detach(), "mask": mask,
+                           "alpha_damp": modes["alpha_damp"].detach(), "damp": (c_key - c_on[..., None]).clamp(min=0),
+                           "restrike": modes["restrike"].detach()[..., None] * S, "ctrl_hop": hop / sr}
         return out

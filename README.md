@@ -276,6 +276,27 @@ In short, on one year (RTX 3090):
   310-min run the excess is about halved, the music loss is slightly better (−0.0084 on test excerpts) and does not
   pull against the envelope term. Checkpoint `runs/phase6/train_run/train/last.pt`; listening in
   [`samples/phase6/`](samples/phase6/).
+- **Review 6** ([`docs/reviews/review_6_training.md`](docs/reviews/review_6_training.md), 2026-10-02): the training loss
+  calibrated on 96 validation excerpts (13 pieces). The model against the recording reads 0.86 with the per-strike
+  variation off and 0.91 with it on; against another draw of itself 0.59 and 0.65: a gap of about 0.26, of which 0.05
+  is each piece's recording level. The floor is a stand-in (it depends on the variation set by hand). Phases 4–6 read
+  0.846, 0.873, 0.860. 75 % of the loss's weight is on notes younger than 0.5 s, 12 % after 1 s; the unison mistuning
+  is still its random draw (correlation 0.98). A critique corrected several of the review's readings (its section 7):
+  the loss is not shown to be *the* cause, and what makes the renders sound synthetic is not known. The proposal for
+  moving forward is its section 8 (not built): listen to excerpts fitted with the residual's current and extended
+  outputs, then one long run of the residual from step 0 at the full rate without the budget, and the note
+  objectives (attack, early level, fades) moved from fits before training into the training batch with every
+  parameter free; the mined frequencies, the initialisation from data and the bench stay.
+- **The composite score** (review 6, section 11, 2026-10-02; uncommitted): one training loss with read-by-read and
+  pooled comparisons (`pianonn/partial_view.py`, `pianonn/composite.py`), checked on known changes
+  (`scripts/score_check.py`). The main bias found was the render, not the score: trained without the per-strike
+  variation, every term pulls the aftersound ~4 dB low against varied takes; as an energy score with the variation on
+  the pulls shrink. Training on it (`--score composite --energy`) with a wider residual (a curve per partial, noise
+  per note, random inputs): the first smoke run diverged (pools across steps lagged the residual); the second, 30
+  min, lowers the composite on held-out and training pieces level matched per piece (0.726 → 0.690 held out), through
+  the pooled, level and onset terms; the band and partial terms do not move, and unmatched the held-out score rises
+  (0.770 → 0.806: the model got louder). The setup is written up in
+  [`docs/composite_score.md`](docs/composite_score.md); listening in [`samples/composite_smoke2/`](samples/composite_smoke2/).
 
 The prior is calibrated against the literature (the KTH *Five Lectures on the Acoustics of the Piano*,
 arXiv and Zenodo papers) and against 260 recorded notes of a Steinway B, analysed with the same code as the

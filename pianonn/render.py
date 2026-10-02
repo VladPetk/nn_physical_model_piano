@@ -12,7 +12,13 @@ from .synth import NeuralPhysicalPiano
 
 
 def load_weights(model, state_dict, log=print):
-    """Load a checkpoint, tolerating parameters added since it was written (they keep their defaults)."""
+    """Load a checkpoint, tolerating parameters added since it was written (they keep their defaults) and parameters
+    whose shape the config has changed (the aware residual's wider outputs; they keep their initialisation too)."""
+    own = model.state_dict()
+    reshaped = [k for k, v in state_dict.items() if k in own and own[k].shape != v.shape]
+    if reshaped:
+        state_dict = {k: v for k, v in state_dict.items() if k not in reshaped}
+        log(f"checkpoint: {len(reshaped)} parameter(s) of another shape left at their initialisation {reshaped[:6]}")
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing or unexpected:
         log(f"checkpoint: {len(missing)} new parameter(s) at their defaults {missing[:6]}, "
@@ -20,11 +26,12 @@ def load_weights(model, state_dict, log=print):
     return model
 
 
-def load_model(ckpt=None, device="cpu", **overrides):
+def load_model(ckpt=None, device="cpu", ema=True, **overrides):
+    """A model from a checkpoint; with ``ema`` (default) its averaged weights where it has them (train.py --ema)."""
     if ckpt:
         state = torch.load(ckpt, map_location=device)
         model = NeuralPhysicalPiano(PianoConfig.from_dict({**state["cfg"], **overrides}))
-        load_weights(model, state["model"])
+        load_weights(model, state["ema"]["weights"] if ema and "ema" in state else state["model"])
     else:
         model = NeuralPhysicalPiano(PianoConfig(**overrides))
     return model.to(device).eval()

@@ -167,13 +167,24 @@ class MaestroSegments(Dataset):
     def __getitem__(self, i):
         import soundfile as sf
 
-        cfg, sr = self.cfg, self.cfg.sample_rate
+        sr = self.cfg.sample_rate
         rng = np.random.default_rng(self.seed * 1_000_003 + i if self.deterministic else None)
         piece = self.pieces[rng.choice(len(self.pieces), p=self.weights)]
         n_samples = int(round((self.warmup + self.segment) * sr))
+        total = sf.info(os.path.join(self.root, piece["audio"])).frames
+        return self._item(piece, int(rng.integers(0, max(1, total - n_samples))))
+
+    def item_at(self, piece_id, start_s):
+        """The example whose window (warm-up included) starts at ``start_s`` seconds into piece ``piece_id``."""
+        piece = next(p for p in self.pieces if p["id"] == piece_id)
+        return self._item(piece, int(round(start_s * self.cfg.sample_rate)))
+
+    def _item(self, piece, start):
+        import soundfile as sf
+
+        cfg, sr = self.cfg, self.cfg.sample_rate
+        n_samples = int(round((self.warmup + self.segment) * sr))
         path = os.path.join(self.root, piece["audio"])
-        total = sf.info(path).frames
-        start = int(rng.integers(0, max(1, total - n_samples)))
         audio, _ = sf.read(path, start=start, frames=n_samples, dtype="float32", always_2d=True)
         audio = np.pad(audio, ((0, n_samples - len(audio)), (0, 0))).T
         if audio.shape[0] != cfg.channels:

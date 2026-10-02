@@ -21,11 +21,17 @@ exact minutes into a piece (review 3, F11).
 Optionally each note's oscillators are split into ``G`` overlapping groups by frequency (weights ``W[P, G, Q]``,
 summing to 1 over ``G``), and each group follows its own gain curve ``m[P, G, L]`` (the physics-aware residual's
 time-varying spectral shape): ``y = ramp * sum_q a_q E_q sin(phi_q) * sum_g W_gq m_g``. Gradients reach ``m`` too.
+With ``c_hop``, ``m`` is instead the log gains at a control rate ``[P, G, C]`` (frame ``c`` at sample ``c * c_hop``
+re the chunk's ``c_start``), interpolated linearly and exponentiated inside, forward and backward: only the control
+values are kept for the backward pass, not ``G`` gains per sample (with a curve per partial, 32 groups, that was
+~5 GB of a training step's 18).
 """
 
 import math
 
 import torch
+
+from .dsp import frames_to_samples, frames_to_samples_adjoint
 
 RESTRIKE_RAMP = 0.002  # s over which a re-strike takes out the ringing vibration (about a contact time)
 
@@ -53,18 +59,25 @@ def _modes(freq, alpha, adamp, rs_nats, tau64, tau, tc, D, S, want_cos):
     return Ms, Mc
 
 
+def _gains(m, c_start, c_hop, L):
+    """The group gains per sample ``[P, G, L]``: ``m`` itself, or with ``c_hop`` its control-rate log gains
+    interpolated and exponentiated."""
+    return m if c_hop is None else torch.exp(frames_to_samples(m, c_start, L, c_hop))
+
+
 class OscBank(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, freq, alpha, amp, adamp, tc, c_note, c_onset, rs_nats, onset, rs_delay, t0, sr, W=None, m=None):
+    def forward(ctx, freq, alpha, amp, adamp, tc, c_note, c_onset, rs_nats, onset, rs_delay, t0, sr, W=None, m=None,
+                c_start=0, c_hop=None):
         L = c_note.shape[-1]
         tau64, tau, x, ramp, Draw, D, S = _common(t0, sr, L, onset, tc, c_note, c_onset, rs_delay, freq.dtype)
         Ms, _ = _modes(freq, alpha, adamp, rs_nats, tau64, tau, tc, D, S, want_cos=False)
         if m is None:
             y = torch.bmm(amp[:, None, :], Ms)[:, 0] * ramp
         else:
-            y = (torch.bmm(W * amp[:, None, :], Ms) * m).sum(1) * ramp
+            y = (torch.bmm(W * amp[:, None, :], Ms) * _gains(m, c_start, c_hop, L)).sum(1) * ramp
         ctx.save_for_backward(freq, alpha, amp, adamp, tc, c_note, c_onset, rs_nats, onset, rs_delay, W, m)
-        ctx.t0, ctx.sr = t0, sr
+        ctx.t0, ctx.sr, ctx.c_start, ctx.c_hop = t0, sr, c_start, c_hop
         return y
 
     @staticmethod
@@ -75,7 +88,12 @@ class OscBank(torch.autograd.Function):
         Ms, Mc = _modes(freq, alpha, adamp, rs_nats, tau64, tau, tc, D, S, want_cos=True)
         G = gy * ramp
         if m is not None:
-            return _grouped_backward(gy, G, ramp, x, tau, Draw, D, S, tc, freq, amp, adamp, W, m, Ms, Mc)
+            g = _gains(m, ctx.c_start, ctx.c_hop, L)
+            out = _grouped_backward(gy, G, ramp, x, tau, Draw, D, S, tc, freq, amp, adamp, W, g, Ms, Mc)
+            d_m = out[-1]
+            if ctx.c_hop is not None:  # through the exponential and the interpolation back to the control frames
+                d_m = frames_to_samples_adjoint(d_m * g, ctx.c_start, m.shape[-1], ctx.c_hop)
+            return out[:-1] + (d_m, None, None)
         rel = tau - 0.5 * tc[:, None]
         R = torch.bmm(Ms, torch.stack([G, G * tau, G * D], -1))  # [P, Q, 3]
         d_amp = R[..., 0]
@@ -91,7 +109,8 @@ class OscBank(torch.autograd.Function):
         d_c_note = -G * yd * (Draw > 0)
         d_c_onset = -d_c_note.sum(-1)
         d_rs = -(G * S * ys).sum(-1)
-        return d_freq, d_alpha, d_amp, d_adamp, d_tc, d_c_note, d_c_onset, d_rs, None, None, None, None, None, None
+        return (d_freq, d_alpha, d_amp, d_adamp, d_tc, d_c_note, d_c_onset, d_rs, None, None, None, None, None, None,
+                None, None)
 
 
 def _grouped_backward(gy, G, ramp, x, tau, Draw, D, S, tc, freq, amp, adamp, W, m, Ms, Mc):
@@ -121,10 +140,28 @@ def _grouped_backward(gy, G, ramp, x, tau, Draw, D, S, tc, freq, amp, adamp, W, 
     return d_freq, d_alpha, d_amp, d_adamp, d_tc, d_c_note, d_c_onset, d_rs, None, None, None, None, None, d_m
 
 
-def osc_bank(freq, alpha, amp, adamp, tc, c_note, c_onset, rs_nats, onset, rs_delay, t0, sr, W=None, m=None):
+def osc_bank(freq, alpha, amp, adamp, tc, c_note, c_onset, rs_nats, onset, rs_delay, t0, sr, W=None, m=None, c_start=0,
+             c_hop=None):
     """``[P, Q]`` oscillators, ``[P]`` note scalars, ``c_note[P, L]``, ``rs_delay[P, R]`` -> ``y[P, L]``; optionally
-    group weights ``W[P, G, Q]`` (no gradient) and group gain curves ``m[P, G, L]``."""
-    return OscBank.apply(freq, alpha, amp, adamp, tc, c_note, c_onset, rs_nats, onset, rs_delay, t0, sr, W, m)
+    group weights ``W[P, G, Q]`` (no gradient) and group gain curves ``m[P, G, L]``, or with ``c_hop`` log gains at
+    the control frames ``[P, G, C]``, frame ``c`` at the chunk's sample ``c * c_hop - c_start``."""
+    return OscBank.apply(freq, alpha, amp, adamp, tc, c_note, c_onset, rs_nats, onset, rs_delay, t0, sr, W, m, c_start,
+                         c_hop)
+
+
+def partial_group_weights(set_index, freq, f_part, modes_per_partial, n_groups):
+    """One group per partial instead of per octave (``NeuralPhysicalPiano.curve_partials``; scripts/fit_passages.py):
+    ``[P, n_groups, Q]`` one-hot weights. Set 0 holds the transverse modes partial-major (oscillator ``q`` is partial
+    ``q // modes_per_partial``); any other set (the phantoms) goes to the partial nearest in log frequency
+    (``f_part[P, partials]``, the partials' frequencies). Partials from ``n_groups`` up share the last group."""
+    P, Q = freq.shape
+    if set_index == 0:
+        g = (torch.arange(Q, device=freq.device) // modes_per_partial).expand(P, Q)
+    else:
+        lf, lp = torch.log(freq.clamp(min=1.0)), torch.log(f_part.clamp(min=1.0))
+        g = (lf[:, :, None] - lp[:, None, :]).abs().argmin(-1)
+    g = g.clamp(max=n_groups - 1)
+    return torch.nn.functional.one_hot(g, n_groups).to(freq.dtype).transpose(1, 2)
 
 
 def group_weights(freq, centers):

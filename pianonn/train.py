@@ -28,6 +28,16 @@ unit). The log reports it, the cosine between its gradient and the rest of the l
 (``ENV_PARAMS``: below 0 they pull against each other) and its gradient's size re theirs; each validation reports it on
 N13's notes of the validation and test pieces, with the median fade error of partials 9-40 at 1 and 1.5 s.
 
+``--score composite`` trains on :class:`pianonn.composite.CompositeLoss` instead (review 6, step 3: read-by-read
+terms, terms pooled across examples and steps, the onset term; its own onset and level terms, so ``--onset-weight``,
+``--level-weight`` and ``--mel-weight`` stay 0), and ``--energy`` scores it as an energy score: each step renders the
+batch a second time without gradient, every random draw afresh, and each term becomes d(render, recording)
+- d(render, second draw) / 2, proper against varied takes (use it with ``--strike-train``). Validation then reports the
+composite (pooled terms pooled over all the validation excerpts; the second draw at seed 1) and the old score
+(``PianoLoss`` with its level term at 0.5) on the first draw, on the validation pieces and, with
+``--val-train-examples``, on excerpts of the training pieces. The log's ``gcos_<module>`` is the cosine between
+successive steps' gradients (independent batches): roughly the share of a step's gradient that is direction.
+
     python -m pianonn.train --data data/maestro24k --years 2018 --out runs/trial --minutes 120
 """
 
@@ -45,10 +55,12 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from torch.utils.data import DataLoader  # noqa: E402
 
+from .composite import CompositeLoss  # noqa: E402
 from .config import PianoConfig  # noqa: E402
 from .data import MaestroSegments, SyntheticPerformances, collate
 from .dsp import bounded
 from .notefit import PieceLevels
+from .partial_view import POOL_MIN, pooled_across
 from .losses import (LogMelLoss, MultiResolutionDiscriminator, MultiResolutionSTFTLoss, OnsetLoss, PianoLoss,
                      band_energies, discriminator_loss, generator_adv_loss, highpass)
 from .synth import ContextNet, NeuralPhysicalPiano
@@ -64,6 +76,64 @@ ENV_PARAMS = ("physics.raw_prompt", "physics.raw_log_b1", "physics.raw_log_b3", 
               "physics.raw_decay_p", "physics.raw_after")  # the strings' decay and the aftersound's level
 
 
+class WeightAverage:
+    """An exponential moving average of the model's weights (parameters and float buffers).
+
+    Adam at 20-50 times the base rate moves the level parameters by up to 1.5 dB from check to check, and the
+    validation loss with them (docs/tone_measures.md 12.9, 17.6; review 6, 4.3). The average is what validation,
+    the audio dumps and the rendered checkpoints use; the raw weights stay in the checkpoint for resuming. The
+    decay starts low (``(1 + n) / (10 + n)``) so the early average is not stuck at the start."""
+
+    def __init__(self, model, decay):
+        self.decay, self.n = decay, 0
+        self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+    @torch.no_grad()
+    def update(self, model):
+        self.n += 1
+        d = min(self.decay, (1 + self.n) / (10 + self.n))
+        for k, v in model.state_dict().items():
+            s = self.shadow[k]
+            if v.is_floating_point():
+                s.mul_(d).add_(v.detach(), alpha=1 - d)
+            else:
+                s.copy_(v)
+
+    def state_dict(self):
+        return {"n": self.n, "decay": self.decay, "weights": self.shadow}
+
+    def load_state_dict(self, state):
+        self.n = state["n"]
+        for k, v in state["weights"].items():
+            if k in self.shadow and self.shadow[k].shape == v.shape:
+                self.shadow[k].copy_(v)
+
+    class _Applied:
+        def __init__(self, avg, model):
+            self.avg, self.model = avg, model
+
+        def __enter__(self):
+            self.raw = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
+            self.model.load_state_dict(self.avg.shadow)
+
+        def __exit__(self, *exc):
+            self.model.load_state_dict(self.raw)
+
+    def applied(self, model):
+        """``with avg.applied(model):`` the model holds the averaged weights inside the block."""
+        return self._Applied(self, model)
+
+
+class _NoAverage:
+    def update(self, model):
+        pass
+
+    def applied(self, model):
+        import contextlib
+
+        return contextlib.nullcontext()
+
+
 @torch.no_grad()
 def perturb_physics(model, scale=0.3, seed=0):
     """Randomise the learnable physical offsets: a stand-in 'real piano' for sanity checks."""
@@ -74,9 +144,10 @@ def perturb_physics(model, scale=0.3, seed=0):
     return model
 
 
-def lr_scale(name):
+def lr_scale(name, residual=0.5):
     """Per-parameter learning-rate multiplier by unit: Adam moves every parameter by ~lr per step, so dB and
-    cents need larger steps than nats, and thousands of FIR taps must move slower than the physics."""
+    cents need larger steps than nats, and thousands of FIR taps must move slower than the physics. ``residual``: the
+    learned residual's (``context.``)."""
     if name == "room.body":
         return 0.03
     if name == "piece_gain":
@@ -86,15 +157,15 @@ def lr_scale(name):
     if name.startswith(CENTS_PARAMS):
         return 5.0
     if name.startswith("context."):
-        return 0.5
+        return residual
     return 1.0
 
 
-def param_groups(model, lr, fir_lr_scale=None):
+def param_groups(model, lr, fir_lr_scale=None, residual_lr=0.5):
     """One group per parameter, so stages can rescale learning rates by name."""
     groups = []
     for name, p in model.named_parameters():
-        s = fir_lr_scale if (fir_lr_scale is not None and name == "room.body") else lr_scale(name)
+        s = fir_lr_scale if (fir_lr_scale is not None and name == "room.body") else lr_scale(name, residual_lr)
         groups.append({"params": [p], "lr": lr * s, "name": name, "base_lr": lr * s})
     return groups
 
@@ -188,6 +259,69 @@ def validate(model, batches, loss_fn, residual, old=None, onset=None):
 
 
 @torch.no_grad()
+def validate_composite(model, batches, comp, residual, energy, old, level_match=True):
+    """The composite on fixed batches: the read-by-read terms and the onset term as means over the batches, the pooled
+    terms pooled over all their excerpts (``pooled_across``, each excerpt weighted by 1 / the render's power); with
+    ``energy``, each term less half its distance to a second draw (seed 1; ``<term>_self``). ``old`` (``PianoLoss``)
+    is reported on the first draw (seed 0) for continuity. With ``level_match`` every render is first scaled to its
+    piece's recorded level, measured on the piece's other excerpts in the set (``metrics.piece_gains_loo``, as
+    ``scripts/compare_runs.py``; an excerpt alone in its piece keeps 0 dB): each piece's recording level (sd ~1.5 dB in
+    2018) is a nuisance that training absorbs in its piece gains, and it would otherwise count as a model error, in the
+    pooled terms most. Returns ``(total, terms)``."""
+    from .metrics import piece_gains_loo
+
+    model.eval()
+    comp.eval()
+    sr = model.cfg.sample_rate
+    renders, e_y, e_t, groups = [], [], [], []
+    for b in batches:
+        n, s = b["audio"].shape[-1], int(b["loss_start"][0])
+        draw = lambda seed: model(b, n, residual=residual,
+                                  generator=torch.Generator(device=b["audio"].device).manual_seed(seed))
+        out = draw(0)
+        full = out["audio"].float()
+        second = draw(1)["audio"].float() if energy else None
+        renders.append((full, second, out["partials"]))
+        energy_of = lambda x: highpass(x[..., s:], sr).pow(2).sum((1, 2)).double().cpu()
+        e_y.append(energy_of(full)), e_t.append(energy_of(b["audio"].float())), groups.append(b["piece"].cpu())
+    gains = np.zeros(sum(len(g) for g in groups))
+    if level_match:
+        gains, _ = piece_gains_loo(torch.cat(e_y).numpy(), torch.cat(e_t).numpy(), torch.cat(groups).numpy())
+    per, cells, i0 = {}, {}, 0
+    for b, (full, second, partials) in zip(batches, renders):
+        n, s = b["audio"].shape[-1], int(b["loss_start"][0])
+        g = torch.as_tensor(10 ** (gains[i0: i0 + len(full)] / 20), dtype=full.dtype, device=full.device)[:, None, None]
+        i0 += len(full)
+        full = full * g
+        p, t = full[..., s:], b["audio"][..., s:].float()
+        notes = dict(partials, onset=partials["onset"] - s / sr, t_ref=-s / sr)
+        terms, sums = comp.read(p, t, notes)
+        terms["onset"] = comp.onset(full, b["audio"].float(), b, s / sr)
+        if energy:
+            second = second * g
+            own, own_sums = comp.read(p, second[..., s:], notes)
+            own["onset"] = comp.self_onset(full, second, b, s / sr)
+            terms.update({k + "_self": v for k, v in own.items()})
+            for k, c in own_sums.items():
+                cells.setdefault(k + "_self", []).append(c)
+        terms["old"] = old(p, t, *onsets_of(b, s, sr))[0]
+        for k, v in terms.items():
+            per[k] = per.get(k, 0.0) + float(v) / len(batches)
+        for k, c in sums.items():
+            cells.setdefault(k, []).append(c)
+    for k, cs in cells.items():
+        P, T, cnt = (torch.cat([c[i] for c in cs]) for i in range(3))
+        eps = torch.cat([c[3] if c[3].dim() == 2 else c[3][None] for c in cs]).amin(0)
+        per[k] = float(pooled_across(P, T, cnt, eps, POOL_MIN.get(k.removesuffix("_self"), 1)))
+    total = sum(w * (per[k] - 0.5 * per.get(k + "_self", 0.0)) for k, w in comp.w.items() if w and k in per)
+    if level_match:
+        per["piece_gain_sd"] = float(np.std(gains))
+    model.train()
+    comp.train()
+    return total, per
+
+
+@torch.no_grad()
 def dump_audio(model, examples, out_dir, tag, residual_too, strike=None):
     """Render the fixed excerpts; ``strike`` switches the per-strike variation on or off for them (None: as it is)."""
     import soundfile as sf
@@ -265,6 +399,18 @@ def main(argv=None):
     ap.add_argument("--env-batch", type=int, default=2, help="N13 notes rendered per step for the envelope term")
     ap.add_argument("--env-cap", type=int, default=40, help="N13 events per cell (as scripts/note_envelope.py --cap)")
     ap.add_argument("--env-seed", type=int, default=1, help="N13 event draw and the order of its notes")
+    ap.add_argument("--score", choices=("piano", "composite"), default="piano",
+                    help="the training loss: PianoLoss (+ the optional terms) or the composite (see above)")
+    ap.add_argument("--energy", action="store_true", help="the composite as an energy score (a second render per step)")
+    ap.add_argument("--pool-decay", type=float, default=0.0,
+                    help="the composite's pooled terms also pooled across steps, decaying by this per step (0: the batch "
+                         "only; 0.97 lagged a fast-moving residual into divergence, runs/composite_train/smoke/)")
+    ap.add_argument("--val-train-examples", type=int, default=0,
+                    help="also validate on this many fixed excerpts of the training pieces (without their piece gains)")
+    ap.add_argument("--residual-lr-scale", type=float, default=0.5,
+                    help="the residual's learning rate re --lr (phase 6: 0.5)")
+    ap.add_argument("--fresh-residual", action="store_true",
+                    help="with --init-from: the residual starts from its initialisation, not the checkpoint's")
     ap.add_argument("--piece-gain", action="store_true",
                     help="fit a free gain (dB, averaging zero) per training piece, applied to the rendered audio before "
                          "every loss term; validation and evaluation render without it")
@@ -280,6 +426,9 @@ def main(argv=None):
     ap.add_argument("--mined", help="scripts/mine_notes.py output: start B and stretch from isolated-note measurements")
     ap.add_argument("--init-examples", type=int, default=32)
     ap.add_argument("--val-examples", type=int, default=24)
+    ap.add_argument("--ema", type=float, default=0.0,
+                    help="decay per step of a moving average of the weights (e.g. 0.995: about 200 steps), used for "
+                         "validation, the audio dumps and rendering from the checkpoints; 0 = off")
     ap.add_argument("--val-every", type=int, default=250)
     ap.add_argument("--dump-every", type=int, default=1000)
     ap.add_argument("--dump-seconds", type=float, default=8.0)
@@ -331,8 +480,11 @@ def main(argv=None):
     if args.init_from and not args.resume:
         from .render import load_weights
 
-        load_weights(model, torch.load(args.init_from, map_location=device)["model"], log=log)
-        log(f"weights from {args.init_from}")
+        sd = torch.load(args.init_from, map_location=device)["model"]
+        if args.fresh_residual:
+            sd = {k: v for k, v in sd.items() if not k.startswith("context.")}
+        load_weights(model, sd, log=log)
+        log(f"weights from {args.init_from}" + (", the residual fresh" if args.fresh_residual else ""))
     has_strike = model.strike_on
     model.strike_on = has_strike and args.strike_train
     if has_strike:
@@ -352,11 +504,22 @@ def main(argv=None):
                                   length=args.val_examples, deterministic=True, years=args.years, seed=1)
         dump_set = MaestroSegments(args.data, "validation", cfg, args.dump_seconds - args.warmup, args.warmup,
                                    args.lookback, length=3, deterministic=True, years=args.years, seed=2)
+        val_train_set = (MaestroSegments(args.data, "train", cfg, args.segment, args.warmup, args.lookback,
+                                         length=args.val_train_examples, deterministic=True, years=args.years, seed=1)
+                         if args.val_train_examples else None)
     loader = DataLoader(dataset, batch_size=args.batch, collate_fn=collate, num_workers=args.workers,
                         persistent_workers=args.workers > 0, pin_memory=device.type == "cuda",
                         prefetch_factor=4 if args.workers > 0 else None)
 
     recon = PianoLoss(cfg.sample_rate, weights=args.loss_weights, level_weight=args.level_weight).to(device)
+    comp = None
+    if args.score == "composite":
+        assert args.onset_weight == 0 and args.level_weight == 0 and args.mel_weight == 0, \
+            "the composite has its own onset and level terms"
+        comp = CompositeLoss(cfg.sample_rate, pool_decay=args.pool_decay).to(device)
+        recon = PianoLoss(cfg.sample_rate, weights=args.loss_weights, level_weight=0.5).to(device)  # the old score
+        log(f"training on the composite{' as an energy score' if args.energy else ''}: weights {comp.w}")
+    assert not args.energy or comp is not None, "--energy needs --score composite"
     old_loss = MultiResolutionSTFTLoss()  # the trial's loss, reported for continuity
     mel_loss = LogMelLoss(cfg.sample_rate).to(device) if args.mel_weight > 0 else None
     onset_loss = (OnsetLoss(cfg.sample_rate, relative=args.onset_relative, pool_decay=args.onset_pool).to(device)
@@ -395,7 +558,7 @@ def main(argv=None):
                f"{rec['env_9+_1s']:+.1f}, at 1.5 s {rec['env_9+_1.5s']:+.1f} dB")
         return rec, msg
     pieces = PieceLevels(len(dataset.pieces)).to(device) if args.piece_gain and teacher is None else None
-    groups = param_groups(model, args.lr)
+    groups = param_groups(model, args.lr, residual_lr=args.residual_lr_scale)
     if pieces is not None:
         groups.append({"params": [pieces.db], "lr": args.lr * lr_scale("piece_gain"), "name": "piece_gain",
                        "base_lr": args.lr * lr_scale("piece_gain")})
@@ -406,6 +569,14 @@ def main(argv=None):
         disc_opt = torch.optim.Adam(disc.parameters(), lr=2e-4, betas=(0.5, 0.9))
 
     step, stage, best, elapsed0 = 0, 1, math.inf, 0.0
+    if args.init_from and not args.resume and pieces is not None:  # a training checkpoint's piece gains, where it has them
+        saved = torch.load(args.init_from, map_location="cpu").get("piece_gain")
+        if saved is not None:
+            saved = dict(zip(saved["ids"], saved["db"].tolist()))
+            with torch.no_grad():
+                pieces.db.copy_(torch.tensor([saved.get(p["id"], 0.0) for p in dataset.pieces], device=device))
+            log(f"piece gains from {args.init_from}: {sum(p['id'] in saved for p in dataset.pieces)} of "
+                f"{len(dataset.pieces)} pieces")
     if args.resume:
         from .render import load_weights
 
@@ -420,7 +591,7 @@ def main(argv=None):
         except ValueError as e:  # parameter set changed: restart the optimiser's moments
             log(f"optimiser state not restored ({e})")
         for g in opt.param_groups:  # the learning-rate policy is this run's (--lr, lr_scale), not the checkpoint's
-            g["base_lr"] = args.lr * lr_scale(g["name"])
+            g["base_lr"] = args.lr * lr_scale(g["name"], args.residual_lr_scale)
         step, stage = state["step"], state["stage"]
         best, elapsed0 = state.get("best", math.inf), state.get("elapsed", 0.0)
         log(f"resumed from {args.resume} at step {step}, stage {stage}, {elapsed0 / 60:.1f} min in, best val {best:.4f}")
@@ -430,9 +601,17 @@ def main(argv=None):
         json.dump({"model": cfg.to_dict(), "args": vars(args)}, f, indent=2)
 
     val_batches = fixed_batches(val_set, args.val_examples, args.batch, device) if val_set else None
+    val_train_batches = (fixed_batches(val_train_set, args.val_train_examples, args.batch, device)
+                         if val_set and val_train_set is not None else None)
+
+    def score_val(batches, residual):
+        """``(total, terms)`` on fixed batches under this run's score."""
+        if comp is not None:
+            return validate_composite(model, batches, comp, residual, args.energy, recon)
+        return validate(model, batches, recon, residual=residual, old=old_loss, onset=onset_val)
     dump_examples = fixed_batches(dump_set, 3, 1, device) if val_set else None
     if val_batches and not args.resume:
-        v_raw, _ = validate(model, val_batches, recon, residual=False, old=old_loss, onset=onset_val)
+        v_raw, _ = score_val(val_batches, False)
         log(f"val ({'start model' if args.init_from else 'untrained prior, before init'}): {v_raw:.4f}", kind="val",
             step=0, val_physics=v_raw, tag="raw_prior")
         if env_val is not None:
@@ -453,10 +632,13 @@ def main(argv=None):
                 est = initialise_from_data(model, fixed_batches(init_set, args.init_examples, args.batch, device),
                                            log=log, tuning=not args.mined, silence=dataset.silence_clips(year))
                 log(f"init estimates {year}", kind="init", year=year, **{k: v for k, v in est.items()})
-            v0, per0 = validate(model, val_batches, recon, residual=False, old=old_loss, onset=onset_val)
+            v0, per0 = score_val(val_batches, False)
             log(f"val (prior after init): {v0:.4f}", kind="val", step=0, val_physics=v0, per_res=per0, tag="init_prior")
         dump_audio(model, dump_examples, os.path.join(args.out, "audio"), "prior", residual_too=False, strike=has_strike)
 
+    avg = WeightAverage(model, args.ema) if args.ema > 0 else _NoAverage()
+    if args.resume and args.ema > 0 and "ema" in state:
+        avg.load_state_dict(state["ema"])
     t_train, steps_run = 0.0, 0
     budget_s = args.minutes * 60 if args.minutes else None
     t_loop = time.time()
@@ -489,6 +671,8 @@ def main(argv=None):
     def save(tag):
         extra = {} if pieces is None else {"piece_gain": {"ids": [p["id"] for p in dataset.pieces],
                                                           "db": (pieces.db - pieces.db.mean()).detach().cpu()}}
+        if isinstance(avg, WeightAverage):
+            extra["ema"] = avg.state_dict()  # render.load_model prefers it; "model" stays the raw weights for --resume
         torch.save({"cfg": cfg.to_dict(), "model": model.state_dict(), "opt": opt.state_dict(), "step": step,
                     "stage": stage, "best": best, "elapsed": elapsed(), "args": vars(args), **extra},
                    os.path.join(args.out, f"{tag}.pt"))
@@ -499,19 +683,28 @@ def main(argv=None):
         nonlocal best
         if not val_batches:
             return
-        v_phys, per = validate(model, val_batches, recon, residual=False, old=old_loss, onset=onset_val)
-        rec = {"kind": "val", "step": step, "stage": stage, "val_physics": v_phys, "per_res": per}
-        msg = f"val step {step}: physics {v_phys:.4f} (" + " ".join(f"{k} {v:.4f}" for k, v in per.items()) + ")"
-        v = v_phys
-        if use_residual():
-            v_res, per_res = validate(model, val_batches, recon, residual=True, old=old_loss, onset=onset_val)
-            rec["val_residual"], rec["per_res_residual"] = v_res, per_res
-            msg += f"  with residual {v_res:.4f}  (unexplained by physics: {v_phys - v_res:+.4f})"
-            v = v_res
-        if env_val is not None:
-            erec, emsg = env_report(use_residual())
-            rec.update(erec)
-            msg += f"; {emsg}"
+        with avg.applied(model):  # the averaged weights, if --ema
+            v_phys, per = score_val(val_batches, False)
+            rec = {"kind": "val", "step": step, "stage": stage, "val_physics": v_phys, "per_res": per}
+            msg = f"val step {step}: physics {v_phys:.4f} (" + " ".join(f"{k} {v:.4f}" for k, v in per.items()) + ")"
+            v = v_phys
+            if use_residual():
+                v_res, per_res = score_val(val_batches, True)
+                rec["val_residual"], rec["per_res_residual"] = v_res, per_res
+                msg += f"  with residual {v_res:.4f}  (unexplained by physics: {v_phys - v_res:+.4f})"
+                v = v_res
+            if val_train_batches:
+                t_phys, tper = score_val(val_train_batches, False)
+                rec["train_physics"], rec["train_per"] = t_phys, tper
+                msg += f"; training pieces: physics {t_phys:.4f}"
+                if use_residual():
+                    t_res, tper_res = score_val(val_train_batches, True)
+                    rec["train_residual"], rec["train_per_residual"] = t_res, tper_res
+                    msg += f", with residual {t_res:.4f}"
+            if env_val is not None:
+                erec, emsg = env_report(use_residual())
+                rec.update(erec)
+                msg += f"; {emsg}"
         log(msg, **rec)
         if v < best:
             best = v
@@ -521,6 +714,7 @@ def main(argv=None):
     t_last = time.time()
     it = iter(loader)
     clip_state = {}  # per module: running typical gradient norm (the trial's global clip at 1.0 scaled every step)
+    prev_grad, gcos = {}, {}  # per module: the last step's gradient, and the cosines with the one before
     adv_from = args.adv_start if args.adv_start >= 0 else math.inf
     if args.adv_with_stage2 and stage >= 2:
         adv_from = step
@@ -552,17 +746,29 @@ def main(argv=None):
             residual = use_residual()
             gan = disc is not None and step >= adv_from
             extras = (("residual_out",) if residual else ()) + (("texture_view",) if gan else ())
+            gain = (10 ** (pieces(batch["piece"]) / 20))[:, None, None] if pieces is not None else None
+            second = None
+            if args.energy:  # the energy score's second draw: every random draw afresh, no gradient
+                with torch.no_grad(), amp_ctx():
+                    second = model(batch, n, residual=residual)["audio"].float()
+                second = second * gain.detach() if gain is not None else second
             with amp_ctx():
                 out = model(batch, n, residual=residual, extras=extras)
-            if pieces is not None:  # the recording's level for this piece: a nuisance, discarded at evaluation
-                out["audio"] = out["audio"] * (10 ** (pieces(batch["piece"]) / 20))[:, None, None]
+            if gain is not None:  # the recording's level for this piece: a nuisance, discarded at evaluation
+                out["audio"] = out["audio"] * gain
             pred, tgt = out["audio"][..., s:].float(), target[..., s:].float()
 
             logs = {}
-            logs["recon"], parts = recon(pred, tgt, *onsets_of(batch, s, cfg.sample_rate))
-            logs.update(parts)
+            if comp is not None:
+                logs["score"], parts = comp(out["audio"].float(), target.float(), batch, s, out["partials"], second)
+                logs.update(parts)
+                loss = logs["score"]
+            else:
+                logs["recon"], parts = recon(pred, tgt, *onsets_of(batch, s, cfg.sample_rate))
+                logs.update(parts)
+                loss = logs["recon"]
             logs["reg"] = model.physics.regularizer(batch["condition"]) + pan_smoothness(model, batch["condition"])
-            loss = logs["recon"] + args.reg * logs["reg"]
+            loss = loss + args.reg * logs["reg"]
             if mel_loss is not None:
                 logs["mel"] = mel_loss(pred, tgt)
                 loss = loss + args.mel_weight * logs["mel"]
@@ -587,6 +793,12 @@ def main(argv=None):
                 loss = loss + args.adv_weight * (logs["adv"] + 2.0 * logs["fm"])  # reaches GAN_PARAMS only
 
             opt.zero_grad(set_to_none=True)
+            # the regulariser's own gradient (fixed from step to step), kept out of the gradient agreement (gcos)
+            trainable = [p for p in model.parameters() if p.requires_grad]
+            reg_grad = {}
+            if logs["reg"].requires_grad:
+                reg_grad = dict(zip(map(id, trainable), torch.autograd.grad(args.reg * logs["reg"], trainable,
+                                                                            retain_graph=True, allow_unused=True)))
             loss.backward()
             if envs is not None:
                 dec = [p for name, p in model.named_parameters() if name.startswith(ENV_PARAMS) and p.grad is not None]
@@ -613,7 +825,7 @@ def main(argv=None):
                 del y
         except torch.OutOfMemoryError:  # a rare batch with many notes (stage 2): skip it rather than crash
             oom = True
-            out = pred = tgt = loss = logs = y = None
+            out = pred = tgt = loss = logs = y = second = reg_grad = None
         if oom:
             opt.zero_grad(set_to_none=True)
             if disc_opt is not None:
@@ -629,6 +841,12 @@ def main(argv=None):
                 continue
             norm = float(torch.stack([p.grad.norm() for p in ps]).norm())
             gnorm[mod] = norm
+            flat = torch.cat([(p.grad if reg_grad.get(id(p)) is None else p.grad - reg_grad[id(p)]).detach().flatten()
+                              for p in ps])
+            last = prev_grad.get(mod)
+            if last is not None and last.shape == flat.shape and math.isfinite(norm):
+                gcos.setdefault(mod, []).append(float(flat @ last / (flat.norm() * last.norm() + 1e-30)))
+            prev_grad[mod] = flat
             if not math.isfinite(norm):
                 finite = False
                 continue
@@ -647,6 +865,7 @@ def main(argv=None):
             warm = min(1.0, (step - g["warm_from"]) / args.lr_warmup) if args.lr_warmup > 0 else 1.0
             g["lr"] = g["base_lr"] * g["stage_scale"] * decay * warm
         opt.step()
+        avg.update(model)
         if device.type == "cuda":
             torch.cuda.synchronize()
         t_train += time.time() - t0
@@ -656,6 +875,10 @@ def main(argv=None):
             vals = {k: float(v.detach()) for k, v in logs.items()}
             if pieces is not None:
                 vals["piece_sd"] = float(pieces.db.std())
+            for mod, cs in gcos.items():
+                if cs:
+                    vals[f"gcos_{mod}"] = float(np.mean(cs))
+            gcos.clear()
             if env_hist:
                 h = np.array(env_hist[-args.log_every:])
                 vals.update(env_db=float(h[:, 0].mean()), env_cos=float(np.nanmean(h[:, 1])),
@@ -670,8 +893,9 @@ def main(argv=None):
         if step % args.val_every == 0:
             run_validation()
         if dump_examples and step % args.dump_every == 0:
-            dump_audio(model, dump_examples, os.path.join(args.out, "audio"), f"step{step}", residual_too=use_residual(),
-                       strike=has_strike)
+            with avg.applied(model):
+                dump_audio(model, dump_examples, os.path.join(args.out, "audio"), f"step{step}",
+                           residual_too=use_residual(), strike=has_strike)
         if step % args.save_every == 0:
             save("last")
         if budget_s and elapsed() >= budget_s:
@@ -680,8 +904,9 @@ def main(argv=None):
 
     run_validation()
     if dump_examples:
-        dump_audio(model, dump_examples, os.path.join(args.out, "audio"), f"step{step}", residual_too=use_residual(),
-                   strike=has_strike)
+        with avg.applied(model):
+            dump_audio(model, dump_examples, os.path.join(args.out, "audio"), f"step{step}",
+                       residual_too=use_residual(), strike=has_strike)
     save("last")
     log(f"done: {step} steps, best val {best:.4f}")
 

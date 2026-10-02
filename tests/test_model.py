@@ -294,6 +294,30 @@ def test_osc_bank_group_gains():
                                     eps=1e-7, atol=1e-5, rtol=1e-4)
 
 
+def test_osc_bank_control_rate_gains():
+    """Log gains at a control rate, interpolated inside the bank: the same output as the sample-rate gains they
+    interpolate to, and the backward through the interpolation agrees with finite differences."""
+    from pianonn.dsp import frames_to_samples
+    from pianonn.oscbank import group_weights, osc_bank
+
+    torch.manual_seed(0)
+    P, Q, L, sr, Gn, hop, start = 3, 5, 64, 2000.0, 3, 16, 5
+    d = dict(dtype=torch.float64)
+    inputs = ((100 + 300 * torch.rand(P, Q, **d)), (0.5 + 3 * torch.rand(P, Q, **d)), torch.randn(P, Q, **d),
+              (1 + 5 * torch.rand(P, Q, **d)), (0.004 + 0.01 * torch.rand(P, **d)),
+              torch.cumsum(torch.rand(P, L, **d), -1) / sr, 0.001 * torch.rand(P, **d), 0.5 + torch.rand(P, **d))
+    onset = torch.tensor([0.0, 0.005, -0.01], **d)
+    rs_delay = torch.tensor([[0.012, math.inf], [math.inf, math.inf], [0.02, 0.025]], **d)
+    W = group_weights(inputs[0], [125.0, 250.0, 500.0])
+    c = 0.3 * torch.randn(P, Gn, (start + L) // hop + 2, **d)
+    a = osc_bank(*inputs, onset, rs_delay, 0.0, sr, W, torch.exp(frames_to_samples(c, start, L, hop)))
+    b = osc_bank(*inputs, onset, rs_delay, 0.0, sr, W, c, start, hop)
+    assert torch.allclose(a, b, atol=1e-12)
+    inputs = tuple(x.requires_grad_() for x in inputs + (c,))
+    assert torch.autograd.gradcheck(lambda *a: osc_bank(*a[:-1], onset, rs_delay, 0.0, sr, W, a[-1], start, hop),
+                                    inputs, eps=1e-7, atol=1e-5, rtol=1e-4)
+
+
 def test_damper_delay_is_learnable():
     """The release edge is fractional in frames, so the loss has a gradient w.r.t. the per-condition damper delay."""
     cfg = small_cfg(use_noise=False, use_sympathetic=False)
@@ -475,6 +499,52 @@ def test_aware_residual_gradients():
         assert g is not None and torch.isfinite(g).all() and g.abs().sum() > 0, name
 
 
+def _wide_setup():
+    m = NeuralPhysicalPiano(small_cfg(residual_kind="aware", use_sympathetic=False, res_dim=32, res_heads=4,
+                                      res_curve_partials=8, res_note_noise=4, res_latent=3))
+    n = 8000
+    perf = make_perf(m, n, [(60, 0.3, 0.8, 80), (43, 0.5, 0.9, 100)])
+    return m, perf, n
+
+
+def test_wide_residual_starts_neutral():
+    """The wider outputs start at the physics: the strings exactly, the per-note noise 60 dB under the notes."""
+    m, perf, n = _wide_setup()
+    with torch.no_grad():
+        base = m(perf, n, residual=False)["strings"]
+        out = m(perf, n, residual=True, generator=torch.Generator().manual_seed(0))
+    assert out["curves"].shape[:3] == (1, 2, 8)
+    assert torch.allclose(out["strings"], base, atol=1e-6)
+    ratio = out["noise_res"].pow(2).mean() / base.pow(2).mean()
+    assert 1e-8 < ratio < 1e-5, ratio
+
+
+def test_note_noise_follows_its_note():
+    """The per-note noise is silent before its note's onset (and the control step after it) and comes in after."""
+    m, perf, n = _wide_setup()
+    with torch.no_grad():
+        m.context.noise_head[-1].bias.fill_(4.0)
+        pw = m(perf, n, residual=True)["frame_ctx"]["note_noise"][0].sum(0)  # [frames]
+    t = torch.arange(pw.shape[-1]) * m.cfg.hop / m.cfg.sample_rate
+    assert pw[t < 0.3].abs().max() == 0
+    assert (pw[(t > 0.36) & (t < 0.8)] > 0).all()
+
+
+def test_latent_varies_the_residual_by_seed():
+    """The random inputs: the same seed gives the same residual, another seed another; gradients reach the new heads."""
+    m, perf, n = _wide_setup()
+    torch.nn.init.normal_(m.context.curve_head[-1].weight, std=0.5)
+    curves = lambda seed: m(perf, n, residual=True, generator=torch.Generator().manual_seed(seed))["curves"]
+    with torch.no_grad():
+        a, b, c = curves(0), curves(0), curves(1)
+    assert torch.equal(a, b) and not torch.allclose(a, c)
+    out = m(perf, n, residual=True)
+    out["audio"].pow(2).mean().backward()
+    for name in ["context.curve_head.1.weight", "context.noise_head.1.weight"]:
+        g = dict(m.named_parameters())[name].grad
+        assert g is not None and torch.isfinite(g).all() and g.abs().sum() > 0, name
+
+
 def _parts_model(**kw):
     cfg = small_cfg(**{"sample_rate": 24000, "hop": 120, "noise_bands": 32, "use_sympathetic": False,
                        "attack_model": "parts", **kw})
@@ -634,3 +704,20 @@ def _kernel_power(k, f, sr):
     z = (k.double() * torch.exp(-2j * math.pi * f * n)).sum()
     return float(z.abs() ** 2)
 
+
+
+def test_partial_groups_follow_the_partial_number():
+    """scripts/fit_passages.py's extended outputs: one gain curve per partial. Transverse oscillators are stored
+    partial-major (q // modes), phantoms join the partial nearest in frequency, the last group takes the rest."""
+    from pianonn.oscbank import partial_group_weights
+
+    M, P = 3, 6
+    f_part = 100.0 * torch.arange(1, P + 1, dtype=torch.float32)[None]  # partials at 100 ... 600 Hz
+    freq = f_part.repeat_interleave(M, -1)  # [1, P*M]
+    W = partial_group_weights(0, freq, f_part, M, 4)
+    assert W.shape == (1, 4, P * M) and torch.all(W.sum(1) == 1)
+    assert W[0, :, 0:3].argmax(0).tolist() == [0, 0, 0] and W[0, :, 6:9].argmax(0).tolist() == [2, 2, 2]
+    assert W[0, 3, 9:].sum() == 9  # partials 4-6 share the last group
+    ph = torch.tensor([[205.0, 395.0]])  # phantoms near partials 2 and 4
+    Wp = partial_group_weights(1, ph, f_part, M, 8)
+    assert Wp[0].argmax(0).tolist() == [1, 3]
