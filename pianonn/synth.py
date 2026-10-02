@@ -19,6 +19,7 @@ import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from . import cuda_ext
 from .config import PianoConfig
 from .dsp import bounded, fft_convolve, frames_to_samples, interp_bands, linear_recurrence, sample_curve, sample_keyed
 from .physics import LOWEST_MIDI, N_KEYS, PianoPhysics, hammer_velocity, key_curve, log_f_bumps
@@ -152,6 +153,13 @@ class SympatheticBank(nn.Module):
         y, state = linear_recurrence(torch.complex(x, torch.zeros_like(x)), log_a, state, self.cfg.rec_chunk)
         return y.real.sum((1, 2)), state
 
+    def _block_fused(self, drive, es, freq, alpha, alpha_damp, gin, state):
+        """``_block`` with the fused CUDA resonators (``pianonn.cuda_ext.Resonators``)."""
+        sr = self.cfg.sample_rate / self.cfg.symp_decimate
+        z0r, z0i = (state.real, state.imag) if state is not None else (torch.zeros_like(alpha), torch.zeros_like(alpha))
+        y, zr, zi = cuda_ext.Resonators.apply(drive, es, alpha, alpha_damp, freq, gin, z0r, z0i, sr, 1000.0)
+        return y, torch.complex(zr, zi)
+
     def forward(self, bridge, own, key_modes, engagement, start, state=None):
         """``bridge[B,L]`` total string signal, ``own[B,88,L]`` per-key share, for frame-grid samples ``[start, start+L)``.
         Returns ``(y[B, L], state)``; pass the state to the next block."""
@@ -175,7 +183,9 @@ class SympatheticBank(nn.Module):
         else:
             es = frames_to_samples(engagement[:, k], start, L, cfg.hop)
         args = (drive, es, freq, alpha, alpha_damp, gin, state.get("rec"))
-        if cfg.checkpoint and torch.is_grad_enabled():
+        if drive.is_cuda and cuda_ext.get() is not None:  # sequential per resonator, analytic backward: no checkpoint
+            y, state["rec"] = self._block_fused(*args)
+        elif cfg.checkpoint and torch.is_grad_enabled():
             y, state["rec"] = checkpoint(self._block, *args, use_reentrant=False)
         else:
             y, state["rec"] = self._block(*args)
@@ -624,6 +634,9 @@ class NeuralPhysicalPiano(nn.Module):
         sorted by how many oscillators they need (treble notes need few) and rendered in slices that keep
         the ``[pairs, oscillators, samples]`` work under ``cfg.bank_elements``. ``curves``: the aware residual's
         log gain per note and octave group of partials ``[B, N, G, C]`` at its control frames."""
+        if C.is_cuda and cuda_ext.get() is not None:
+            return self._render_strings_fused(modes, ki, onset, mask, C, hist, rs_delay, pan, start, length, per_key,
+                                              curves)
         cfg = self.cfg
         sr, hop = cfg.sample_rate, cfg.hop
         B, N = ki.shape
@@ -698,6 +711,81 @@ class NeuralPhysicalPiano(nn.Module):
             if per_key:
                 keys.append(C.new_zeros(B * N_KEYS, L).index_add(0, row[idx], y).view(B, N_KEYS, L))
         return torch.cat(out, -1), (torch.cat(keys, -1) if per_key else None)
+
+    def _render_strings_fused(self, modes, ki, onset, mask, C, hist, rs_delay, pan, start, length, per_key, curves):
+        """``render_strings`` with the fused CUDA kernels (``pianonn.cuda_ext.StringBank``): the same activity test per
+        chunk of ``cfg.synth_chunk`` samples (each note's oscillators up to the last one within ``activity_db`` of its
+        peak, dampers included), then every active note over the whole segment in one launch. Each note renders exactly
+        its own active oscillators (the reference pads a slice of notes to its longest)."""
+        cfg = self.cfg
+        sr, hop = cfg.sample_rate, cfg.hop
+        B, N = ki.shape
+        ch = pan.shape[-1]
+        BN = B * N
+        dev = ki.device
+        flat = lambda x: x.reshape(BN, *x.shape[2:])
+        sets = [tuple(flat(x) for x in st) for st in self._flat_sets(modes)]
+        tc, on, msk = flat(modes["tc"]), flat(onset), flat(mask)
+        rs_nats, rsd, kf, pan_f = flat(modes["restrike"]), flat(rs_delay), flat(ki), flat(pan)
+        bi = torch.arange(B, device=dev).repeat_interleave(N)
+        row = bi * N_KEYS + kf
+        C_rows = C.reshape(B * N_KEYS, -1)
+        c_onset = sample_keyed(C, ki, onset.clamp(min=-hist / sr) + hist / sr, sr, hop).reshape(BN)
+        chunk = cfg.synth_chunk
+        s0 = torch.arange(start, start + length, chunk, device=dev)  # each activity chunk's first sample
+        with torch.no_grad():
+            log_amps = [torch.log(st[2].abs() + 1e-30) for st in sets]
+            thresh = log_amps[0].amax(-1) - cfg.activity_db * math.log(10) / 20
+            tau0 = (s0.float()[None] / sr - on[:, None]).clamp(min=0)  # [BN, chunks]
+            pos = (s0.double() + hist) / hop
+            i0 = pos.floor().long().clamp(0, C_rows.shape[-1] - 2)
+            w = (pos - i0).clamp(0, 1).to(C_rows.dtype)
+            c0 = (C_rows[:, i0] * (1 - w) + C_rows[:, i0 + 1] * w)[row]  # [BN, chunks]
+            d0 = (c0 - c_onset[:, None]).clamp(min=0)
+            nvs = []
+            for (freq, alpha, amp, adamp), la in zip(sets, log_amps):
+                act = (la[:, None] - alpha[:, None] * tau0[..., None] - adamp[:, None] * d0[..., None]) > thresh[:, None, None]
+                nvs.append(torch.where(act.any(-1), act.shape[-1] - act.flip(-1).int().argmax(-1), 0))
+            ends = (s0 + chunk).clamp(max=start + length).float() / sr
+            alive = msk[:, None] & (on[:, None] < ends[None]) & (nvs[0] > 0)  # [BN, chunks]
+            idx = alive.any(1).nonzero().squeeze(1)
+        P = idx.numel()
+        if P == 0:
+            return C.new_zeros(B, ch, length), (C.new_zeros(B, N_KEYS, length) if per_key else None)
+        sel = lambda x: x.index_select(0, idx)
+        with torch.no_grad():
+            nv1 = nvs[1] if len(nvs) > 1 else torch.zeros_like(nvs[0])
+            nv = (torch.stack([nvs[0], nv1], -1) * alive[..., None]).index_select(0, idx).int().contiguous()
+        Q0 = sets[0][0].shape[-1]
+        freq, alpha, amp, adamp = (torch.cat([sel(st[i]) for st in sets], -1) for i in range(4))
+        if curves is not None:
+            m = sel(curves.reshape(BN, *curves.shape[2:]))  # [P, G, control frames]
+            with torch.no_grad():
+                if self.curve_partials:  # one group per partial (oscbank.partial_group_weights), as indices
+                    G, M = self.curve_partials, modes["freq"].shape[-1]
+                    parts = [(torch.arange(Q0, device=dev) // M).expand(P, Q0)]
+                    if len(sets) > 1:
+                        f_part = sel(flat(modes["freq"][..., 0]))
+                        lf, lp = torch.log(freq[:, Q0:].clamp(min=1.0)), torch.log(f_part.clamp(min=1.0))
+                        parts.append((lf[:, :, None] - lp[:, None, :]).abs().argmin(-1))
+                    g0 = torch.cat(parts, -1).clamp(max=G - 1).int().contiguous()
+                    w0, g1, w1 = torch.ones_like(freq), g0, torch.zeros_like(freq)
+                else:  # soft octave groups: at most two per oscillator
+                    vals, ids = group_weights(freq.detach(), self.context.centers).topk(2, dim=1)
+                    g0, g1 = ids[:, 0].int().contiguous(), ids[:, 1].int().contiguous()
+                    w0, w1 = vals[:, 0].contiguous(), vals[:, 1].contiguous()
+        else:
+            m = freq.new_zeros(0)
+            g0 = g1 = torch.zeros(0, dtype=torch.int32, device=dev)
+            w0 = w1 = freq.new_zeros(0)
+        ints = (int(hist), int(hop), int(cfg.res_control * hop), int(chunk), int(Q0), int(start), int(length))
+        fixed = (g0, w0, g1, w1, sel(on).double().contiguous(), sel(rsd).float().contiguous(), sel(row).contiguous(),
+                 nv, ints, float(sr))
+        y = cuda_ext.StringBank.apply(freq, alpha, amp, adamp, sel(tc), sel(c_onset), sel(rs_nats), C_rows, m, fixed)
+        b_idx, pan_p = bi.index_select(0, idx), sel(pan_f)
+        out = torch.stack([C.new_zeros(B, length).index_add(0, b_idx, y * pan_p[:, c:c + 1]) for c in range(ch)], 1)
+        keys = C.new_zeros(B * N_KEYS, length).index_add(0, sel(row), y).view(B, N_KEYS, length) if per_key else None
+        return out, keys
 
     def render_impulses(self, amp, tc, onset, mask, pan, n_samples):
         """Knock impulse: a raised-cosine force pulse of the contact time at every strike, ``[B, ch, n]``."""

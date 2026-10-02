@@ -17,3 +17,4 @@ CLAUDE.md
 !samples/**/*.flac
 /samples
 /runs
+pianonn/csrc/build/

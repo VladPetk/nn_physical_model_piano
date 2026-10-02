@@ -131,23 +131,28 @@ class PartialView(nn.Module):
         n_idx, p_idx = ok.nonzero(as_tuple=True)
         return n_idx, p_idx, f[n_idx, p_idx], on[n_idx]
 
-    def forward(self, pred, target, notes):
+    def forward(self, pred, target, notes, cache=None):
         """``pred``, ``target``: the scored audio ``[B, ch, T]``; ``notes``: ``{"freq", "amp", "alpha": [B, N, P(, M)],
         "onset": [B, N] (s re the first scored sample), "mask": [B, N]}``, and for the exposure ``"alpha_damp": [B, N, P],
         "damp", "restrike": [B, N, F]`` at ``"ctrl_hop"`` s from ``"t_ref"`` s (the rendered window's first sample re
         the first scored sample; without them the dampers are ignored). Returns ``{"partials", "pooled",
         "pooled_exposed", "between", "between_pooled": [B]}``, each the mean |log10 difference| over its counted
-        cells."""
-        sr, hop = self.sr, self.hop
-        pred, target = highpass(pred, sr, self.hp_hz), highpass(target, sr, self.hp_hz)
+        cells. ``cache``: a dict shared by calls with the same ``pred`` and ``notes`` (the energy score compares one
+        render with two references): everything of the prediction's side is computed once."""
+        cache = {} if cache is None else cache
+        sr = self.sr
+        if "view_hp" not in cache:
+            cache["view_hp"] = highpass(pred, sr, self.hp_hz)
+        pred, target = cache["view_hp"], highpass(target, sr, self.hp_hz)
         B, ch, T = pred.shape
-        t_window = T / sr
         out_p, out_b = [], []
         sums = {k: [] for k in POOL_MIN}
         n_between = int(self.b_mask2048.shape[0]) * len(BETWEEN_AGES)
         for b in range(B):
-            n_idx, p_idx, fr, on = self.select(notes, b, t_window)
-            if fr.numel() == 0:
+            if ("view", b) not in cache:
+                cache[("view", b)] = self._pred_side(pred[b], notes, b, T / sr)
+            pc = cache[("view", b)]
+            if pc is None:
                 for o in (out_p, out_b):
                     o.append(pred.new_zeros(()))
                 nc = len(POOL_PARTIALS) * len(POOL_AGES)
@@ -155,41 +160,56 @@ class PartialView(nn.Module):
                     z = pred.new_zeros(ch, c)
                     sums[k].append((z, z, pred.new_zeros(c), pred.new_full((c,), self.floor)))
                 continue
-            size = note_sizes(notes["freq"][b][n_idx, 0], sr)
-            order = torch.argsort(size, stable=True)  # the readings in the order the sizes concatenate them
-            n_idx, p_idx, fr, on, size = (x[order] for x in (n_idx, p_idx, fr, on, size))
-            E_p, E_t = [], []
-            spec_p, spec_t = {}, {}
-            for n in sorted(set(size.tolist())):
-                sel = size == n
-                P_p, P_t = self._power(pred[b], n), self._power(target[b], n).detach()
-                spec_p[n], spec_t[n] = P_p, P_t
-                k = fr[sel] * n / sr  # fractional bin
-                j = torch.round(k).long()[:, None] + torch.arange(-1, 2, device=k.device)  # [Q, 3]
-                w = (1 - (j - k[:, None]).abs() / 1.5).clamp(min=0)
-                j = j.clamp(0, P_p.shape[1] - 1)
-                E_p.append((P_p[:, j, :] * w[None, :, :, None]).sum(2))  # [ch, Q, frames]
+            fr, parts, live, age, E_p = (pc[k] for k in ("fr", "parts", "live", "age", "E_p"))
+            E_t, spec_t = [], {}
+            for n, (j, w) in pc["bins"].items():
+                P_t = self._power(target[b], n).detach()
+                spec_t[n] = P_t
                 E_t.append((P_t[:, j, :] * w[None, :, :, None]).sum(2))
-            E_p, E_t, starts, parts = torch.cat(E_p, 1), torch.cat(E_t, 1), on, p_idx
-            frames = E_p.shape[-1]
-            t = torch.arange(frames, device=pred.device) * hop / sr
-            live = (t[None, :] >= starts[:, None] - 0.01).float()  # [Q, frames]: from the note's sound onset on
+            E_t = torch.cat(E_t, 1)
             loud = self._loudest(E_t * live[None], fr)  # [ch, Q or 1, frames]: the loudest partial at each moment
             eps = self.floor + self.rel * loud
             d = (torch.log10(E_p + eps) - torch.log10(E_t + eps)).abs() * live[None]
             out_p.append(d.sum() / (live.sum() * ch).clamp(min=1))
-            bt, bsums = self._between(spec_p, spec_t, pred[b], target[b], fr, starts, frames)
+            bt, bsums = self._between(pc, spec_t, target[b], E_p.shape[-1])
             out_b.append(bt)
             sums["between_pooled"].append(bsums)
-            age = t[None, :] - starts[:, None]
             sums["pooled"].append(self._pooled(E_p, E_t, live, parts, age))
-            share = self.exposure(notes, b, n_idx, p_idx, fr, size, starts, t)
-            sums["pooled_exposed"].append(self._pooled(E_p, E_t, live * share ** self.exposure_pow, parts, age))
+            sums["pooled_exposed"].append(self._pooled(E_p, E_t, live * pc["share"] ** self.exposure_pow, parts, age))
         out = {"partials": torch.stack(out_p), "between": torch.stack(out_b)}
         out["sums"] = {k: tuple(torch.stack(x) for x in zip(*v)) for k, v in sums.items()}
         for k, (P, T_, cnt, eps) in out["sums"].items():
             out[k] = pooled_l1(P, T_, cnt, eps.amin(0), POOL_MIN[k])
         return out
+
+    def _pred_side(self, x, notes, b, t_window):
+        """What ``forward`` reads of the prediction ``x[ch, T]`` (high-passed) of example ``b`` and does not depend on
+        the reference: the readings' selection, analysis sizes and bins, the prediction's spectra and readings, when
+        each reading counts, the note ages and the exposure. None when nothing is read."""
+        sr, hop = self.sr, self.hop
+        n_idx, p_idx, fr, on = self.select(notes, b, t_window)
+        if fr.numel() == 0:
+            return None
+        size = note_sizes(notes["freq"][b][n_idx, 0], sr)
+        order = torch.argsort(size, stable=True)  # the readings in the order the sizes concatenate them
+        n_idx, p_idx, fr, on, size = (z[order] for z in (n_idx, p_idx, fr, on, size))
+        E_p, spec_p, bins = [], {}, {}
+        for n in sorted(set(size.tolist())):
+            sel = size == n
+            P_p = self._power(x, n)
+            spec_p[n] = P_p
+            k = fr[sel] * n / sr  # fractional bin
+            j = torch.round(k).long()[:, None] + torch.arange(-1, 2, device=k.device)  # [Q, 3]
+            w = (1 - (j - k[:, None]).abs() / 1.5).clamp(min=0)
+            j = j.clamp(0, P_p.shape[1] - 1)
+            bins[n] = (j, w)
+            E_p.append((P_p[:, j, :] * w[None, :, :, None]).sum(2))  # [ch, Q, frames]
+        E_p = torch.cat(E_p, 1)
+        frames = E_p.shape[-1]
+        t = torch.arange(frames, device=x.device) * hop / sr
+        live = (t[None, :] >= on[:, None] - 0.01).float()  # [Q, frames]: from the note's sound onset on
+        return {"fr": fr, "starts": on, "parts": p_idx, "live": live, "age": t[None, :] - on[:, None], "E_p": E_p,
+                "spec_p": spec_p, "bins": bins, "x": x, "share": self.exposure(notes, b, n_idx, p_idx, fr, size, on, t)}
 
     @torch.no_grad()
     def exposure(self, notes, b, n_idx, p_idx, fr, size, on, t):
@@ -237,21 +257,37 @@ class PartialView(nn.Module):
         M = M.reshape(ch, T, nb).permute(0, 2, 1)
         return M[:, b, :]
 
-    def _between(self, spec_p, spec_t, x_p, x_t, fr, starts, frames):
+    def _between(self, pc, spec_t, x_t, frames):
         """Mean power per bin away from every sounding partial, per 1/3-octave band and frame, and pooled per (band,
-        time since the latest onset). Returns ``(between, (P, T, count, eps))``, the pooled cells as ``_pooled``'s."""
+        time since the latest onset). Returns ``(between, (P, T, count, eps))``, the pooled cells as ``_pooled``'s.
+        ``pc``: ``_pred_side``'s dict; the prediction's part is computed once and kept there."""
+        if "between" not in pc:
+            pc["between"] = self._between_pred(pc, frames)
+        tot, cnt = x_t.new_zeros(()), x_t.new_zeros(())
+        pooled = []
+        for n, M, free, bins, ok, mp, pb, sp, eps in pc["between"]:
+            P_t = spec_t[n] if n in spec_t else self._power(x_t, n).detach()
+            num_t = torch.einsum("kf,cft->ckt", M, P_t * free)
+            mt = num_t / bins.clamp(min=1)[None]
+            d = (torch.log10(mp + eps) - torch.log10(mt + eps)).abs() * ok
+            tot, cnt = tot + d.sum(), cnt + ok.sum() * P_t.shape[0]
+            st = num_t @ pc["between_ages"]
+            pooled.append((sp.flatten(1), st.flatten(1), pb.flatten(), pb.new_full((pb.numel(),), eps)))
+        return tot / cnt.clamp(min=1), tuple(torch.cat(z, -1) for z in zip(*pooled))
+
+    def _between_pred(self, pc, frames):
+        """The prediction's side of ``_between``: per analysis size, the free bins and the prediction's band powers."""
         sr, hop = self.sr, self.hop
+        x_p, fr, starts, spec_p = pc["x"], pc["fr"], pc["starts"], pc["spec_p"]
         t = torch.arange(frames, device=x_p.device) * hop / sr
         live = (t[None, :] >= starts[:, None] - 0.01)  # [Q, frames]
         on = torch.unique(starts)
         since = torch.where(t[None, :] >= on[:, None] - 0.01, t[None, :] - on[:, None], torch.full_like(t, math.inf)[None])
         age = torch.bucketize(since.amin(0).clamp(min=0), torch.tensor(BETWEEN_AGES, device=t.device), right=True) - 1
-        age_1h = torch.nn.functional.one_hot(age, len(BETWEEN_AGES)).float()  # [frames, ages]
-        tot, cnt = x_p.new_zeros(()), x_p.new_zeros(())
-        pooled = []
+        pc["between_ages"] = torch.nn.functional.one_hot(age, len(BETWEEN_AGES)).float()  # [frames, ages]
+        out = []
         for n, lo, hi in ((8192, 0.0, 200.0), (2048, 200.0, math.inf)):
             P_p = spec_p[n] if n in spec_p else self._power(x_p, n)
-            P_t = spec_t[n] if n in spec_t else self._power(x_t, n).detach()
             F = P_p.shape[1]
             k = torch.round(fr * n / sr).long()
             near = torch.zeros(F, frames, device=x_p.device)
@@ -265,12 +301,9 @@ class PartialView(nn.Module):
             M = M[band_sel]
             bins = M @ free  # [bands, frames]: free bins per band (mask-weighted)
             num_p = torch.einsum("kf,cft->ckt", M, P_p * free)
-            num_t = torch.einsum("kf,cft->ckt", M, P_t * free)
             ok = (bins >= 3).float()[None]
-            mp, mt = num_p / bins.clamp(min=1)[None], num_t / bins.clamp(min=1)[None]
+            mp = num_p / bins.clamp(min=1)[None]
             eps = self.floor * 6 / n  # white noise at the floor level, per bin, in these units
-            d = (torch.log10(mp + eps) - torch.log10(mt + eps)).abs() * ok
-            tot, cnt = tot + d.sum(), cnt + ok.sum() * P_p.shape[0]
-            pb, sp, st = bins @ age_1h, num_p @ age_1h, num_t @ age_1h  # [bands, ages], [ch, bands, ages]
-            pooled.append((sp.flatten(1), st.flatten(1), pb.flatten(), pb.new_full((pb.numel(),), eps)))
-        return tot / cnt.clamp(min=1), tuple(torch.cat(x, -1) for x in zip(*pooled))
+            pb, sp = bins @ pc["between_ages"], num_p @ pc["between_ages"]  # [bands, ages], [ch, bands, ages]
+            out.append((n, M, free, bins, ok, mp, pb, sp, eps))
+        return out

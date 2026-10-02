@@ -104,7 +104,10 @@ per channel: mic gain · body FIR ⊛ (direct + parametric octave-band hall), pe
 ## Usage
 
 Training is GPU-first. Install a CUDA build of PyTorch (the default `pip install torch`
-gives the CPU wheel), then the package:
+gives the CPU wheel), then the package. On a GPU the string bank and the sympathetic resonators run as fused CUDA
+kernels, compiled on first use into `pianonn/csrc/build/` (about a minute); that needs the CUDA toolkit's `nvcc` and,
+on Windows, the Visual Studio Build Tools (C++). Without them the model renders with the PyTorch code, three to four
+times slower ([`docs/speed.md`](docs/speed.md)); `PIANONN_FUSED=0` forces that.
 
 ```bash
 python -m venv .venv && .venv/Scripts/activate      # or: source .venv/bin/activate
@@ -297,6 +300,12 @@ In short, on one year (RTX 3090):
   the pooled, level and onset terms; the band and partial terms do not move, and unmatched the held-out score rises
   (0.770 → 0.806: the model got louder). The setup is written up in
   [`docs/composite_score.md`](docs/composite_score.md); listening in [`samples/composite_smoke2/`](samples/composite_smoke2/).
+- **Training speed** ([`docs/speed.md`](docs/speed.md), 2026-10-02): the composite training step from 4.5 s to 1.0 s on the
+  same batches: the CUDA allocator back at its default (its garbage-collection and split settings cost 1.2 s), the
+  string bank and the sympathetic resonators as fused CUDA kernels with analytic backwards (`pianonn/csrc`; the PyTorch
+  code stays the reference and the fallback), the score reading the render once for both of the energy score's
+  comparisons. Audio and gradients agree with the reference to float precision (`tests/test_cuda.py`). Also fixed:
+  after running out of memory once, `train.py` kept the failed step's graph and skipped every later batch.
 
 The prior is calibrated against the literature (the KTH *Five Lectures on the Acoustics of the Piano*,
 arXiv and Zenodo papers) and against 260 recorded notes of a Steinway B, analysed with the same code as the

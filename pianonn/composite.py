@@ -64,19 +64,16 @@ READ_BY_READ = ("band", "partials", "between")
 POOLED = ("pooled_exposed", "between_pooled", "level")
 
 
-def level_sums(piano, pred, target):
+def level_sums(piano, pred, target, Ep=None, Et=None):
     """PianoLoss's level term as pooled cells: per example, each band's energy summed over the excerpt ``(P, T: [B, ch,
-    bands], count: [B, bands] frames, eps: [bands] per frame)``."""
+    bands], count: [B, bands] frames, eps: [bands] per frame)``. ``Ep``, ``Et``: ``piano.band_list`` of ``pred`` and
+    ``target`` when already computed."""
     B, ch = pred.shape[:2]
-    p = highpass(pred, piano.sr, piano.hp_hz).reshape(B * ch, -1)
-    t = highpass(target, piano.sr, piano.hp_hz).reshape(B * ch, -1)
-    P, T, eps = [], [], []
-    for gi, n, n_bins in piano.groups:
-        m = getattr(piano, f"mask{gi}")
-        Ep, Et = piano._bands(p, n, m, n_bins, piano.hop), piano._bands(t, n, m, n_bins, piano.hop)
-        P.append(Ep.sum(-1)), T.append(Et.sum(-1)), eps.append(piano._eps(n, m)[:, 0])
-    P, T = torch.cat(P, 1).reshape(B, ch, -1), torch.cat(T, 1).reshape(B, ch, -1)
-    frames = Ep.shape[-1]
+    Ep = piano.band_list(pred) if Ep is None else Ep
+    Et = piano.band_list(target) if Et is None else Et
+    eps = [piano._eps(n, getattr(piano, f"mask{gi}"))[:, 0] for gi, n, _ in piano.groups]
+    P, T = torch.cat([e.sum(-1) for e in Ep], 1).reshape(B, ch, -1), torch.cat([e.sum(-1) for e in Et], 1).reshape(B, ch, -1)
+    frames = Ep[-1].shape[-1]
     return P, T, P.new_full((B, P.shape[-1]), float(frames)), torch.cat(eps)
 
 
@@ -122,35 +119,44 @@ class CompositeLoss(nn.Module):
         self.self_onset = OnsetLoss(sr, pool_decay=pool_decay)
         self.self_pools = nn.ModuleDict({k: RunningPool(pool_decay, POOL_MIN.get(k, 1)) for k in POOLED})
 
-    def read(self, p, t, notes, sums=True):
+    def read(self, p, t, notes, sums=True, cache=None):
         """The read-by-read terms of the scored windows ``p``, ``t`` (means over the batch) and, with ``sums``, the
-        pooled terms' cells ``{name: (P, T, count, eps)}``; ``notes`` with onsets re the scored window."""
-        terms = {"band": self.piano.terms(p, t)["band"].mean()}
-        v = self.view(p, t, notes)
+        pooled terms' cells ``{name: (P, T, count, eps)}``; ``notes`` with onsets re the scored window. ``cache``: a
+        dict shared by calls with the same ``p`` and ``notes`` (the energy score reads one render against the recording
+        and against a second draw): ``p``'s spectra and readings are computed once, and its gradient flows through
+        them once."""
+        cache = {} if cache is None else cache
+        if "bands" not in cache:
+            cache["bands"] = self.piano.band_list(p)
+        Ep, Et = cache["bands"], self.piano.band_list(t)
+        terms = {"band": self.piano.band_from(Ep, Et, p.shape[0]).mean()}
+        v = self.view(p, t, notes, cache=cache)
         terms["partials"], terms["between"] = v["partials"].mean(), v["between"].mean()
         if not sums:
             return terms, None
-        cells = dict(v["sums"], level=level_sums(self.piano, p, t))
+        cells = dict(v["sums"], level=level_sums(self.piano, p, t, Ep, Et))
         return terms, {k: cells[k] for k in POOLED}
 
-    def _terms(self, full, target_full, p, t, batch, notes, pools, onset, t_lo):
-        terms, sums = self.read(p, t, notes)
+    def _terms(self, full, target_full, p, t, batch, notes, pools, onset, t_lo, cache):
+        terms, sums = self.read(p, t, notes, cache=cache)
         for k in POOLED:
             P, T, cnt, eps = sums[k]
             terms[k] = pools[k](P, T, cnt, eps.amin(0) if eps.dim() == 2 else eps)
         if self.w.get("onset", 0):
-            terms["onset"] = onset(full.float(), target_full.float(), batch, t_lo)
+            terms["onset"] = onset(full.float(), target_full.float(), batch, t_lo, cache=cache)
         return terms
 
     def forward(self, full, target_full, batch, s, notes, second=None):
         sr = self.sr
         p, t = full[..., s:].float(), target_full[..., s:].float()
         notes = dict(notes, onset=notes["onset"] - s / sr, t_ref=-s / sr)
-        terms = self._terms(full, target_full, p, t, batch, notes, self.pools, self.onset, s / sr)
+        cache = {}  # the render's side of every term, shared by the two comparisons
+        terms = self._terms(full, target_full, p, t, batch, notes, self.pools, self.onset, s / sr, cache)
         scored = dict(terms)
         if second is not None:
             second = second.float().detach()
-            own = self._terms(full, second, p, second[..., s:], batch, notes, self.self_pools, self.self_onset, s / sr)
+            own = self._terms(full, second, p, second[..., s:], batch, notes, self.self_pools, self.self_onset, s / sr,
+                              cache)
             for k, d in own.items():
                 terms[k + "_self"] = d
                 scored[k] = terms[k] - d + 0.5 * d.detach()  # the value d(X, Y) - d(X, X') / 2, the gradient's form

@@ -14,7 +14,6 @@ import json
 import os
 import time
 
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "garbage_collection_threshold:0.6,max_split_size_mb:256")
 
 import soundfile as sf  # noqa: E402
 import torch  # noqa: E402

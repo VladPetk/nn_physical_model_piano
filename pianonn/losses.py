@@ -137,6 +137,18 @@ class PianoLoss(nn.Module):
     def _log_bands(self, x, n, mask, n_bins, hop):
         return torch.log10(self._bands(x, n, mask, n_bins, hop) + self._eps(n, mask))
 
+    def band_list(self, x):
+        """The band term's band energies of ``x[B, ch, T]`` (high-passed): one ``[B * ch, bands, frames]`` per group."""
+        x = highpass(x, self.sr, self.hp_hz).reshape(-1, x.shape[-1])
+        return [self._bands(x, n, getattr(self, f"mask{gi}"), n_bins, self.hop) for gi, n, n_bins in self.groups]
+
+    def band_from(self, Ep, Et, B):
+        """The band term per example ``[B]`` from ``band_list``'s energies of the prediction and the target (the
+        same as ``terms(...)["band"]``)."""
+        d = [(torch.log10(p + self._eps(n, getattr(self, f"mask{gi}"))) - torch.log10(t + self._eps(n, getattr(self, f"mask{gi}")))).abs()
+             for (gi, n, _), p, t in zip(self.groups, Ep, Et)]
+        return torch.cat(d, 1).mean((1, 2)).reshape(B, -1).mean(1)
+
     def terms(self, pred, target, onsets=None, onset_mask=None):
         """Per-example terms ``{name: [B]}`` (mean over channels, bands and frames)."""
         B = pred.shape[0]
@@ -306,11 +318,18 @@ class OnsetLoss(nn.Module):
         """log10 of the pooled attack (re the pooled early window) from ``pooled``'s ``[2, bands]``."""
         return torch.log10(s[0] + eps) - torch.log10(s[1] + eps)
 
-    def forward(self, pred, target, batch, t_lo):
-        rows, times, _ = self.anchors(batch, t_lo, pred.shape[-1] / self.sr - self.window[1])
+    def forward(self, pred, target, batch, t_lo, cache=None):
+        """``cache``: a dict shared by calls with the same ``pred`` and ``batch`` (the energy score compares one render
+        with two references): the anchors and the prediction's window powers are computed once."""
+        cache = {} if cache is None else cache
+        if "onset_anchors" not in cache:
+            cache["onset_anchors"] = self.anchors(batch, t_lo, pred.shape[-1] / self.sr - self.window[1])
+        rows, times, _ = cache["onset_anchors"]
         if not len(rows):
             return pred.sum() * 0.0
-        p = self.powers(pred, rows, times)
+        if "onset_pred" not in cache:
+            cache["onset_pred"] = self.powers(pred, rows, times)
+        p = cache["onset_pred"]
         with torch.no_grad():
             q = self.powers(target, rows, times)
         c = self.cells(p, q)

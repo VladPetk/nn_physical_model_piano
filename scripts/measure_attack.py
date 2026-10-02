@@ -24,7 +24,6 @@ import math
 import os
 import sys
 
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "garbage_collection_threshold:0.6,max_split_size_mb:256")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import json  # noqa: E402

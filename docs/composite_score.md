@@ -216,6 +216,9 @@ of the take's own scatter (section 3).
 - **Cost (read, smoke 2):** 5.4 s per step (second render 1.25 s, render 1.45 s, score 0.37 s, backward 2.34 s on a
   dense batch), peak 15 GB. 30 min = 332 steps = 2,656 excerpts = 1.5 h of scored audio, 6.5 % of one pass over
   the 22.9 h. (I wrote 12 % earlier; that was wrong.)
+- **Cost since 2026-10-02** ([`docs/speed.md`](speed.md)): 1.0 s per step on the same setup (the allocator at its
+  default, the string bank and the sympathetic resonators as fused CUDA kernels, the score reading the render once;
+  the same audio and gradients to float precision).
 
 ### 6.4 Validation and evaluation
 

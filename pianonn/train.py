@@ -48,8 +48,9 @@ import math
 import os
 import time
 
-# must be set before the first CUDA allocation (see the memory fraction in main)
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "garbage_collection_threshold:0.6,max_split_size_mb:256")
+# PYTORCH_CUDA_ALLOC_CONF is left at PyTorch's default: "garbage_collection_threshold:0.6,max_split_size_mb:256" cost
+# 1.2 s of the smoke-2 step's 4.5 s (the cache freed and re-allocated inside every step, large blocks never split; same
+# peak memory; 2026-10-02). The memory fraction in main alone keeps the allocator inside the card.
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
@@ -295,12 +296,13 @@ def validate_composite(model, batches, comp, residual, energy, old, level_match=
         full = full * g
         p, t = full[..., s:], b["audio"][..., s:].float()
         notes = dict(partials, onset=partials["onset"] - s / sr, t_ref=-s / sr)
-        terms, sums = comp.read(p, t, notes)
-        terms["onset"] = comp.onset(full, b["audio"].float(), b, s / sr)
+        cache = {}  # the render's side, shared by the two comparisons
+        terms, sums = comp.read(p, t, notes, cache=cache)
+        terms["onset"] = comp.onset(full, b["audio"].float(), b, s / sr, cache=cache)
         if energy:
             second = second * g
-            own, own_sums = comp.read(p, second[..., s:], notes)
-            own["onset"] = comp.self_onset(full, second, b, s / sr)
+            own, own_sums = comp.read(p, second[..., s:], notes, cache=cache)
+            own["onset"] = comp.self_onset(full, second, b, s / sr, cache=cache)
             terms.update({k + "_self": v for k, v in own.items()})
             for k, c in own_sums.items():
                 cells.setdefault(k + "_self", []).append(c)
@@ -825,7 +827,9 @@ def main(argv=None):
                 del y
         except torch.OutOfMemoryError:  # a rare batch with many notes (stage 2): skip it rather than crash
             oom = True
-            out = pred = tgt = loss = logs = y = second = reg_grad = None
+            # every name that can hold the failed step's graph: one left behind (``parts`` was) keeps it alive, and
+            # every later batch then runs out of memory too (runs/scratch/speed_check, 2026-10-02)
+            out = pred = tgt = loss = logs = parts = gain = y = env = tot = sm = g_rest = second = reg_grad = None
         if oom:
             opt.zero_grad(set_to_none=True)
             if disc_opt is not None:

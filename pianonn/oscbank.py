@@ -1,5 +1,9 @@
 """The damped-sinusoid bank as one autograd function with an analytic backward.
 
+This is the reference. On a GPU, ``NeuralPhysicalPiano.render_strings`` uses the fused CUDA kernels of
+``pianonn.cuda_ext`` (``pianonn/csrc/kernels.cu``, the same mathematics, docs/speed.md); a change here must be made
+there too, and ``tests/test_cuda.py`` compares the two.
+
 For ``P`` sounding notes (flattened over the batch) with ``Q`` oscillators each, over one chunk of
 ``L`` samples starting at absolute time ``t0``:
 
