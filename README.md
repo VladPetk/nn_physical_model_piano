@@ -270,6 +270,12 @@ In short, on one year (RTX 3090):
   variation, the decays fitted on isolated notes with a per-partial term; the fundamental's early fade is the body's
   low-band ringing (fixed on notes, back after training); the pedal-halo gap is an excess with the pedal up. Checkpoint
   `runs/phase5/train_run/train/last.pt`; listening in [`samples/phase5/`](samples/phase5/).
+- **Phase 6** (`docs/tone_measures.md` 17): a note that rang too long led to a measure of the whole note's envelope in
+  music (N13: each partial's fade to 2.5 s) and a map of what every measure sees. The upper partials rang 4-7 dB too
+  long after 1 s; their decays were fitted on N13 and the term kept in the training loss, the decays free. After a
+  310-min run the excess is about halved, the music loss is slightly better (−0.0084 on test excerpts) and does not
+  pull against the envelope term. Checkpoint `runs/phase6/train_run/train/last.pt`; listening in
+  [`samples/phase6/`](samples/phase6/).
 
 The prior is calibrated against the literature (the KTH *Five Lectures on the Acoustics of the Piano*,
 arXiv and Zenodo papers) and against 260 recorded notes of a Steinway B, analysed with the same code as the
@@ -320,6 +326,16 @@ Phase 5 (`docs/tone_measures.md` 16), one round with one training run at the end
       the Q change under the per-bin terms, 16.5), but the attack in music is no longer too abrupt in the bass and tenor
       (E4 8 kHz R2-R4 1.2/1.1/2.1 → 0.2/0.9/1.2 dB, recordings 0.3/0.5/0.5) and closer in the treble; the fundamental's
       early fade came back in training. Listening in [`samples/phase5/`](samples/phase5/).
+Phase 6 (`docs/tone_measures.md` 17), the whole note:
+- [x] 1. N13, the whole note's envelope in music (`scripts/note_envelope.py`, 17.3): partials to 40 / 6 kHz at 0.1-2.5 s.
+      On phase 5 the upper partials ring too long (9+ fade 4-6 dB too little by 1 s, 6-7 by 1.5 s; R3 about +10);
+      the fundamental is right; the per-strike spread is not too wide. The coverage map of every measure (17.2).
+- [x] 2. The envelope fit (`scripts/fit_envelope.py`, 17.4): the strings' decay and the aftersound on N13's fades.
+- [x] 3. One long run (310 min) with the envelope term in the training loss and the decays free (`--env-weight`,
+      17.5-17.6), the aware residual in stage 2. The music loss does not pull against the envelope term (gradient
+      cosine about −0.01): it barely sees the tails. The upper partials' excess ring is about halved (N13 9-12 at 1.5 s
+      +6.4 → +2.0 dB; R3 partial 2's late decay now right), and on 96 test excerpts −0.0084 ± 0.0036 against phase 5.
+      Checkpoint `runs/phase6/train_run/train/last.pt`; listening in [`samples/phase6/`](samples/phase6/).
 Then: all years (5 above), the residual's read-out and budget, texture.
 
 - [ ] Deferred on measurement: pitch glide (~1.5–3 cents at *ff*), duplex strings. Later: felt model at note-on,

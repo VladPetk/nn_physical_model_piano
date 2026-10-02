@@ -1,6 +1,7 @@
 """Render a MIDI file with a trained (or untrained, physics-prior-only) model."""
 
 import argparse
+import math
 
 import numpy as np
 import torch
@@ -47,19 +48,25 @@ def load_variant(spec, device="cpu", log=print):
 
     Options change the checkpoint's model without training it: ``key=value`` overrides a config field (e.g.
     ``bridge_end_comb=1``); ``mined=<file>`` re-applies per-key B from a ``scripts/mine_notes.py`` file (the tuning
-    is left as it is)."""
+    is left as it is); ``pedal_theta=<CC>`` moves the sustain value at which the dampers lift half-way (0-127,
+    within the parameter's range, about 15-91)."""
     label, rest = spec.split("=", 1)
     parts = rest.split(":")
     i = max(j for j, p in enumerate(parts) if p in ("physics", "residual"))
     ckpt, mode = ":".join(parts[:i]), parts[i]
-    overrides, mined = {}, None
+    overrides, mined, theta = {}, None, None
     for opt in filter(None, ":".join(parts[i + 1:]).split(",")):
         k, v = opt.split("=", 1)
         if k == "mined":
             mined = v
+        elif k == "pedal_theta":
+            theta = float(v)
         else:
             overrides[k] = _parse_value(v)
     model = load_model(ckpt, device=device, **overrides)
+    if theta is not None:  # theta = 0.42 + 0.3 tanh(raw / 0.3) (physics.pedal_lift)
+        with torch.no_grad():
+            model.physics.raw_pedal_theta.fill_(0.3 * math.atanh(max(-0.999, min(0.999, (theta / 127 - 0.42) / 0.3))))
     if mined:
         import json
 

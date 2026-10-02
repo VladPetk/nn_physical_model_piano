@@ -1,0 +1,140 @@
+{
+ "sample_rate": 24000,
+ "seconds": 12.0,
+ "split": "test",
+ "format": "wav",
+ "order": [
+  "recording",
+  "phase5",
+  "phase6",
+  "phase6_residual"
+ ],
+ "models": {
+  "phase5": {
+   "checkpoint": "runs/phase5/train_run/train/last.pt",
+   "residual": false
+  },
+  "phase6": {
+   "checkpoint": "runs/phase6/train_run/train/last.pt",
+   "residual": false
+  },
+  "phase6_residual": {
+   "checkpoint": "runs/phase6/train_run/train/last.pt",
+   "residual": true
+  }
+ },
+ "excerpts": [
+  {
+   "index": 0,
+   "piece": "MIDI-Unprocessed_Recital5-7_MID--AUDIO_06_R1_2018_wav--3",
+   "start_s": 1021.2,
+   "velocity": 32.3,
+   "pedal": 0.84,
+   "notes": 31,
+   "level_db": {
+    "recording": -37.49,
+    "phase5": -39.87,
+    "phase6": -39.76,
+    "phase6_residual": -39.65
+   }
+  },
+  {
+   "index": 1,
+   "piece": "MIDI-Unprocessed_Recital5-7_MID--AUDIO_06_R1_2018_wav--3",
+   "start_s": 1211.5,
+   "velocity": 34.5,
+   "pedal": 0.83,
+   "notes": 36,
+   "level_db": {
+    "recording": -37.99,
+    "phase5": -40.44,
+    "phase6": -40.44,
+    "phase6_residual": -40.22
+   }
+  },
+  {
+   "index": 2,
+   "piece": "MIDI-Unprocessed_Recital13-15_MID--AUDIO_15_R1_2018_wav--1",
+   "start_s": 485.3,
+   "velocity": 39.4,
+   "pedal": 0.04,
+   "notes": 23,
+   "level_db": {
+    "recording": -37.77,
+    "phase5": -41.84,
+    "phase6": -41.84,
+    "phase6_residual": -41.64
+   }
+  },
+  {
+   "index": 3,
+   "piece": "MIDI-Unprocessed_Recital5-7_MID--AUDIO_06_R1_2018_wav--3",
+   "start_s": 649.7,
+   "velocity": 52.1,
+   "pedal": 0.79,
+   "notes": 70,
+   "level_db": {
+    "recording": -28.21,
+    "phase5": -31.0,
+    "phase6": -31.23,
+    "phase6_residual": -30.98
+   }
+  },
+  {
+   "index": 4,
+   "piece": "MIDI-Unprocessed_Recital5-7_MID--AUDIO_06_R1_2018_wav--3",
+   "start_s": 1302.8,
+   "velocity": 58.2,
+   "pedal": 0.87,
+   "notes": 76,
+   "level_db": {
+    "recording": -24.81,
+    "phase5": -26.62,
+    "phase6": -26.99,
+    "phase6_residual": -26.7
+   }
+  },
+  {
+   "index": 5,
+   "piece": "MIDI-Unprocessed_Recital9-11_MID--AUDIO_09_R1_2018_wav--1",
+   "start_s": 933.6,
+   "velocity": 63.7,
+   "pedal": 0.83,
+   "notes": 72,
+   "level_db": {
+    "recording": -29.05,
+    "phase5": -28.54,
+    "phase6": -29.08,
+    "phase6_residual": -28.73
+   }
+  },
+  {
+   "index": 6,
+   "piece": "MIDI-Unprocessed_Recital17-19_MID--AUDIO_19_R1_2018_wav--3",
+   "start_s": 143.5,
+   "velocity": 70.2,
+   "pedal": 0.93,
+   "notes": 168,
+   "level_db": {
+    "recording": -21.41,
+    "phase5": -21.24,
+    "phase6": -21.55,
+    "phase6_residual": -21.31
+   }
+  },
+  {
+   "index": 7,
+   "piece": "MIDI-Unprocessed_Recital9-11_MID--AUDIO_09_R1_2018_wav--1",
+   "start_s": 253.7,
+   "velocity": 82.9,
+   "pedal": 0.71,
+   "notes": 106,
+   "level_db": {
+    "recording": -21.36,
+    "phase5": -21.05,
+    "phase6": -21.46,
+    "phase6_residual": -21.2
+   }
+  }
+ ]
+}

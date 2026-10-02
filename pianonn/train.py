@@ -21,6 +21,13 @@ stage 2 without the residual (the control for its gain), and ``--adv-with-stage2
 the discriminator judges the audio, but its gradients reach only the noise bank and the residual
 (``GAN_PARAMS``), through a view of the output in which everything else is detached.
 
+``--env-weight`` adds the whole note's envelope (N13, ``pianonn.envfit``; docs/tone_measures.md 17): each step also
+renders ``--env-batch`` of N13's notes of the training pieces in their contexts (with the residual in stage 2) and adds
+the L1 distance of each partial's fade (0.2-2.5 s re 0.1 s) to the recording's, in log10 power (dB / 10, PianoLoss's
+unit). The log reports it, the cosine between its gradient and the rest of the loss's on the strings' decay
+(``ENV_PARAMS``: below 0 they pull against each other) and its gradient's size re theirs; each validation reports it on
+N13's notes of the validation and test pieces, with the median fade error of partials 9-40 at 1 and 1.5 s.
+
     python -m pianonn.train --data data/maestro24k --years 2018 --out runs/trial --minutes 120
 """
 
@@ -34,6 +41,7 @@ import time
 # must be set before the first CUDA allocation (see the memory fraction in main)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "garbage_collection_threshold:0.6,max_split_size_mb:256")
 
+import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from torch.utils.data import DataLoader  # noqa: E402
 
@@ -52,6 +60,8 @@ DB_PARAMS = ("physics.gain_db", "physics.cond_gain_db", "physics.cond_vel_slope"
 GAN_PARAMS = ("noise.", "context.")  # what the critic may change (enforced by the texture view, see synth.forward)
 MODULES = ("physics", "room", "noise", "context")
 CENTS_PARAMS = ("physics.raw_cents", "physics.cond_cents")
+ENV_PARAMS = ("physics.raw_prompt", "physics.raw_log_b1", "physics.raw_log_b3", "physics.raw_bridge_g",
+              "physics.raw_decay_p", "physics.raw_after")  # the strings' decay and the aftersound's level
 
 
 @torch.no_grad()
@@ -250,6 +260,11 @@ def main(argv=None):
     ap.add_argument("--level-weight", type=float, default=0.0,
                     help="weight of PianoLoss's whole-excerpt level term (log band energies summed over the excerpt; "
                          "its optimum is the energy match whatever the time structure); 0 = off")
+    ap.add_argument("--env-weight", type=float, default=0.0,
+                    help="weight of the whole-note envelope term (N13 fades, dB / 10; see above); 0 = off")
+    ap.add_argument("--env-batch", type=int, default=2, help="N13 notes rendered per step for the envelope term")
+    ap.add_argument("--env-cap", type=int, default=40, help="N13 events per cell (as scripts/note_envelope.py --cap)")
+    ap.add_argument("--env-seed", type=int, default=1, help="N13 event draw and the order of its notes")
     ap.add_argument("--piece-gain", action="store_true",
                     help="fit a free gain (dB, averaging zero) per training piece, applied to the rendered audio before "
                          "every loss term; validation and evaluation render without it")
@@ -347,6 +362,38 @@ def main(argv=None):
     onset_loss = (OnsetLoss(cfg.sample_rate, relative=args.onset_relative, pool_decay=args.onset_pool).to(device)
                   if args.onset_weight > 0 else None)
     onset_val = (onset_loss, args.onset_weight) if onset_loss is not None else None
+    envs = env_val = env_term = None
+    if args.env_weight > 0 and teacher is None:
+        from . import envfit as EF
+        from . import measures as M
+        from .config import year_to_condition
+
+        assert args.years and len(args.years) == 1, "the envelope term reads one year's recordings: --years Y"
+        table = M.partial_table(model, year_to_condition(args.years[0]), device)
+        tabs = {p: table[p - 21][(table[p - 21] > 0) & (table[p - 21] < 6500)] for p in range(21, 109)}
+        events, _ = EF.mine(args.data, args.years[0], args.env_cap, args.env_seed)
+        envs = EF.EnvelopeSet(args.data, [e for e in events if e["split"] == "train"], cfg, table, tabs,
+                              log=lambda m: log(f"envelope term, training pieces: {m}"))
+        env_val = EF.EnvelopeSet(args.data, [e for e in events if e["split"] != "train"], cfg, table, tabs,
+                                 log=lambda m: log(f"envelope term, validation and test pieces: {m}"))
+        env_term = EF.EnvelopeTerm(cfg.sample_rate)
+        env_rng = np.random.default_rng(args.env_seed)
+    env_hist = []
+
+    def env_report(residual):
+        """N13 on the held-out notes: mean |model - recording fade| (dB) and the median for partials 9-40 at 1, 1.5 s."""
+        model.eval()
+        r = EF.evaluate(model, env_val, env_term, device, residual=residual)
+        model.train()
+        d = r["d"]
+        rec = {"env_val": float(np.nanmean(np.abs(d))), "env_cells": int(np.isfinite(d).sum())}
+        for t in (1.0, 1.5):
+            v = d[:, M.ENV_TIMES.index(t), 8:]
+            v = v[np.isfinite(v)]
+            rec[f"env_9+_{t:g}s"] = float(np.median(v)) if len(v) else float("nan")
+        msg = (f"envelope {rec['env_val']:.3f} dB over {rec['env_cells']} cells, partials 9-40 at 1 s "
+               f"{rec['env_9+_1s']:+.1f}, at 1.5 s {rec['env_9+_1.5s']:+.1f} dB")
+        return rec, msg
     pieces = PieceLevels(len(dataset.pieces)).to(device) if args.piece_gain and teacher is None else None
     groups = param_groups(model, args.lr)
     if pieces is not None:
@@ -388,6 +435,9 @@ def main(argv=None):
         v_raw, _ = validate(model, val_batches, recon, residual=False, old=old_loss, onset=onset_val)
         log(f"val ({'start model' if args.init_from else 'untrained prior, before init'}): {v_raw:.4f}", kind="val",
             step=0, val_physics=v_raw, tag="raw_prior")
+        if env_val is not None:
+            erec, emsg = env_report(False)
+            log(f"val step 0: {emsg}", kind="env_val", step=0, **erec)
         if args.mined:
             from .fit_init import apply_mined_priors
 
@@ -458,6 +508,10 @@ def main(argv=None):
             rec["val_residual"], rec["per_res_residual"] = v_res, per_res
             msg += f"  with residual {v_res:.4f}  (unexplained by physics: {v_phys - v_res:+.4f})"
             v = v_res
+        if env_val is not None:
+            erec, emsg = env_report(use_residual())
+            rec.update(erec)
+            msg += f"; {emsg}"
         log(msg, **rec)
         if v < best:
             best = v
@@ -493,45 +547,80 @@ def main(argv=None):
             s = int(args.warmup * cfg.sample_rate)
         else:
             target, n, s = batch["audio"], batch["audio"].shape[-1], int(batch["loss_start"][0])
-        residual = use_residual()
-        gan = disc is not None and step >= adv_from
-        extras = (("residual_out",) if residual else ()) + (("texture_view",) if gan else ())
-        with amp_ctx():
-            out = model(batch, n, residual=residual, extras=extras)
-        if pieces is not None:  # the recording's level for this piece: a nuisance, discarded at evaluation
-            out["audio"] = out["audio"] * (10 ** (pieces(batch["piece"]) / 20))[:, None, None]
-        pred, tgt = out["audio"][..., s:].float(), target[..., s:].float()
+        oom = False
+        try:
+            residual = use_residual()
+            gan = disc is not None and step >= adv_from
+            extras = (("residual_out",) if residual else ()) + (("texture_view",) if gan else ())
+            with amp_ctx():
+                out = model(batch, n, residual=residual, extras=extras)
+            if pieces is not None:  # the recording's level for this piece: a nuisance, discarded at evaluation
+                out["audio"] = out["audio"] * (10 ** (pieces(batch["piece"]) / 20))[:, None, None]
+            pred, tgt = out["audio"][..., s:].float(), target[..., s:].float()
 
-        logs = {}
-        logs["recon"], parts = recon(pred, tgt, *onsets_of(batch, s, cfg.sample_rate))
-        logs.update(parts)
-        logs["reg"] = model.physics.regularizer(batch["condition"]) + pan_smoothness(model, batch["condition"])
-        loss = logs["recon"] + args.reg * logs["reg"]
-        if mel_loss is not None:
-            logs["mel"] = mel_loss(pred, tgt)
-            loss = loss + args.mel_weight * logs["mel"]
-        if onset_loss is not None:
-            logs["onset"] = onset_loss(out["audio"].float(), target.float(), batch, s / cfg.sample_rate)
-            loss = loss + args.onset_weight * logs["onset"]
-        if residual:
-            weights = dict(zip(("note", "frame", "additive"), args.budget))
-            for k, v in residual_budget(model, out, batch["mask"]).items():
-                logs["budget_" + k] = v
-                loss = loss + weights[k] * v
-        if gan:
-            real = highpass(tgt, cfg.sample_rate)  # no infrasound giveaway: the loss ignores it too
-            fake = highpass(out["audio_texture"][..., s:].float(), cfg.sample_rate)
-            disc.requires_grad_(True)
-            disc_opt.zero_grad()
-            logs["disc"] = discriminator_loss(disc, real, fake)
-            logs["disc"].backward()
-            disc_opt.step()
-            disc.requires_grad_(False)
-            logs["adv"], logs["fm"] = generator_adv_loss(disc, real, fake)
-            loss = loss + args.adv_weight * (logs["adv"] + 2.0 * logs["fm"])  # reaches GAN_PARAMS only
+            logs = {}
+            logs["recon"], parts = recon(pred, tgt, *onsets_of(batch, s, cfg.sample_rate))
+            logs.update(parts)
+            logs["reg"] = model.physics.regularizer(batch["condition"]) + pan_smoothness(model, batch["condition"])
+            loss = logs["recon"] + args.reg * logs["reg"]
+            if mel_loss is not None:
+                logs["mel"] = mel_loss(pred, tgt)
+                loss = loss + args.mel_weight * logs["mel"]
+            if onset_loss is not None:
+                logs["onset"] = onset_loss(out["audio"].float(), target.float(), batch, s / cfg.sample_rate)
+                loss = loss + args.onset_weight * logs["onset"]
+            if residual:
+                weights = dict(zip(("note", "frame", "additive"), args.budget))
+                for k, v in residual_budget(model, out, batch["mask"]).items():
+                    logs["budget_" + k] = v
+                    loss = loss + weights[k] * v
+            if gan:
+                real = highpass(tgt, cfg.sample_rate)  # no infrasound giveaway: the loss ignores it too
+                fake = highpass(out["audio_texture"][..., s:].float(), cfg.sample_rate)
+                disc.requires_grad_(True)
+                disc_opt.zero_grad()
+                logs["disc"] = discriminator_loss(disc, real, fake)
+                logs["disc"].backward()
+                disc_opt.step()
+                disc.requires_grad_(False)
+                logs["adv"], logs["fm"] = generator_adv_loss(disc, real, fake)
+                loss = loss + args.adv_weight * (logs["adv"] + 2.0 * logs["fm"])  # reaches GAN_PARAMS only
 
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            if envs is not None:
+                dec = [p for name, p in model.named_parameters() if name.startswith(ENV_PARAMS) and p.grad is not None]
+                g_rest = [p.grad.detach().clone() for p in dec]
+                idx = env_rng.choice(len(envs), args.env_batch, replace=False).tolist()
+                with amp_ctx():
+                    y = model(envs.batch(idx, device), envs.n, residual=residual)["audio"].float()
+                tot, cnt = 0.0, 0
+                for j, i in enumerate(idx):
+                    ev = envs.notes[i]
+                    sm, c, _, _ = env_term.note(y[j], envs.rec[i], envs.table[ev["pitch"] - 21], envs.t_on, ev["t_end"])
+                    tot, cnt = tot + sm, cnt + c
+                if cnt:
+                    env = tot / cnt / 10  # dB -> log10 power
+                    (args.env_weight * env).backward()
+                    if dec:
+                        ga = torch.cat([g.flatten() for g in g_rest])
+                        ge = torch.cat([(p.grad - g).flatten() for p, g in zip(dec, g_rest)])
+                        cos = float(ga @ ge / (ga.norm() * ge.norm() + 1e-30))
+                        ratio = float(ge.norm() / (ga.norm() + 1e-30))
+                    else:
+                        cos = ratio = float("nan")
+                    env_hist.append((float(env.detach()) * 10, cos, ratio, cnt))
+                del y
+        except torch.OutOfMemoryError:  # a rare batch with many notes (stage 2): skip it rather than crash
+            oom = True
+            out = pred = tgt = loss = logs = y = None
+        if oom:
+            opt.zero_grad(set_to_none=True)
+            if disc_opt is not None:
+                disc_opt.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            log(f"step {step}: out of GPU memory ({batch['pitch'].shape[1]} notes), batch skipped", kind="warn", step=step)
+            continue
         gnorm, finite = {}, True
         for mod in MODULES:
             ps = [p for name, p in model.named_parameters() if name.startswith(mod + ".") and p.grad is not None]
@@ -567,6 +656,10 @@ def main(argv=None):
             vals = {k: float(v.detach()) for k, v in logs.items()}
             if pieces is not None:
                 vals["piece_sd"] = float(pieces.db.std())
+            if env_hist:
+                h = np.array(env_hist[-args.log_every:])
+                vals.update(env_db=float(h[:, 0].mean()), env_cos=float(np.nanmean(h[:, 1])),
+                            env_gratio=float(np.nanmedian(h[:, 2])), env_cells=float(h[:, 3].mean()))
             dt = time.time() - t_last
             t_last = time.time()
             mem = torch.cuda.max_memory_allocated() / 2**30 if device.type == "cuda" else 0.0

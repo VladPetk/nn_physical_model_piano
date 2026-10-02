@@ -203,6 +203,7 @@ JNDs used where known:
 | N10 | release | F1, F2 | on note-offs with the pedal up **in any texture** (f₀ ≥ 130 Hz, no onset in −0.1…+0.3 s): level tracks (window max(30 ms, 6/f₀), every 2 ms) of the released note's first 8 partials that are clear of every other ringing note's partials, each fitted by two lines with a step between them. At the microphones the direct sound is only a few dB above the reverberant field, so a damper shows as a step and a steeper slope, not a deep drop. Delay (the breakpoint: contact plus part of the fall), step, slopes before and after. The first version (steepest descent on isolated note-offs) failed validation in context |
 | N11 | spread | V classes | the note-to-note spread of N1, N2, N5 and N6 at equal key and velocity, model vs recording |
 | N12 | extra peaks | E2, E1, C7 | narrow peaks at 50–650 ms (Hann, res 3.3 Hz) that are not the note's own partials (tracked up the series): new with the note (10 dB over the same stretch before it), 10 dB over the local floor and over the nearest partial's sidelobes, beyond 2 res + 0.15 % of every partial and not stronger than it. Labelled *phantom* (at an f_j + f_k), *near* (within 25 cents of a partial: unison splitting, undamped strings, duplex segments tuned near it) or *between*. Pedal up. Near peaks below 1397 Hz on damped keys cannot be undamped strings |
+| N13 | whole envelope | C4, C9, E1 | **in any texture**, notes of MIDI 36-88 read while they sound freely (key or pedal ≥ CC 64 holds the damper off, no re-strike, ≤ 3 s): each partial up to 40 / 6 kHz at 0.1-2.5 s (window max(50 ms, 8/f₀), mean power over t ± max(20 ms, 8 %), less frames within −10…+40 ms of another note's attack), beside its local floor (control frequencies half-way to the neighbours); a reading counts where no note struck in the 2 s before and not yet damped has a partial within one main-lobe half width. Fade = level at t re 0.1 s, each held at or above its floor. `scripts/note_envelope.py`; docs 17 |
 
 ### 3.2 Tracks (T)
 
@@ -221,6 +222,7 @@ JNDs used where known:
 | E3 (F4) | re-strikes | F4 | runs of one key struck again 0.08–0.6 s apart under the pedal: the level of the key's partials 20–100 ms after each strike; (model − recording at strike k) − (model − recording at the first strike). Positive: the model keeps too much of the ringing string |
 | E4 | attacks in music | B4, D2 | positive spectral flux per octave band in −5 … +40 ms around onsets **minus the excerpt's flux away from onsets** (room and reverb fluctuate too), as a distribution over onsets, by the register of the struck note |
 | E5 | una corda | F5 | spectrum and level with CC67 down vs up, same keys and velocities |
+| E6 | release under a part-pressed pedal | F1, F3 | note-offs of MIDI 48-88 with the sustain steady (12 CC) from 0.3 s before to 0.6 s after, at any depth: per partial clear of the notes that may ring, the drop 0.4-0.6 s after the note-off and the extra decay, by pedal depth. `scripts/pedal_release.py`; docs 16.7 |
 
 ### 3.4 Passages (P)
 
@@ -1489,3 +1491,198 @@ terms (16.5).
 
 Listening: `samples/phase5/` (8 × 12 s and the demo, the 2 × 20 s excerpts of phase 4, the 12 R3 notes against phase
 5).
+
+### 16.7 A note that rings too long: excerpt 0, note 66
+
+The owner heard one note in `samples/phase5/listen_long/0_ab.wav` ring far too long with a metallic high tone, in
+phase 5 and already in phase 4: note 66 of `0_notes.md` (`scripts/excerpt_roll.py` draws the excerpt's notes over the
+spectrograms), a D3 at velocity 87, released at 13.1 s under the pedal (CC 87-92 until 17.7 s). At 14-15 s its
+partials stand 10-20 dB over the recording's at 0.9-1.8 kHz and 15-30 dB at 2.8-4.6 kHz (D3 partials 19-30). What it
+was not (mine, renders of this excerpt and of note 66 alone, `runs/scratch/n66/`):
+- **Not the strings' decay fitted in phase 5.** Phase 4's decay parameters in phase 5 (`physics.raw_prompt`, `raw_log_b1`,
+  `raw_log_b3`, `raw_bridge_g`, `raw_decay_p`) did not change what the owner heard.
+- **Not the ring-up, nor the sympathetic bank** (no change with either off).
+- **Not the pedal's lift curve** (E6 below). Moving the dampers' half-lift to CC 89 killed the tone and, by ear, every
+  other sound with it for a second.
+
+**The lead, not yet confirmed by ear: the per-strike variation's draw.** The same model, the same notes, other noise seeds: at 3.2 kHz, 14 s,
+the recording −12 dB, phase 5 seed 0 (the sample) +2, seeds 1-4 −23, −22, −3, 0, no per-strike variation −6; 0.9 kHz
+is 11-16 dB over the recording in every draw. The decay variation (`strike_log_decay` 0.25 plus `strike_decay_tilt`
+0.26 per octave from 1 kHz, i.e. ±0.5 in log decay rate at 3-5 kHz, plus `strike_partial_decay`) can halve one strike's
+upper-partial decay; the spreads were checked on partials 1-12 only (16.3), never above ~2 kHz in R3.
+`note66_seeds_ab.wav`: recording, seed 0, seed 1, no variation.
+
+**E6: a released note under a part-pressed pedal** (`scripts/pedal_release.py`, `measures.pedal_releases`,
+`measures.pedal_release_decay`; `runs/phase5/pedal_release/`). Note-offs of MIDI 48-88 with no onset 0.1 s before to
+0.6 s after and the sustain steady (12 CC) from 0.3 s before to 0.6 s after, 1,409 of 4,737 in 2018 (≤ 80 per depth ×
+register); per partial clear of the notes that may ring (keys down, and with the pedal at 40+ notes struck in the 3 s
+before; 8 s left almost none), the level 0.4-0.6 s after the note-off re just before. Synthetic check: extra decays of
+8k dB/s read within 2 dB/s (`tests/test_measures.py`). Validation through the renderer: half-lift moved to CC 79 / 89
+reads −9.0 / −9.3 dB at 64-80 and −1.4 / −6.6 at 80-96, nothing at < 40 or 112+.
+
+| pedal CC at the note-off | < 40 | 40-64 | 64-80 | 80-96 | 96-112 | 112+ |
+|---|---|---|---|---|---|---|
+| recording, drop (dB) | −18.2 (295) | −17.0 (44) | −5.3 (61) | −5.1 (56) | −4.6 (52) | −5.1 (37) |
+| phase 5 − recording | −0.1 (209) | +2.0 (31) | −1.0 (37) | +0.6 (36) | +1.2 (36) | +2.6 (23) |
+| phase 4 − recording | +0.1 (216) | +1.2 (35) | −0.7 (34) | −1.5 (40) | +0.3 (37) | +1.6 (25) |
+
+(medians over partials, n partials in brackets; 10-25 note-offs per depth above 40.) In 2018 the dampers are on up to
+CC ~64 and off from ~64: the model's lift curve (half-way at CC 54-65) matches within 1-2 dB, and only 2 % of the 132
+recorded note-offs at CC ≥ 64 look damped (drop < −12 dB). No partial-dependence of the damping at part pedal could be
+read at these n.
+
+## 17. Phase 6: the whole note (2026-10-01)
+
+### 17.1 Why the blind spots kept appearing
+
+Note 66 (16.7) rang too long in a stretch nothing measured. Section 4.1 had said so in round 2 ("nothing is longer
+than 2 s ... the aftersound, the knee of the double decay"), and 4.2 planned per-key statistics of long tracks (T1),
+but T1 was built only to 1 s (section 15, R3 only, partials 1-12) and every measure since was built where a listening
+complaint pointed. The limits were set for convenience and never revisited: partials 1-12 (profile, note fits), 0.48 s
+(note fits), 0.4 s (bench band levels), 2 s (training windows). The losses weigh by energy and the ear by salience: a
+high partial ringing 30 dB under the attack, unmasked because nothing new is struck, costs a spectral loss little.
+Clean long tails are rare in music (37 R3 notes of 2018 with 2 s clear after them), which kept the windows short.
+N13 reads notes in any texture instead, partial by partial where they are clear of the others.
+
+### 17.2 Coverage: what sees which part of a note
+
+Before phase 6 (iso: isolated notes of the bench or the R3 profile; mus: in music; fit: a note fit; loss: the
+training losses, section 4.1). Empty cells were blind.
+
+| part of the note | partials 1-4 / below 1 kHz | partials 5-12 | partials 13+ / above 2 kHz | between the partials |
+|---|---|---|---|---|
+| 0-40 ms (attack) | iso: onset measure (bands), N0, N4; mus: E4; fit: onset; loss: attack | same | same | iso: N6 knock; fit: knock, parts |
+| 40-100 ms | iso: N2, N5; fit: early, p 50-150 ms; loss | same | iso: N2 (to 16), N5 bands; loss: band | iso: N5 |
+| 0.1-0.5 s | iso: N8 (1-8), profile (R3); fit: p 150-480 ms, sustain; loss | iso: profile (R3); fit: p (to 12) | iso: N5 bands to 0.4 s; loss: band (1/6 oct) | iso: N6 sustain (halo) |
+| 0.5-1 s | iso: profile late (R3 only); loss: band, fine (mixed) | iso: profile late (R3 only) | – | – |
+| 1-3 s | loss only, mixed into 2 s windows | – | – | – |
+| after the damper | iso: N10 (pedal up), P4 (room); mus: E6 | iso: N10 | – | P4 bands |
+| note to note spread | iso: N11, profile spreads (R3) | profile spreads (R3) | – | – |
+
+Phase 6 adds N13 (any texture, R2-R6, partials to 40 / 6 kHz, 0.1-2.5 s; spreads from the same readings) and the
+envelope fit and training term on it (17.4, 17.5). Still blind after it: beyond 2.5 s (the aftersound's own rate, beats slower than 0.5 Hz),
+the treble above R6, the energy between the partials after 0.4 s, and partial 2 in music (an octave above is almost
+always sounding: 4-34 readings).
+
+### 17.3 N13 on phase 5
+
+`runs/phase6/envelope/`: 2,200 notes of 2018 (≤ 20 / 30 / 60 per register × velocity for lengths < 1 / 1-2 / 2+ s, of
+362,179), every split (a measure of the sound). Synthetic check (`tests/test_measures.py`): fades of 3 + 0.5 k dB/s
+read within 0.6 dB + 3 %, colliding partials and a reading under another note's attack dropped. Through the renderer:
+the prompt decay of partials 13+ doubled moves 13-20 by −2.1 dB at 1 s and −3.4 at 1.5 s, 21-40 by −2.6 and −3.1,
+partials 1-12 by ≤ 0.3; partial 2's aftersound +6 dB moves partial 2 by +0.9 to +2.1 dB at 1-2 s (4-14 readings: N13
+barely sees partial 2).
+
+Model − recording fade (dB, median over partials; n), all registers:
+
+| partials | 0.35 s | 0.5 s | 1 s | 1.5 s | 2 s |
+|---|---|---|---|---|---|
+| 1 | −0.8 (111) | −0.0 (94) | +0.1 (62) | +0.3 (41) | +0.5 (23) |
+| 2 | +0.8 (43) | +1.1 (34) | −1.1 (14) | −0.5 (8) | |
+| 3-4 | +0.6 (92) | +2.1 (69) | +0.4 (32) | +4.3 (22) | +5.0 (8) |
+| 5-8 | +1.0 (162) | +1.4 (112) | +1.8 (53) | +5.9 (33) | +4.3 (17) |
+| 9-12 | +2.2 (82) | +1.6 (63) | +6.1 (34) | +6.4 (19) | +9.2 (10) |
+| 13-20 | +1.7 (137) | +2.6 (117) | +4.8 (62) | +7.2 (47) | +6.8 (26) |
+| 21-40 | +2.3 (182) | +2.7 (150) | +4.2 (82) | +3.8 (62) | +5.0 (21) |
+
+**The upper partials ring too long**: from 0.5 s, partials 9 and up fade 2-3 dB less than the piano's, 4-6 dB less by
+1 s and 6-7 by 1.5 s; by frequency, 0.5-2 kHz +4 to +5 dB at 1-2 s. R3 is the worst (9-12 and 13-20 +10 dB at 1 s,
+13-15 readings), R2 +4 to +9. The fundamental is right throughout. The share of partials still 6 dB over their floor
+agrees (R3, 21-40 at 1 s: recording 50 %, model 86 %; R2 13-20 at 1 s: 63 % / 83 %). R4-R6 have few clear readings
+above partial 8. **The per-strike spread is not too wide**: the IQR of the fade across notes (R2-R3, both sides
+counted) at 0.5-1 s is 3.3-3.9 dB for partials 13-20 against the piano's 4.3-8.5 (16.7's draw was a tail one); the
+variation's tilt is kept.
+
+### 17.4 The envelope fit
+
+`pianonn/envfit.py`, `scripts/fit_envelope.py`: the strings' decay (per-key prompt loss, b1, b3, the loss exponent,
+the bridge conductance over frequency) and the aftersound's level per key and mode, fitted on N13's fades. Each step
+renders a batch of N13 notes in their contexts and reads the model's partials at the recording's frames with a
+differentiable DFT; the term is the L1 distance of the fades (0.2-2.5 s re 0.1 s) over N13's cells. Notes of the
+training pieces are fitted (event seed 1, cap 15: 307 of 1,383 with a countable reading), the validation and test
+pieces' held out (52 of 257). Per-key tables move by piecewise-linear corrections with knots every 8 keys.
+
+`runs/phase6/env_fit/` (400 steps of 6, lr 3e-3, from phase 5): the term 4.35 → 4.21 dB on the fitted notes, 4.91 →
+4.82 on the held-out ones. It moved the right way but little: key 50's prompt decay went from about 6 to 7.5-9.5 dB/s
+at partials 9-20, where N13 asks for about 11-13. No parameter sat at a bound: under-trained.
+`runs/phase6/env_fit2/` (1,000 steps of 6 from `env_fit/`, lr 1e-2): 4.21 → 3.99 dB on the fitted notes, 4.82 → 4.75 on
+the held-out ones (52 notes, 559 cells). On the fitted R3 notes, partials 5-8 at 1 s went from +8.5 to +2.5 dB and
+13-20 from +7.0 to +4.2 (5-9 notes); the held-out notes are too few per register to say more. It starts the run.
+
+### 17.5 The envelope term in training, not frozen decays
+
+Phase 5 froze the decays in training after fitting them on notes. Doing the same with the envelope fit would protect
+the fit from a loss that cannot judge it, and hide the question why it cannot. Phases 3 and 4 trained the decays with
+the music loss (2 s windows, every frame weighted alike) and the upper partials still rang too long, so either the
+loss barely sees them (a partial 30-50 dB down at 1-2 s shares its 1/6-octave band with every other sounding note)
+or it prefers them long (they stand in for sustained energy the model lacks; not the pedal halo, which E1 found in
+excess, 16.4, but possibly the energy between the partials after 0.4 s, which nothing measures, 17.2). Both are mine,
+untested.
+
+`pianonn/train.py --env-weight`: every step also renders `--env-batch` (2) N13 notes of the training pieces in
+their contexts (with the residual in stage 2: the residual has per-note decay corrections) and adds N13's fade
+distance, in dB / 10 (PianoLoss's log10 power), the decays left free. The log reports the cosine between this term's
+gradient on the strings' decay and the rest of the loss's (`env_cos`: below 0 they pull against each other) and its
+size re theirs (`env_gratio`); each validation reports the term on the held-out N13 notes and the median fade error
+of partials 9-40 at 1 and 1.5 s. Smoke test (`runs/scratch/env_train_smoke`, 49 steps of 2, both stages): at weight 1
+the term's gradient on the decays was 1.4-4 times the rest's, `env_cos` between −0.10 and +0.06; the run uses 0.5.
+
+### 17.6 One long run with the envelope term
+
+`runs/phase6/train_run/` (`chain.sh`): 310 min from `env_fit2/`, the envelope term at weight 0.5 with the decays free
+(804 N13 notes of the training pieces, cap 40; 169 held out), the physics-aware residual (fresh) in stage 2 from
+step 2,960; otherwise as phase 5. 4,800 steps. Stage 2 ran out of GPU memory once at step ~3,190 (the main loss's
+backward on a batch with many notes, 17.7 of 19.2 GB); the chain restarted from step 3,000, and `train.py` now skips
+such a batch instead of crashing (none was skipped after).
+
+**The music loss does not pull against the envelope term.** The cosine between the two gradients on the strings' decay
+stayed at −0.005 to −0.016 in every 500-step window (sd of the 25-step means 0.02), while the envelope term's gradient
+was about 3 times the rest's. The envelope fit had already changed the upper partials' fades by several dB at 1 s
+without costing the music loss anything (validation 0.9445 at the start against phase 5's 0.948). Of 17.5's two
+readings, this supports the first: the music loss barely sees the tails; it does not prefer them long (mine; the
+per-step cosine is noisy with 2 notes, so a weak conflict cannot be excluded).
+
+Validation (64 excerpts; the held-out N13 notes, physics in stage 1 and with the residual in stage 2):
+
+| step | music, physics | with the residual | envelope (dB) | partials 9-40 at 1 s / 1.5 s |
+|---|---|---|---|---|
+| 0 | 0.9445 | | 4.01 | +2.4 / +1.8 |
+| 1,250 | 0.9331 | | 3.89 | +2.5 / +1.6 |
+| 2,960 | 0.9609 | 0.9597 | 3.89 | +1.9 / +2.0 |
+| 4,500 | 0.9368 | 0.9270 | 3.82 | +1.1 / +2.3 |
+| 4,800 | 0.9402 | 0.9450 | 3.81 | +1.1 / +2.7 |
+
+The music validation swung by ±0.03 between checks in stage 1 (the per-key level, `gain_db`, wandered by up to 1.5 dB,
+as in 12.9); the residual's contribution swung between −0.022 and +0.010 and ends slightly negative.
+
+On 96 test excerpts (2 seeds, variation off, `compare.md`), against phase 5: total −0.0084 ± 0.0036 (physics) and
+−0.0100 ± 0.0034 (with the residual), every term negative (band −0.005, fine −0.009, attack −0.003, MR-STFT −0.021,
+log-mel −0.06 dB); the residual adds −0.0016 to the physics.
+
+N13 (`envelope/`, the 2,200 notes of 17.3, every split), model − recording fade, median over partials (n), phase 5 →
+phase 6 (physics):
+
+| partials | 0.5 s | 1 s | 1.5 s | 2 s |
+|---|---|---|---|---|
+| 1 | −0.0 → −0.5 (97) | +0.1 → +0.5 (65) | +0.3 → +0.6 (42) | +0.5 → −1.3 (21) |
+| 3-4 | +2.1 → +1.2 (70) | +0.4 → +0.0 (33) | +4.3 → +0.1 (23) | +5.0 → +0.1 (9) |
+| 5-8 | +1.4 → +0.5 (115) | +1.8 → +1.1 (54) | +5.9 → +2.2 (33) | +4.3 → −0.7 (14) |
+| 9-12 | +1.6 → +0.0 (66) | +6.1 → +4.1 (35) | +6.4 → +2.0 (19) | +9.2 → +5.8 (10) |
+| 13-20 | +2.6 → +1.9 (118) | +4.8 → +2.5 (65) | +7.2 → +3.5 (47) | +6.8 → −0.6 (26) |
+| 21-40 | +2.7 → +1.1 (164) | +4.2 → +2.0 (86) | +3.8 → +0.0 (64) | +5.0 → −4.0 (22) |
+
+**The upper partials' excess ring is about halved**, the fundamental unchanged. 1,800 of these notes are from training
+pieces (the envelope term drew its own from the same pieces, seed 1). On the 400 of the validation and test pieces
+alone the direction holds for partials 9 and up (13-20 at 1 s +10.9 → +6.0, 21-40 +3.3 → +0.2; 5-17 readings per
+cell) but not for 5-8 (+6.5 → +7.6, 10); too few to say more. R3, the worst register, still rings long: 5-8 +7.3 and
+13-20 +5.2 dB at 1 s (13-16 readings; phase 5 about +10). The residual changes the fades by ≤ 0.9 dB.
+
+The R3 partial profile (`r3_profile/`, 56 isolated tenor notes), late decay at 0.5-1 s, model − recording (dB/s;
+positive: the model fades too slowly), phase 5 → phase 6: partial 2 +4.6 → −0.8, 4 +5.8 → +2.8, 6 +13.1 → +11.6,
+7 +9.1 → +5.1, 9 +11.8 → +6.8, 10 +5.5 → +2.4, 11 +1.8 → −3.9, 12 −5.0 → −3.9 (11-24 notes). The bench (459 isolated
+notes): 19 cells beyond their threshold against phase 5's 17, R2 level −3.4 → −2.0 dB. Listening:
+[`samples/phase6/`](../samples/phase6/), with note 66 marked; checkpoint `runs/phase6/train_run/train/last.pt`.
+
+Open: R3's partials 5-8 and 13-20 still ring 5-7 dB long at 1 s; partials 5-8 do not improve on held-out notes; the
+residual is no help on validation (it swung between −0.022 and +0.010) though it gains −0.0016 on the test excerpts;
+the per-step `env_cos` is noisy (2 notes), so a summed-gradient check would settle 17.5's question better.

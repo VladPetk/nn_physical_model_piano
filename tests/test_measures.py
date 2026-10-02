@@ -389,3 +389,57 @@ def test_onset_profile_reads_known_delays_ramps_and_a_knock():
     assert abs(knock["win"][0, i500] - base["win"][0, i500]) < 0.3
     # a steady note settles: 20-40 ms sits at its 50-100 ms level plus the decay in between (26 dB/s x ~55 ms)
     assert np.all(np.abs(base["win"][3, 1:] - 1.4) < 0.6)
+
+
+def test_pedal_release_decay_reads_each_partials_extra_decay():
+    """A note decaying at 3 dB/s whose partial k decays 8 k dB/s faster after the note-off at 1.0 s; partial 5 sits
+    under another note's partial and is skipped."""
+    f0, t = 200.0, np.arange(int(1.8 * SR)) / SR
+    rng = np.random.default_rng(0)
+    x = np.zeros_like(t)
+    for k in range(1, 9):
+        db = -3.0 * t - 8.0 * k * np.clip(t - 1.0, 0, None) - 2.0 * k
+        x += 10 ** (db / 20) * np.sin(2 * np.pi * k * f0 * t + rng.uniform(0, 2 * np.pi))
+    x += 1e-5 * rng.standard_normal(len(t))
+    table = f0 * np.arange(1, 9)
+    r = M.pedal_release_decay(np.stack([x, x], 1), SR, 1.0, table, others=[np.array([5 * f0 + 1.0])])
+    k = np.arange(1, 9)
+    ok = k != 5
+    assert np.all(np.abs(r["extra"][:8][ok] + 8.0 * k[ok]) < 2.0)
+    assert np.all(np.abs(r["before"][:8][ok] + 3.0) < 1.0)
+    # 0.4-0.6 s after (centre 0.5) re -0.12..-0.02 (centre -0.07): 3 x 0.57 + 8 k x 0.5 dB
+    want = 3.0 * 0.57 + 8.0 * k[ok] * 0.5
+    assert np.all(np.abs(r["drop"][:8][ok] + want) < 0.05 * want + 0.3)
+    assert np.isnan(r["extra"][4]) and np.all(np.isnan(r["extra"][8:]))
+
+
+def test_note_envelope_reads_each_partials_fade_where_clear():
+    """Partial k of a 200 Hz note fades at 3 + 0.5 k dB/s; a 300 Hz note sounds throughout (every third partial
+    collides) and a note struck at 0.75 s and damped at 0.85 s blanks that reading; 2.5 s lies past the end (2.6 s)."""
+    f0, t = 200.0, np.arange(int(3.0 * SR)) / SR
+    rng = np.random.default_rng(1)
+    t_on = 0.3
+    x = np.zeros_like(t)
+    for k in range(1, 21):
+        db = -2.0 * k - (3.0 + 0.5 * k) * np.clip(t - t_on, 0, None)
+        x += (t >= t_on) * 10 ** (db / 20) * np.sin(2 * np.pi * k * f0 * t + rng.uniform(0, 2 * np.pi))
+    for m in range(1, 14):
+        x += 1e-2 * 10 ** (-m / 20) * np.sin(2 * np.pi * 300.0 * m * t)
+    x += 1e-6 * rng.standard_normal(len(t))
+    table = f0 * np.arange(1, 31)
+    others = [(62, -0.5, np.inf), (75, 0.75, 0.85)]
+    tabs = {62: 300.0 * np.arange(1, 21), 75: 622.25 * np.arange(1, 10)}
+    r = M.note_envelope(np.stack([x, x], 1), SR, t_on, table, 2.6, others, tabs)
+    times = np.array(M.ENV_TIMES)
+    k = np.arange(1, 21)
+    assert len(r["freqs"]) == 29  # below 6 kHz
+    collide = k % 3 == 0
+    i075 = list(M.ENV_TIMES).index(0.75)
+    for i, tau in enumerate(times):
+        if i == i075 or tau == 2.5:
+            assert not r["clear"][i].any()
+            continue
+        assert not r["clear"][i, :20][collide].any() and r["clear"][i, :20][~collide].all()
+        fade = r["L"][i, :20] - r["L"][0, :20]
+        want = -(3.0 + 0.5 * k) * (tau - 0.1)
+        assert np.all(np.abs(fade[~collide] - want[~collide]) < 0.6 + 0.03 * np.abs(want[~collide])), (tau, fade, want)

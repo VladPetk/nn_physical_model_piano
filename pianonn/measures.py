@@ -801,6 +801,197 @@ def release_tracks(x, sr, t_off, partials, others=(), n_partials=8, fmax=4000.0,
     return out
 
 
+# ------------------------------------------------------------------ E6: release under a part-pressed pedal
+
+PEDAL_DEPTHS = (("<40", 0, 40), ("40-64", 40, 64), ("64-80", 64, 80), ("80-96", 80, 96), ("96-112", 96, 112),
+                ("112+", 112, 128))
+
+
+def pedal_releases(notes, pedals, lo=48, hi=88, hold=0.3, quiet=(0.1, 0.6), span=(-0.3, 0.6), flat=12.0, ring=3.0):
+    """E6 events: note-offs of pitch ``lo``..``hi`` (below the undamped keys) held >= ``hold`` s, no onset in
+    [off - 0.1, off + 0.6], the sustain pedal steady over ``span`` s re the note-off (max - min <= ``flat`` CC) at any
+    depth, the sostenuto up. ``[(row, cc, others)]``: ``cc`` the sustain value at the note-off; ``others`` the
+    pitches that may ring at the released note's partials: keys down in [off + span], and with the pedal at 40 or
+    more any note struck in the ``ring`` s before (a part-pressed pedal may leave them ringing; older ones have
+    faded, and excluding 8 s of them left almost no partial)."""
+    on, off = notes[:, 1], notes[:, 2]
+    st, sv = pedals["sustain_t"], pedals["sustain_v"]
+    so_t, so_v = pedals["sostenuto_t"], pedals["sostenuto_v"]
+    out = []
+    for i in range(len(notes)):
+        t = off[i]
+        if not lo <= notes[i, 0] <= hi or t - on[i] < hold:
+            continue
+        if np.any((on > t - quiet[0]) & (on < t + quiet[1])):
+            continue
+        v = np.array([_value_at(st, sv, t + span[0])] + list(sv[(st > t + span[0]) & (st < t + span[1])]))
+        if v.max() - v.min() > flat:
+            continue
+        if _value_at(so_t, so_v, t) >= PEDAL[0][2] or np.any(so_v[(so_t > t + span[0]) & (so_t < t + span[1])] >= PEDAL[0][2]):
+            continue
+        cc = _value_at(st, sv, t)
+        keys = (on < t + span[1]) & (off > t + span[0])
+        if cc >= 40:
+            keys |= (on > t - ring) & (on < t + span[1])
+        keys[i] = False
+        out.append((i, cc, sorted({int(p) for p in notes[keys, 0]})))
+    return out
+
+
+def pedal_release_decay(x, sr, t_off, partials, others=(), n_partials=16, fmax=6000.0, snr_db=6.0, clear=1.0):
+    """E6 on one note-off: per partial of the released note (up to ``n_partials`` below ``fmax``), ``[K]`` arrays:
+    ``drop`` (dB: the level 0.4-0.6 s after the note-off re 0.12-0.02 s before it), ``before`` and ``after`` (dB/s,
+    lines fitted over -0.3..-0.03 s and 0.08..0.6 s) and ``extra`` = after - before, the decay the dampers add.
+    Window max(50 ms, 8 / f0). A partial counts (else NaN) when it is clear, by ``clear`` main-lobe half widths, of every
+    partial of the ``others``' lists, and stands ``snr_db`` over the louder of two control frequencies half-way to
+    its neighbours just before the note-off."""
+    f0 = float(partials[0])
+    win = max(0.05, 8.0 / f0)
+    res = 2.0 / win
+    others = [np.asarray(o, float) for o in others]
+    fr = np.asarray(partials, float)
+    fr = fr[(fr > 0) & (fr < fmax)][:n_partials]
+    K = n_partials
+    out = {k: np.full(K, np.nan) for k in ("drop", "before", "after", "extra")}
+    if not len(fr):
+        return out
+    sp = np.diff(np.concatenate([[0.0], fr, [fr[-1] + (fr[-1] - fr[-2] if len(fr) > 1 else f0)]]))
+    ctrl = np.stack([fr - 0.5 * sp[:-1], fr + 0.5 * sp[1:]], 1)  # [k, 2]
+    t, L = partial_tracks(x, sr, t_off - 0.35, t_off + 0.7, np.concatenate([fr, ctrl.ravel()]), win)
+    Lp, Lc = L[:, : len(fr)], L[:, len(fr):].reshape(len(t), len(fr), 2).max(-1)
+    tr = t - t_off
+
+    def pmean(y, a, b):
+        sel = (tr >= a) & (tr <= b)
+        return 10 * np.log10(np.mean(10 ** (y[sel] / 10), 0))
+
+    pre, pre_c = pmean(Lp, -0.12, -0.02), pmean(Lc, -0.12, -0.02)
+    post = pmean(Lp, 0.4, 0.6)
+    bsel, asel = (tr >= -0.3) & (tr <= -0.03), (tr >= 0.08) & (tr <= 0.6)
+    for k in range(len(fr)):
+        if any(np.min(np.abs(o - fr[k])) <= clear * res for o in others if len(o)) or pre[k] - pre_c[k] < snr_db:
+            continue
+        b = np.polyfit(tr[bsel], Lp[bsel, k], 1)[0]
+        a = np.polyfit(tr[asel], Lp[asel, k], 1)[0]
+        out["drop"][k], out["before"][k], out["after"][k], out["extra"][k] = post[k] - pre[k], b, a, a - b
+    return out
+
+
+# ------------------------------------------------------------------ N13: the whole note's envelope, partial by partial
+
+ENV_TIMES = (0.1, 0.2, 0.35, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5)  # s after the onset; the first is the reference (a bass
+# note's window is 0.12 s: 50 ms would reach back before the onset)
+ENV_LIFT = 64  # CC64 above which the dampers are off (E6, 16.7)
+
+
+def damp_times(notes, pedals, lift=ENV_LIFT):
+    """When each note's damper falls (s): its note-off, or later, the first moment after it the sustain is below
+    ``lift``; inf if never."""
+    st, sv = pedals["sustain_t"], pedals["sustain_v"]
+    out = np.empty(len(notes))
+    for i, off in enumerate(notes[:, 2]):
+        if _value_at(st, sv, off) < lift:
+            out[i] = off
+        else:
+            later = np.nonzero((st > off) & (sv < lift))[0]
+            out[i] = st[later[0]] if len(later) else np.inf
+    return out
+
+
+def envelope_events(notes, pedals, lo=36, hi=88, t_max=2.6, min_end=0.3, back=2.0):
+    """N13 events in any texture: every note of pitch ``lo``..``hi`` (below the undamped keys). ``[(row, t_end,
+    others)]``: ``t_end`` (s re the onset) where it stops sounding freely: its damper falls (``damp_times``), its key
+    is struck again, or ``t_max``, less 50 ms; at least ``min_end``. ``others``: ``(pitch, onset, damp)`` re the
+    note's onset of the notes struck from ``back`` s before it to its end (older ones count as faded), for
+    ``note_envelope`` to read each partial only where none of them sounds near it."""
+    on = notes[:, 1]
+    damp = damp_times(notes, pedals)
+    out = []
+    for i in range(len(notes)):
+        p, t0 = notes[i, 0], on[i]
+        if not lo <= p <= hi:
+            continue
+        again = on[(notes[:, 0] == p) & (on > t0 + 1e-4)]
+        end = min(damp[i], again.min() if len(again) else np.inf, t0 + t_max) - t0 - 0.05
+        if end < min_end:
+            continue
+        near = np.nonzero((on >= t0 - back) & (on <= t0 + end + 0.1))[0]
+        others = [(int(notes[j, 0]), float(on[j] - t0), float(damp[j] - t0)) for j in near if j != i]
+        out.append((i, float(end), others))
+    return out
+
+
+def refine_partials(x, sr, t_on, table, f0, t1):
+    """The note's own partial frequencies on one side: the spectral peak within min(1.5 %, f0 / 4) of each table
+    frequency over 30 ms to ``t1`` s after the onset (``t1`` at most 0.4)."""
+    seg = _segment(x, sr, t_on + 0.03, t_on + min(0.4, t1))
+    n_fft = 1 << int(math.ceil(math.log2(len(seg) * 8)))
+    P, hz = _power(seg, n_fft), np.fft.rfftfreq(n_fft, 1 / sr)
+    out = []
+    for f in table:
+        tol = min(0.015 * f, 0.25 * f0)
+        band = (hz >= f - tol) & (hz <= f + tol)
+        out.append(float(hz[band][np.argmax(P[band])]) if band.any() else float(f))
+    return np.array(out)
+
+
+def note_envelope(x, sr, t_on, table, t_end, others=(), other_tables=None, times=ENV_TIMES, fmax=6000.0, kmax=40,
+                  clear=1.0):
+    """N13 on one note: the level of each of its partials (up to ``kmax`` below ``fmax``; ``table`` the reference
+    comb, refined on this side by ``refine_partials``) at ``times`` s after ``t_on``.
+
+    Window max(50 ms, 8 / f0), every 10 ms; each reading is the mean power over ``times`` ± max(20 ms, 8 %) (within
+    the note: after the onset by half a window, before ``t_end``), less the frames whose window meets another
+    note's attack (its onset -10..+40 ms, onsets later than 30 ms: a chord's spread belongs to this attack); with
+    under half the frames left it is not read. Beside each partial, the louder of two control frequencies half-way
+    to its neighbours: the local floor (other notes' halo, the room, noise). A reading is *clear* when no note of
+    ``others`` (``(pitch, onset, damp)`` re ``t_on``, struck before the span ends and not yet damped at its start;
+    partial lists in ``other_tables[pitch]``) has a partial within ``clear`` main-lobe half widths.
+    Returns ``freqs`` [K], ``L`` and ``ctrl`` [T, K] dB (NaN where not read), ``clear`` [T, K] bool, ``frames`` (per
+    time, the frame centres read, s re ``t_on``, or None), ``ctrl_freqs`` [K, 2] and ``win`` (s)."""
+    table = np.asarray(table, float)
+    fr = table[(table > 0) & (table < fmax)][:kmax]
+    f0 = float(fr[0])
+    T, K = len(times), len(fr)
+    out = {"freqs": fr, "L": np.full((T, K), np.nan), "ctrl": np.full((T, K), np.nan), "clear": np.zeros((T, K), bool),
+           "frames": [None] * T, "ctrl_freqs": None, "win": max(0.05, 8.0 / f0)}
+    if t_end < times[0] + 0.03:
+        return out
+    fr = refine_partials(x, sr, t_on, fr, f0, t_end)
+    out["freqs"] = fr
+    win = max(0.05, 8.0 / f0)
+    res = 2.0 / win
+    sp = np.diff(np.concatenate([[fr[0] - f0], fr, [fr[-1] + (fr[-1] - fr[-2] if K > 1 else f0)]]))
+    ctrl = np.stack([fr - 0.5 * sp[:-1], fr + 0.5 * sp[1:]], 1)
+    out["ctrl_freqs"] = ctrl
+    t, Lall = partial_tracks(x, sr, t_on + 0.02, t_on + t_end, np.concatenate([fr, ctrl.ravel()]), win, hop=0.01)
+    t = t - t_on
+    Lp, Lc = Lall[:, :K], Lall[:, K:].reshape(len(t), K, 2).max(-1)
+    for i, tau in enumerate(times):
+        d = max(0.02, 0.08 * tau)
+        a, b = tau - d, tau + d
+        if b + win / 2 > t_end or a - win / 2 < 0.0:
+            continue
+        span = (t >= a) & (t <= b)
+        sel = span.copy()
+        for _, o_on, _ in others:
+            if o_on > 0.03:
+                sel &= ~((t + win / 2 >= o_on - 0.01) & (t - win / 2 <= o_on + 0.04))
+        if sel.sum() < max(1, 0.5 * span.sum()):
+            continue
+        out["L"][i] = 10 * np.log10(np.mean(10 ** (Lp[sel] / 10), 0))
+        out["ctrl"][i] = 10 * np.log10(np.mean(10 ** (Lc[sel] / 10), 0))
+        out["frames"][i] = t[sel]
+        lo_t, hi_t = a - win / 2, b + win / 2
+        ok = np.ones(K, bool)
+        for p, o_on, o_damp in others:
+            if o_on <= hi_t and o_damp >= lo_t and other_tables is not None and p in other_tables:
+                of = np.asarray(other_tables[p], float)
+                ok &= np.min(np.abs(fr[:, None] - of[None, :]), 1) > clear * res
+        out["clear"][i] = ok
+    return out
+
+
 # ------------------------------------------------------------------ P4: room and image
 
 
