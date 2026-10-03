@@ -422,7 +422,8 @@ class SpecDiscriminator(nn.Module):
 
 class MultiResolutionDiscriminator(nn.Module):
     """Adversarial critic on log spectrograms. Spectral losses alone average away
-    the attack transients and noise texture that make a piano sound real."""
+    the attack transients and noise texture that make a piano sound real. Round 2's critic (``--critic patch``);
+    see ``WideSpecDiscriminator`` for why it sees too little."""
 
     def __init__(self, fft_sizes=(512, 1024, 2048)):
         super().__init__()
@@ -433,17 +434,112 @@ class MultiResolutionDiscriminator(nn.Module):
         return [d(x) for d in self.discs]
 
 
-def discriminator_loss(disc, real, fake):
+class WideSpecDiscriminator(nn.Module):
+    """One resolution of the wide critic. The patch critic above sees ~11 frequency bins per output (kernels 3 high,
+    no stride across frequency), so it cannot compare registers: it failed to see a 3 dB shelf above 1 kHz between
+    recordings and told the model's renders from recordings at AUC 0.53 (``runs/gan_check/check1``). Here every
+    layer after the first strides by 2 down the frequency axis with kernels 9 high, and the head spans what is left,
+    so each output judges one frame of the whole spectrum (plus 6 frames either side). The convolutions run in
+    bfloat16 on the GPU (``amp``); the log magnitude and the outputs stay float32."""
+
+    def __init__(self, n_fft, ch=32, layers=4, amp=True):
+        super().__init__()
+        self.n_fft, self.amp = n_fft, amp
+        convs = [nn.Conv2d(1, ch, (9, 3), padding=(4, 1))]
+        convs += [nn.Conv2d(ch, ch, (9, 3), stride=(2, 1), padding=(4, 1)) for _ in range(layers)]
+        self.convs = nn.ModuleList(convs)
+        rows = n_fft // 2 + 1
+        for _ in range(layers):
+            rows = (rows + 1) // 2
+        self.out = nn.Conv2d(ch, 1, (rows, 3), padding=(0, 1))
+
+    def spectrum(self, x):
+        return torch.log(_mag(x, self.n_fft) + 1e-5)[:, None]  # [B,1,F,T]
+
+    def forward(self, x=None, spec=None):
+        h = self.spectrum(x) if spec is None else spec
+        feats = []
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.amp and h.is_cuda):
+            for conv in self.convs:
+                h = F.leaky_relu(conv(h), 0.1)
+                feats.append(h)
+            out = self.out(h)
+        return out.float(), [f.float() for f in feats]
+
+
+class WideMultiResolutionDiscriminator(nn.Module):
+    """The wide critic at three resolutions; ``spectra`` lets a step compute the recordings' spectra once. With ``mono``
+    it judges the channels' mean (``x[B, ch, T]``): the side signal alone gave the renders away most easily
+    (``runs/gan_check/views1``), and the residual, acting before the room, cannot change the stereo image."""
+
+    def __init__(self, fft_sizes=(512, 1024, 2048), amp=True, mono=False):
+        super().__init__()
+        self.mono = mono
+        self.discs = nn.ModuleList([WideSpecDiscriminator(n, amp=amp) for n in fft_sizes])
+
+    def spectra(self, x):
+        if self.mono and x.dim() == 3:
+            x = x.mean(1)
+        x = x.reshape(-1, x.shape[-1])
+        return [d.spectrum(x) for d in self.discs]
+
+    def forward(self, x=None, spectra=None):
+        if spectra is None:
+            spectra = self.spectra(x)
+        return [d(spec=s) for d, s in zip(self.discs, spectra)]
+
+
+def make_discriminator(kind, mono=False):
+    if kind == "wide":
+        return WideMultiResolutionDiscriminator(mono=mono)
+    assert not mono, "mono: the wide critic only"
+    return MultiResolutionDiscriminator()
+
+
+def _judge(disc, x, spectra=None):
+    return disc(x) if spectra is None else disc(spectra=spectra)
+
+
+def discriminator_loss(disc, real, fake, real_spectra=None):
     loss = 0.0
-    for (lr, _), (lf, _) in zip(disc(real), disc(fake.detach())):
+    for (lr, _), (lf, _) in zip(_judge(disc, real, real_spectra), disc(fake.detach())):
         loss = loss + ((lr - 1) ** 2).mean() + (lf**2).mean()
     return loss
 
 
-def generator_adv_loss(disc, real, fake):
+def r1_penalty(disc, real_spectra):
+    """R1 (Mescheder et al. 2018): the squared norm of the critic's gradient at the recordings, here with respect to its
+    input, the log spectra. It keeps the critic from growing sharp around the real data, so it cannot win outright and
+    its gradient stays informative (``runs/loss_compare/C_gan``: without it the critic sat at 0.5 against 1.5 for chance
+    from the start). Needs a critic that takes spectra (``--critic wide``)."""
+    specs = [s.detach().requires_grad_(True) for s in real_spectra]
+    outs = disc(spectra=specs)
+    grads = torch.autograd.grad(sum(o.sum() for o, _ in outs), specs, create_graph=True)
+    return sum(g.pow(2).flatten(1).sum(1).mean() for g in grads)
+
+
+def critic_step(disc, opt, real, fake, real_spectra=None, r1=0.0, r1_every=4, step=0):
+    """One update of the critic; R1 lazily, every ``r1_every`` steps at ``r1_every`` times the weight. Returns its loss
+    (without the penalty) and the penalty (0 when not computed)."""
+    disc.requires_grad_(True)
+    opt.zero_grad()
+    loss = discriminator_loss(disc, real, fake, real_spectra)
+    pen = torch.zeros((), device=real.device)
+    if r1 > 0 and step % r1_every == 0:
+        pen = r1_penalty(disc, real_spectra if real_spectra is not None else disc.spectra(real))
+    (loss + 0.5 * r1 * r1_every * pen).backward()
+    opt.step()
+    disc.requires_grad_(False)
+    return loss.detach(), pen.detach()
+
+
+def generator_adv_loss(disc, real, fake, real_spectra=None):
+    """The least-squares generator term and the feature matching. The feature matching compares each render with
+    its own recording (paired), so against a take it is one more spectral distance, not a judgement of realism
+    (``runs/gan_check/check1``: its push follows the band error, the adversarial term's does not)."""
     adv, fm = 0.0, 0.0
     with torch.no_grad():
-        real_out = disc(real)
+        real_out = _judge(disc, real, real_spectra)
     for (lf, ff), (_, fr) in zip(disc(fake), real_out):
         adv = adv + ((lf - 1) ** 2).mean()
         fm = fm + sum((a - b).abs().mean() for a, b in zip(ff, fr)) / len(ff)

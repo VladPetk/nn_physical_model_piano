@@ -19,7 +19,21 @@ in validation or evaluation): at equal key and velocity the pieces of one year d
 level parameters follow each batch's pieces (docs/tone_measures.md 12.5, 12.9). ``--no-residual`` runs
 stage 2 without the residual (the control for its gain), and ``--adv-with-stage2`` adds the GAN in stage 2:
 the discriminator judges the audio, but its gradients reach only the noise bank and the residual
-(``GAN_PARAMS``), through a view of the output in which everything else is detached.
+(``GAN_PARAMS``). ``--critic-reach texture`` (round 2) gets there through a view of the output in which everything
+else is detached, so it reaches only their noise; ``--critic-reach residual`` judges the output itself and backs its
+term up separately into ``GAN_PARAMS`` alone, so it reaches the residual's tonal outputs too (band gains, per-partial
+curves, per-note corrections). ``--critic wide`` is the critic that sees the whole spectrum per frame
+(``losses.WideSpecDiscriminator``; the round-2 ``patch`` critic failed ``scripts/gan_check.py``). ``--gan-params``
+narrows what the critic reaches (``context.``: the residual alone; the default also lets it move the noise bank, which
+renders as physics: ``runs/loss_compare/C_gan``'s physics degraded through it), ``--r1`` regularises the critic (R1 at
+the recordings) and ``--gan-share`` scales the critic's gradient on those parameters, every step, to that share of the
+rest of the loss's gradient on them (running means of both norms), whatever the critic's strength.
+
+``--split-grad`` (stage 2, with the residual): the physics (everything but the residual) learns only from its own
+render scored alone, the residual only from the full output. Scored only on the full output, the physics learned to
+cancel whatever the residual did, and the physics alone ran away: ``runs/gan2`` (the GAN pushing the residual) went
+0.640 -> 0.851 on held-out pieces in 750 steps while the full output held; ``loss_compare/B_comp`` drifted the same
+way, slowly. Costs a second render and score per step (and its own second draw for the energy score).
 
 ``--env-weight`` adds the whole note's envelope (N13, ``pianonn.envfit``; docs/tone_measures.md 17): each step also
 renders ``--env-batch`` of N13's notes of the training pieces in their contexts (with the residual in stage 2) and adds
@@ -62,15 +76,15 @@ from .data import MaestroSegments, SyntheticPerformances, collate
 from .dsp import bounded
 from .notefit import PieceLevels
 from .partial_view import POOL_MIN, pooled_across
-from .losses import (LogMelLoss, MultiResolutionDiscriminator, MultiResolutionSTFTLoss, OnsetLoss, PianoLoss,
-                     band_energies, discriminator_loss, generator_adv_loss, highpass)
+from .losses import (LogMelLoss, MultiResolutionSTFTLoss, OnsetLoss, PianoLoss, band_energies, critic_step,
+                     generator_adv_loss, highpass, make_discriminator)
 from .synth import ContextNet, NeuralPhysicalPiano
 
 STAGE2_ONLY = ("context.", "noise.att", "physics.partial_gain", "physics.color")
 DB_PARAMS = ("physics.gain_db", "physics.cond_gain_db", "physics.cond_vel_slope", "physics.cond_vel_curve", "physics.soft_gain_db",
              "physics.raw_phantom_db", "physics.raw_impulse_db", "physics.raw_impulse_vel", "room.mic_gain_db",
              "room.raw_pan")  # the floor and hum (bounded +-3 dB around a measurement) learn at the base rate
-GAN_PARAMS = ("noise.", "context.")  # what the critic may change (enforced by the texture view, see synth.forward)
+GAN_PARAMS = ("noise.", "context.")  # what the critic may change (the texture view, or a backward into these alone)
 MODULES = ("physics", "room", "noise", "context")
 CENTS_PARAMS = ("physics.raw_cents", "physics.cond_cents")
 ENV_PARAMS = ("physics.raw_prompt", "physics.raw_log_b1", "physics.raw_log_b3", "physics.raw_bridge_g",
@@ -437,6 +451,24 @@ def main(argv=None):
     ap.add_argument("--adv-start", type=int, default=-1, help="step to switch on the GAN loss (-1: never)")
     ap.add_argument("--adv-with-stage2", action="store_true", help="switch the GAN on together with stage 2")
     ap.add_argument("--adv-weight", type=float, default=0.1)
+    ap.add_argument("--fm-weight", type=float, default=2.0,
+                    help="the feature matching re the adversarial term (paired: one more spectral distance)")
+    ap.add_argument("--critic", choices=("patch", "wide"), default="patch",
+                    help="patch: round 2's critic (~11 frequency bins per output); wide: the whole spectrum per frame")
+    ap.add_argument("--gan-params", nargs="*", default=list(GAN_PARAMS),
+                    help="parameter-name prefixes the critic's gradient may reach (context.: the residual alone)")
+    ap.add_argument("--critic-mono", action="store_true",
+                    help="the critic judges the channels' mean (wide critic): the residual cannot change the stereo image")
+    ap.add_argument("--r1", type=float, default=0.0, help="R1 penalty on the critic at the recordings (wide critic)")
+    ap.add_argument("--r1-every", type=int, default=4, help="lazy R1: every this many steps, at this many times the weight")
+    ap.add_argument("--gan-share", type=float, default=0.0,
+                    help="with --critic-reach residual: scale the critic's gradient on --gan-params to this share of the "
+                         "rest of the loss's gradient on them (running means of the norms); --adv-weight is then unused")
+    ap.add_argument("--split-grad", action="store_true",
+                    help="stage 2: the physics learns from its own render alone, the residual from the full output")
+    ap.add_argument("--critic-reach", choices=("texture", "residual"), default="texture",
+                    help="what the critic's gradient reaches within GAN_PARAMS: texture, their noise only (round 2); "
+                         "residual, every output of theirs (a second backward restricted to them)")
     ap.add_argument("--no-residual", action="store_true",
                     help="stage 2 without the residual: the control run for what the residual adds")
     ap.add_argument("--loss-weights", type=float, nargs=3, default=(1.0, 0.25, 0.5), metavar=("BAND", "FINE", "ATTACK"))
@@ -450,6 +482,14 @@ def main(argv=None):
                     help="autocast the forward pass to bfloat16 (GPU only). Off by default: the physics is "
                          "exp/log/sqrt/sin of wide-range quantities and sub-Hz beating, and matmuls are a small "
                          "share of the compute, so the speedup is modest and the precision risk is real.")
+    ap.add_argument("--patience", type=int, default=0,
+                    help="early stopping: stop after this many validations in a row without the mean of the last "
+                         "--es-window validated scores (the residual's, in stage 2) falling at least --min-delta below "
+                         "its best so far; 0 = off. The count restarts at stage 2. The validation wanders by ~0.01 "
+                         "between checks, more than the trend: on raw values the rule stopped A's stage 1 of "
+                         "runs/loss_compare at step 2,250, before its gain at 3,000-4,000; smoothed over 4, at 6,000")
+    ap.add_argument("--es-window", type=int, default=4)
+    ap.add_argument("--min-delta", type=float, default=0.002)
     ap.add_argument("--log-every", type=int, default=25)
     ap.add_argument("--save-every", type=int, default=500)
     args = ap.parse_args(argv)
@@ -567,10 +607,11 @@ def main(argv=None):
     opt = torch.optim.Adam(groups)
     disc = disc_opt = None
     if args.adv_start >= 0 or args.adv_with_stage2:
-        disc = MultiResolutionDiscriminator().to(device)
+        disc = make_discriminator(args.critic, args.critic_mono).to(device)
         disc_opt = torch.optim.Adam(disc.parameters(), lr=2e-4, betas=(0.5, 0.9))
 
     step, stage, best, elapsed0 = 0, 1, math.inf, 0.0
+    es = {"best": math.inf, "since": 0, "hist": []}  # early stopping: the smoothed best, validations since, last few
     if args.init_from and not args.resume and pieces is not None:  # a training checkpoint's piece gains, where it has them
         saved = torch.load(args.init_from, map_location="cpu").get("piece_gain")
         if saved is not None:
@@ -596,6 +637,7 @@ def main(argv=None):
             g["base_lr"] = args.lr * lr_scale(g["name"], args.residual_lr_scale)
         step, stage = state["step"], state["stage"]
         best, elapsed0 = state.get("best", math.inf), state.get("elapsed", 0.0)
+        es.update(state.get("early_stop", {}))
         log(f"resumed from {args.resume} at step {step}, stage {stage}, {elapsed0 / 60:.1f} min in, best val {best:.4f}")
     for g in opt.param_groups:  # where each parameter's warm-up starts (kept in the optimiser's state across resumes)
         g.setdefault("warm_from", step)
@@ -676,7 +718,8 @@ def main(argv=None):
         if isinstance(avg, WeightAverage):
             extra["ema"] = avg.state_dict()  # render.load_model prefers it; "model" stays the raw weights for --resume
         torch.save({"cfg": cfg.to_dict(), "model": model.state_dict(), "opt": opt.state_dict(), "step": step,
-                    "stage": stage, "best": best, "elapsed": elapsed(), "args": vars(args), **extra},
+                    "stage": stage, "best": best, "elapsed": elapsed(), "early_stop": dict(es), "args": vars(args),
+                    **extra},
                    os.path.join(args.out, f"{tag}.pt"))
 
     use_residual = lambda: stage >= 2 and not args.no_residual
@@ -707,6 +750,14 @@ def main(argv=None):
                 erec, emsg = env_report(use_residual())
                 rec.update(erec)
                 msg += f"; {emsg}"
+        es["hist"] = (es["hist"] + [v])[-args.es_window:]
+        if len(es["hist"]) == args.es_window:
+            m = sum(es["hist"]) / args.es_window
+            if m < es["best"] - args.min_delta:
+                es["best"], es["since"] = m, 0
+            else:
+                es["since"] += 1
+        rec["early_stop"] = dict(es)
         log(msg, **rec)
         if v < best:
             best = v
@@ -718,6 +769,10 @@ def main(argv=None):
     clip_state = {}  # per module: running typical gradient norm (the trial's global clip at 1.0 scaled every step)
     prev_grad, gcos = {}, {}  # per module: the last step's gradient, and the cosines with the one before
     adv_from = args.adv_start if args.adv_start >= 0 else math.inf
+    share_state = {}  # --gan-share: running means of the two gradient norms
+    assert args.gan_share == 0 or args.critic_reach == "residual", "--gan-share needs --critic-reach residual"
+    assert args.r1 == 0 or args.critic == "wide", "--r1 needs --critic wide"
+    assert not args.split_grad or (comp is not None and envs is None), "--split-grad: the composite, no envelope term"
     if args.adv_with_stage2 and stage >= 2:
         adv_from = step
     while step < n_steps:
@@ -727,11 +782,13 @@ def main(argv=None):
             for g in opt.param_groups:
                 if g["name"].startswith(STAGE2_ONLY):
                     g["warm_from"] = step
+            es.update(best=math.inf, since=0, hist=[])  # the residual's validation starts its own count
             log(f"step {step}: stage 2 (partial_gain, colouration{'' if args.no_residual else ' and the residual'} unfrozen; "
                 f"physics lr x{args.stage2_physics_lr})")
             if args.adv_with_stage2 and disc is not None:
                 adv_from = step
-                log(f"step {step}: GAN on (critic gradients reach only {', '.join(GAN_PARAMS)})")
+                log(f"step {step}: GAN on ({args.critic} critic; its gradients reach only {', '.join(args.gan_params)}, "
+                    f"{'their noise (texture view)' if args.critic_reach == 'texture' else 'every output of theirs'})")
             run_validation()
         batch = to_device(next(it), device, non_blocking=device.type == "cuda")
         t0 = time.time()
@@ -747,8 +804,29 @@ def main(argv=None):
         try:
             residual = use_residual()
             gan = disc is not None and step >= adv_from
-            extras = (("residual_out",) if residual else ()) + (("texture_view",) if gan else ())
+            texture = gan and args.critic_reach == "texture"
+            extras = (("residual_out",) if residual else ()) + (("texture_view",) if texture else ())
+            gan_loss = None
             gain = (10 ** (pieces(batch["piece"]) / 20))[:, None, None] if pieces is not None else None
+            split = args.split_grad and residual
+            score_phys = None
+            if split:  # the physics' own pass, first and freed before the full one (memory): its render alone
+                opt.zero_grad(set_to_none=True)
+                own = [p for name, p in model.named_parameters() if not name.startswith("context.") and p.requires_grad]
+                own += [pieces.db] if pieces is not None else []
+                second_p = None
+                if args.energy:
+                    with torch.no_grad(), amp_ctx():
+                        second_p = model(batch, n, residual=False)["audio"].float()
+                    second_p = second_p * gain.detach() if gain is not None else second_p
+                with amp_ctx():
+                    out_p = model(batch, n, residual=False)
+                audio_p = out_p["audio"] * gain if gain is not None else out_p["audio"]
+                score_phys, _ = comp(audio_p.float(), target.float(), batch, s, out_p["partials"], second_p)
+                reg_p = model.physics.regularizer(batch["condition"]) + pan_smoothness(model, batch["condition"])
+                torch.autograd.backward(score_phys + args.reg * reg_p, inputs=own)
+                score_phys = score_phys.detach()
+                out_p = audio_p = second_p = reg_p = None
             second = None
             if args.energy:  # the energy score's second draw: every random draw afresh, no gradient
                 with torch.no_grad(), amp_ctx():
@@ -760,7 +838,7 @@ def main(argv=None):
                 out["audio"] = out["audio"] * gain
             pred, tgt = out["audio"][..., s:].float(), target[..., s:].float()
 
-            logs = {}
+            logs = {} if score_phys is None else {"score_physics": score_phys}
             if comp is not None:
                 logs["score"], parts = comp(out["audio"].float(), target.float(), batch, s, out["partials"], second)
                 logs.update(parts)
@@ -777,31 +855,82 @@ def main(argv=None):
             if onset_loss is not None:
                 logs["onset"] = onset_loss(out["audio"].float(), target.float(), batch, s / cfg.sample_rate)
                 loss = loss + args.onset_weight * logs["onset"]
+            budget = 0.0  # the residual's own penalties (the split backs them up into the residual directly)
             if residual:
                 weights = dict(zip(("note", "frame", "additive"), args.budget))
                 for k, v in residual_budget(model, out, batch["mask"]).items():
                     logs["budget_" + k] = v
-                    loss = loss + weights[k] * v
+                    budget = budget + weights[k] * v
+                loss = loss + budget
             if gan:
                 real = highpass(tgt, cfg.sample_rate)  # no infrasound giveaway: the loss ignores it too
-                fake = highpass(out["audio_texture"][..., s:].float(), cfg.sample_rate)
-                disc.requires_grad_(True)
-                disc_opt.zero_grad()
-                logs["disc"] = discriminator_loss(disc, real, fake)
-                logs["disc"].backward()
-                disc_opt.step()
-                disc.requires_grad_(False)
-                logs["adv"], logs["fm"] = generator_adv_loss(disc, real, fake)
-                loss = loss + args.adv_weight * (logs["adv"] + 2.0 * logs["fm"])  # reaches GAN_PARAMS only
+                # the texture view (without the piece gain, as in round 2), or the output itself (with it, as scored)
+                fake = highpass((out["audio_texture"][..., s:] if texture else pred).float(), cfg.sample_rate)
+                real_spec = disc.spectra(real) if hasattr(disc, "spectra") else None  # once for both passes
+                logs["disc"], logs["r1"] = critic_step(disc, disc_opt, real, fake, real_spec, args.r1, args.r1_every,
+                                                       step)
+                adv, fm = generator_adv_loss(disc, real, fake, real_spec)
+                gan_loss = (1.0 if args.gan_share > 0 else args.adv_weight) * (adv + args.fm_weight * fm)
+                logs["adv"], logs["fm"] = adv.detach(), fm.detach()  # the log must not keep the critic's graph alive
+                adv = fm = None
+                if texture:  # reaches GAN_PARAMS only, through the view
+                    loss, gan_loss = loss + gan_loss, None
 
-            opt.zero_grad(set_to_none=True)
+            if not split:  # (the split's physics pass has already zeroed and filled the physics' gradients)
+                opt.zero_grad(set_to_none=True)
             # the regulariser's own gradient (fixed from step to step), kept out of the gradient agreement (gcos)
             trainable = [p for p in model.parameters() if p.requires_grad]
             reg_grad = {}
             if logs["reg"].requires_grad:
                 reg_grad = dict(zip(map(id, trainable), torch.autograd.grad(args.reg * logs["reg"], trainable,
                                                                             retain_graph=True, allow_unused=True)))
-            loss.backward()
+            g_gan = None
+            if split:  # the full output into the residual alone, in one backward: each term's push on the output
+                # audio first (through the score and the critic only), the critic's held at --gan-share of the score's
+                # there (running means of the two norms), so no model graph is kept across two backward passes
+                a = out["audio"]
+                push, = torch.autograd.grad(logs["score"], a, retain_graph=True)
+                if gan_loss is not None:
+                    g_a, = torch.autograd.grad(gan_loss, a, retain_graph=True)
+                    n_rest, n_gan = float(push.norm()), float(g_a.norm())
+                    if math.isfinite(n_rest) and math.isfinite(n_gan) and args.gan_share > 0:
+                        for k, v in (("rest", n_rest), ("gan", n_gan)):
+                            share_state[k] = v if k not in share_state else 0.9 * share_state[k] + 0.1 * v
+                        scale = args.gan_share * share_state["rest"] / max(share_state["gan"], 1e-30)
+                        logs["gan_scale"] = torch.tensor(scale)
+                        logs["gan_share_now"] = torch.tensor(scale * n_gan / max(n_rest, 1e-30))
+                    else:
+                        scale = args.adv_weight if args.gan_share == 0 else 0.0
+                    push = push + scale * g_a
+                    g_a = None
+                    gan_loss = None
+                ctx_params = [p for name, p in model.named_parameters() if name.startswith("context.") and p.requires_grad]
+                ((a * push.detach()).sum() + budget).backward(inputs=ctx_params)
+                a = push = None
+            elif gan_loss is not None:  # the critic's term into --gan-params alone, through the output itself; first,
+                # so that the full backward after it frees the graph
+                gan_params = [p for name, p in model.named_parameters()
+                              if name.startswith(tuple(args.gan_params)) and p.requires_grad]
+                if args.gan_share > 0:  # kept aside, scaled to the rest's gradient once that is known
+                    g_gan = torch.autograd.grad(gan_loss, gan_params, retain_graph=True, allow_unused=True)
+                else:
+                    torch.autograd.backward(gan_loss, inputs=gan_params, retain_graph=True)
+                gan_loss = None
+            if not split:
+                loss.backward()
+            if g_gan is not None:
+                n_rest = float(torch.stack([p.grad.norm() for p in gan_params if p.grad is not None]).norm())
+                n_gan = float(torch.stack([g.norm() for g in g_gan if g is not None]).norm())
+                if math.isfinite(n_rest) and math.isfinite(n_gan):
+                    for k, v in (("rest", n_rest), ("gan", n_gan)):
+                        share_state[k] = v if k not in share_state else 0.9 * share_state[k] + 0.1 * v
+                    scale = args.gan_share * share_state["rest"] / max(share_state["gan"], 1e-30)
+                    for p, g in zip(gan_params, g_gan):
+                        if g is not None:
+                            p.grad = g * scale if p.grad is None else p.grad + g * scale
+                    logs["gan_scale"] = torch.tensor(scale)
+                    logs["gan_share_now"] = torch.tensor(scale * n_gan / max(n_rest, 1e-30))
+                g_gan = None
             if envs is not None:
                 dec = [p for name, p in model.named_parameters() if name.startswith(ENV_PARAMS) and p.grad is not None]
                 g_rest = [p.grad.detach().clone() for p in dec]
@@ -830,6 +959,8 @@ def main(argv=None):
             # every name that can hold the failed step's graph: one left behind (``parts`` was) keeps it alive, and
             # every later batch then runs out of memory too (runs/scratch/speed_check, 2026-10-02)
             out = pred = tgt = loss = logs = parts = gain = y = env = tot = sm = g_rest = second = reg_grad = None
+            gan_loss = real = fake = real_spec = adv = fm = g_gan = None
+            out_p = audio_p = second_p = reg_p = score_phys = a = push = g_a = budget = None
         if oom:
             opt.zero_grad(set_to_none=True)
             if disc_opt is not None:
@@ -894,8 +1025,10 @@ def main(argv=None):
                 + f" | grad {' '.join(f'{k}={v:.2g}' for k, v in gnorm.items())} | {dt / args.log_every:.2f}s/step "
                   f"(compute {t_train / steps_run:.2f}) mem {mem:.1f}G notes {batch['pitch'].shape[1]} lr x{decay:.3g}",
                 kind="train", step=step, stage=stage, grad=gnorm, lr_factor=decay, **vals)
+        stop_early = False
         if step % args.val_every == 0:
             run_validation()
+            stop_early = args.patience > 0 and es["since"] >= args.patience
         if dump_examples and step % args.dump_every == 0:
             with avg.applied(model):
                 dump_audio(model, dump_examples, os.path.join(args.out, "audio"), f"step{step}",
@@ -904,6 +1037,10 @@ def main(argv=None):
             save("last")
         if budget_s and elapsed() >= budget_s:
             log(f"time limit reached after {step} steps ({elapsed() / 60:.1f} min, {t_train / 60:.1f} of them in steps)")
+            break
+        if stop_early:
+            log(f"early stop after {step} steps ({elapsed() / 60:.1f} min): the mean of the last {args.es_window} "
+                f"validations has not fallen {args.min_delta} below {es['best']:.4f} in {es['since']}")
             break
 
     run_validation()

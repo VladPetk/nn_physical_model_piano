@@ -238,7 +238,22 @@ of the take's own scatter (section 3).
   (`runs/score_check/run1/`, read); the onset term integrates over each attack's window.
 - The N13 envelope term (each partial's fade on isolated notes, phase 6): off in the smoke runs, to read the composite
   alone. `pooled_exposed` now sees the first partials' decay in music.
-- A critic for texture: planned after this, not built.
+- A critic for texture. Round 2's critic (`--critic patch`) was checked for the first time on 2026-10-02
+  (`scripts/gan_check.py`, `runs/gan_check/check1/`, read) and failed all three checks:
+  - between recordings, with a 3 dB shelf above 1 kHz as the only thing the generator can change, the shelf does
+    not return to 0: from +3 dB it ends at −2.2 dB, from −3 dB at −1.0 dB, the critic's loss at chance throughout;
+  - trained 600 steps against renders of `env_fit2`, it tells them from recordings at a held-out AUC of 0.53
+    (64 + 64 excerpts), and its push per octave band does not follow the measured band error (correlation +0.05;
+    the paired feature matching's +0.64: one more spectral distance);
+  - at weight 0.1 its gradient on the residual is 0.1 % of the composite's.
+
+  Mine: each of its outputs sees ~11 frequency bins, so it cannot compare registers. Its texture view also reached
+  only the noise bank and the residual's noise paths, not the residual's band gains or per-partial curves. Built
+  since, not yet checked on the GPU: `--critic wide` (`losses.WideSpecDiscriminator`: strides down the frequency
+  axis, one output per frame over the whole spectrum, bfloat16 convolutions, the recordings' spectra computed once
+  per step), `--critic-reach residual` (the critic judges the output itself; its term goes back into the noise bank
+  and the residual alone by a second, restricted backward), `--fm-weight`. Cost of the round-2 GAN per step (read,
+  same batches): 0.72 s without, 1.21 s with it.
 
 ## 8. What the two smoke runs showed
 
@@ -325,3 +340,54 @@ Checks 1 and 2 cost minutes; 3 is a small measurement; 4 is the long run itself.
 - Level-matched evaluation as the gate: it hides any change in absolute level (section 8).
 - The residual's new outputs: the per-note noise at −60 dB and its range, 8 random inputs, the 32 per-partial curves.
 - The rates: the residual at the full base rate, the physics at 0.3, warm-up 100.
+
+## 11. The loss comparison (2026-10-03)
+
+`runs/loss_compare/` (`chain.sh`, `post.sh`): the old loss (A) against the composite (B) and the composite with the
+wide critic (C, weight 0.3, reaching the residual's every output), each from `phase6/env_fit2`, stage 1 then the
+residual, every leg stopped early at its own held-out plateau; the envelope term off. One run per arm, no error bars
+across training runs. Read:
+
+- **Training:** A's stage 1 17,000 steps (stopped by hand; plateaued by ~6,000), B's 9,250 (79 min); with the residual
+  A 7,750 steps, B 4,000, C 2,750 (all early stops).
+- **Each loss wins on its own score.** Held out, level matched (64 validation excerpts): composite A 0.689, B **0.619**,
+  C 0.706 (phase 6 0.731); old score A **0.829**, B 0.843, C 0.857 (phase 6 0.863). Not level matched, B's held-out
+  gain on the composite disappears (A 0.734, B 0.740) and its old score is no better than the start (0.917 against
+  0.920): its level suits the training pieces, as in smoke 2. On the training pieces B's composite falls far more
+  (0.644 against A 0.800).
+- **The old distances on 96 test excerpts** (variation off, which is how A trained and not how B and C did): A
+  −0.046 ± 0.009 against phase 6, B +0.013 ± 0.008, C +0.038 ± 0.014.
+- **Decays (N13; no envelope term in any arm):** only the composite pulled the upper partials' excess ring in: fade
+  error at 1 s, partials 9-12 / 13-20, A +4.1 / +3.0 dB, B +2.2 / +0.5, C +2.0 / +2.4 (start +4.9 / +3.2). B pulls
+  partial 2 low late (−4.8 dB at 1.5 s, few notes).
+- **The GAN:** the critic won outright (end of C: critic loss 0.48, chance 1.5; generator term 2.9), the physics alone
+  got worse through C's training (held out 0.63 → 0.79 on the composite: the noise bank, which the critic reaches, and
+  the physics following the residual) and C ends worse than B on every score.
+- The note bench (onsets, the pedal halo, attacks and texture in music) shows no clear difference between the arms.
+- Listening: `samples/loss_compare_blind/` (phase 6, A, B, C with their residuals, shuffled per excerpt; the key in
+  `runs/loss_compare/listen/blind_key.*`), the named page `runs/loss_compare/listen/index.html`. Not heard yet.
+
+## 12. The GAN rebuilt (2026-10-03), stopped at the residual
+
+Read, unless marked mine:
+
+- **What tells renders from recordings** (`runs/gan_check/views1/`, a fresh critic per restricted view, held-out AUC):
+  every band from 500 Hz up (0.98-1.00), the loudness-equalised signal (1.00), the mono mix (1.00) and the side signal
+  (1.00, the easiest: critic loss 0.29); only < 500 Hz is close (0.72). No single artifact.
+- **The critic:** wide (`--critic wide`), on the mono mix (`--critic-mono`), R1 10 (`--r1`): on per-octave gains between
+  recordings (the known answer, `gan_check.py`, part `octaves`) the RMS of the second half's means 0.53 dB (0.67 without
+  R1), held-out AUC against B's renders 0.78 (1.00 without). It keeps a bias: it pushes 4-8 kHz down by 0.5-0.9 dB even
+  between recordings. Not the 24 kHz files' top: the recordings do not roll off near 12 kHz, and the renders are
+  already 1-2.5 dB quieter there (re 2-4 kHz).
+- **Scored only on the full output, the physics learns to cancel what the residual does.** C2 (`runs/gan2`, the critic
+  reaching the residual alone): the physics alone 0.640 → 0.851 held out in 750 steps while the full output held; B
+  drifted the same way, slowly (0.623 → 0.642). So C's degradation (section 11) was this, more than the noise bank.
+  `--split-grad`: the physics learns from its own render alone, the residual from the full output. In C3
+  (`runs/gan3/C3`) the physics held (0.624-0.633 over 1,250 steps).
+- **Memory:** C skipped 205 of its 2,750 batches (the densest), C2 32 of 1,280, B 6 of 4,000: the GAN arms trained on
+  lighter music. With the split, both pushes are balanced on the output audio and one backward goes into the residual;
+  at a memory fraction of 0.9, C3 skipped 4 of 1,375.
+- **Stopped by the owner:** with the residual adding nothing on held-out pieces (B: 0.629 → flat, then 0.650; C3: 0.619
+  → 0.634, the physics alone 0.624-0.633), a GAN that acts only through the residual cannot be judged. Next: make the
+  residual learn something that holds on new pieces; then the GAN again, or a GAN into the physics (with the split).
+  The fresh-critic test of C3's renders (pass mark 1) was not run.

@@ -71,6 +71,49 @@ def test_adversarial_losses_run():
     assert fake.grad is not None and torch.isfinite(fake.grad).all()
 
 
+def test_wide_critic_sees_the_whole_spectrum():
+    """Each output of the wide critic depends on the lowest and the highest bin of its frame (the patch critic's ~11
+    bins could not compare registers: runs/gan_check/check1), and the recordings' spectra computed once give the same
+    losses as computed inside."""
+    from pianonn.losses import WideMultiResolutionDiscriminator
+
+    torch.manual_seed(0)
+    disc = WideMultiResolutionDiscriminator(fft_sizes=(256, 512), amp=False)
+    real, fake = torch.randn(2, 4000), torch.randn(2, 4000, requires_grad=True)
+    spec = disc.spectra(real)
+    d = discriminator_loss(disc, real, fake, spec)
+    adv, fm = generator_adv_loss(disc, real, fake, spec)
+    assert torch.allclose(d, discriminator_loss(disc, real, fake))
+    assert torch.allclose(adv, generator_adv_loss(disc, real, fake)[0])
+    (d + adv + fm).backward()
+    assert fake.grad is not None and torch.isfinite(fake.grad).all()
+    for sub in disc.discs:
+        s = sub.spectrum(real[:1]).detach().requires_grad_(True)
+        out, _ = sub(spec=s)
+        assert out.shape[2] == 1 and out.shape[3] == s.shape[3]
+        t = out.shape[3] // 2
+        g, = torch.autograd.grad(out[0, 0, 0, t], s)
+        col = g[0, 0, :, t].abs()
+        assert col[0] > 0 and col[-1] > 0
+
+
+def test_critic_step_with_r1_and_mono():
+    """The critic's step with R1 runs and penalises (a positive penalty on the steps it is computed, none between); the
+    mono critic judges a stereo pair and its left-right swap alike."""
+    from pianonn.losses import WideMultiResolutionDiscriminator, critic_step
+
+    torch.manual_seed(0)
+    disc = WideMultiResolutionDiscriminator(fft_sizes=(256,), amp=False, mono=True)
+    opt = torch.optim.Adam(disc.parameters(), lr=1e-3)
+    real, fake = torch.randn(2, 2, 3000), torch.randn(2, 2, 3000)
+    _, pen0 = critic_step(disc, opt, real, fake, disc.spectra(real), r1=1.0, r1_every=2, step=0)
+    _, pen1 = critic_step(disc, opt, real, fake, disc.spectra(real), r1=1.0, r1_every=2, step=1)
+    assert pen0 > 0 and pen1 == 0
+    with torch.no_grad():
+        a, b = disc(real)[0][0], disc(real.flip(1))[0][0]
+    assert torch.allclose(a, b, atol=1e-6)
+
+
 def test_loss_is_not_dominated_by_the_noise_floor():
     """A recording has a noise floor and the model's piano renders silence between notes. With the loss floor, the
     same piano must score far better than a different one against a -60 dBFS floor (review 3, section 4.1)."""
