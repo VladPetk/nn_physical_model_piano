@@ -123,14 +123,14 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("data")
     ap.add_argument("--years", type=int, nargs="*", default=[2018])
-    ap.add_argument("--model", default="runs/phase3/step4/train/last.pt")
+    ap.add_argument("--model", default="runs/phase6/env_fit2/model.pt")
     ap.add_argument("--examples", type=int, default=24)
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--steps", type=int, default=150)
     ap.add_argument("--lr", type=float, default=0.05, help="Adam on the outputs before the tanh (unitless)")
     ap.add_argument("--scale", type=float, default=1.0, help="the outputs' bounds as a multiple of the net's")
     ap.add_argument("--variants", nargs="*", default=["note", "frame", "both"], help="note, frame, both, aware")
-    ap.add_argument("--aware-from", default="runs/residual/aware/train/last.pt",
+    ap.add_argument("--aware-from", default="runs/loss_compare/B_comp/train/last.pt",
                     help="checkpoint of the aware residual for variant aware (its weights are the start)")
     ap.add_argument("--aware-lr", type=float, default=1e-3)
     ap.add_argument("--aware-steps", type=int, help="steps for variant aware (default --steps)")

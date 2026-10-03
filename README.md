@@ -161,30 +161,29 @@ python -m pianonn.diagnostics [--ckpt runs/exp1/train/best.pt]
 
 Outputs go under `runs/` (not in git except its index, [`runs/README.md`](runs/README.md)): one folder per
 experiment, one subfolder per run, each holding its checkpoints, `log.jsonl` (every log line), `train.log` (the
-console, if redirected) and `eval/`. Measurements taken from the recordings go in `runs/measurements/`, throwaway
-runs in `runs/scratch/`.
+console, if redirected) and `eval/`. Measurements taken from the recordings go in `runs/measurements/`. Anything
+temporary (throwaway runs, scratch scripts, test renders) goes in `scratch/` at the root, which git ignores.
 
 The physics prior is specified in [`docs/physical_parameters.md`](docs/physical_parameters.md), with
 a source for every value. The literature reviews are in [`docs/literature/`](docs/literature/), the
 recording calibration is in [`docs/calibration_iowa.md`](docs/calibration_iowa.md) (reproduce it with
-`python -m pianonn.calibration data/iowa`), and the current acceptance report is
-[`docs/diagnostics_prior.md`](docs/diagnostics_prior.md).
-`samples/demo.mid` is the demo score. Renders are no longer kept in the repository: make
-them with `python -m pianonn.render samples/demo.mid out.wav --ckpt ...`, or take the listening sets in
-`runs/round2/listen/` and `runs/round2/ab/`.
+`python -m pianonn.calibration data/iowa`).
+`samples/demo.mid` is the demo score. Renders and listening sets are not kept in git: `samples/` (apart from the demo
+score) is local. Make renders with `python -m pianonn.render samples/demo.mid out.wav --ckpt ...`.
 
 ## Status
 
-The documents, in order:
-- [`docs/plan_phase0_1.md`](docs/plan_phase0_1.md): the plan that took the project from the reviews to its
-  first fit on real audio;
-- [`docs/trial_2018.md`](docs/trial_2018.md): the first trial on MAESTRO 2018, corrected after review 4;
-- [`docs/plan_round2.md`](docs/plan_round2.md): the response to review 4, with a new loss, floor, budget and
-  evaluation scale;
-- [`docs/round2_results.md`](docs/round2_results.md): the re-fit with a control branch and a GAN branch.
+The documents:
 - [`docs/tone_measures.md`](docs/tone_measures.md): what a piano note is made of, the measures that follow,
-  and what each loss term can see (the design for round 3); sections 9–11 report the note bench built from it,
-  its validation and what it found, and 10.4 / 11.4 the physics it points to.
+  and what each loss term can see; the note bench, what it found, and phases 3-6 (sections 9-17).
+- [`docs/reviews/review_6_training.md`](docs/reviews/review_6_training.md): the training approach after phase 6.
+- [`docs/composite_score.md`](docs/composite_score.md): the composite score, the loss comparison (11) and the GAN (12).
+- [`docs/speed.md`](docs/speed.md): the training step from 4.5 s to 1.0 s.
+- [`docs/literature_losses.md`](docs/literature_losses.md): the losses of five neural MIDI-to-audio papers.
+
+Earlier plans, trials and reviews 1-5 (`plan_phase0_1.md`, `trial_2018.md`, `plan_round2.md`, `round2_results.md`,
+`diagnostics_prior.md`, `reviews/review_1..5`) were removed on 2026-10-03; they are in git at commit `7568049`
+(`git show 7568049:docs/plan_round2.md`). Code comments that cite them refer to that version.
 
 In short, on one year (RTX 3090):
 - **Distance.** On 96 held-out test excerpts, the round-2 loss (log band energies, fine and attack terms, no

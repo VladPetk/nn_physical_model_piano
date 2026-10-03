@@ -1,20 +1,22 @@
+# Python
 __pycache__/
 *.egg-info/
 .venv/
 venv/
 .pytest_cache/
+pianonn/csrc/build/
+
+# data, outputs and audio stay local
+data/
+samples/*
+!samples/demo.mid
+scratch/
 runs/*
 !runs/README.md
-data/
 *.wav
 *.flac
 *.pt
-!samples/*.wav
+
+# local agent files
 .claude/
 CLAUDE.md
-
-!samples/**/*.wav
-!samples/**/*.flac
-/samples
-/runs
-pianonn/csrc/build/

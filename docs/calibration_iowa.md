@@ -119,7 +119,7 @@ final calibration.
 
 ## Review history
 
-- **Review 2** ([`reviews/review_2_calibration.md`](reviews/review_2_calibration.md)) found that v2's per-partial
+- **Review 2** (`reviews/review_2_calibration.md` (removed; git `7568049`)) found that v2's per-partial
   energy-decay-curve "prompt T60" misread recordings. Real mid-range notes fall about 20 dB in the first second,
   while the v2 model fell about 5 dB.
 - It also found partial selection by list index, the mono-sum comb filtering, the unconstrained treble tracker, and

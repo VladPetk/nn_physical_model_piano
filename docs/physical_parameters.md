@@ -1,7 +1,7 @@
 # Physical parameters: requirements (v5)
 
 v5 adds what review 3 found missing for loud, pedalled music and for fitting real recordings
-(details and status in [`plan_phase0_1.md`](plan_phase0_1.md)); section 8 lists the new rows. The Iowa
+(details and status in `plan_phase0_1.md` (removed; git `7568049`)); section 8 lists the new rows. The Iowa
 values below are unchanged: from now on the values are refitted on MAESTRO, per year where the
 instrument differs.
 
@@ -20,7 +20,7 @@ The bass inharmonicity prior was also ~2× the Steinway's (Rigaud's curve); it n
 These are fitted to the Iowa recordings in one pass (`scripts/fit_spectra.py`, `scripts/fit_decays.py`) and
 are meant as a better starting point for the MAESTRO fit, not a final calibration.
 
-v3 fixed what the second review ([`reviews/review_2_calibration.md`](reviews/review_2_calibration.md)) showed was wrong in v2:
+v3 fixed what the second review (`reviews/review_2_calibration.md` (removed; git `7568049`)) showed was wrong in v2:
 - The v2 "prompt T60" metric misread the recordings. Real mid-range notes lose about 20 dB in their first
   second, three strings' worth of bridge loss, as the literature predicted; v2's model lost 5 dB. Decays are
   now fitted to measured decay profiles.
@@ -154,7 +154,7 @@ Not modelled yet, from **L**:
 - a 20–30 ms touch precursor before struck (staccato) notes;
 - hammer-shank resonances in the knock (about 250 Hz mid-range).
 
-## 6. Acceptance checks (`python -m pianonn.diagnostics`, report in [`diagnostics_prior.md`](diagnostics_prior.md))
+## 6. Acceptance checks (`python -m pianonn.diagnostics`, report in `diagnostics_prior.md` (removed; git `7568049`))
 
 Against the Iowa recordings, analysed identically, at C1, C2, C3, C4, A4, C5, C6 and C7:
 
