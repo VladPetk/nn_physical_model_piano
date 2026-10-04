@@ -49,14 +49,17 @@ def render_both(model, perf, n, monkeypatch, residual=True):
     return res
 
 
-def assert_close(fus, ref, audio_db=-90.0, grad_rel=2e-3):
+def assert_close(fus, ref, audio_db=-90.0, grad_rel=2e-3, loose=()):
+    """``loose``: parameters held to 5 x ``grad_rel`` (the free longitudinal modes' frequency: a resonator's frequency
+    gradient sums large terms of both signs, and the fused path runs that recurrence over the whole window, the
+    reference per activity chunk)."""
     (a_f, g_f), (a_r, g_r) = fus, ref
     err = (a_f - a_r).abs().max() / a_r.abs().max()
     assert 20 * math.log10(float(err) + 1e-30) < audio_db
     assert g_f.keys() == g_r.keys()
     for k in g_r:
         rel = float((g_f[k] - g_r[k]).norm() / (g_r[k].norm() + 1e-30))
-        assert rel < grad_rel or float(g_r[k].norm()) < 1e-6, (k, rel)
+        assert rel < grad_rel * (5 if k in loose else 1) or float(g_r[k].norm()) < 1e-6, (k, rel)
 
 
 @pytest.mark.parametrize("curve_partials", [0, 6])
@@ -84,7 +87,7 @@ def test_fused_matches_reference_without_the_residual(monkeypatch):
 
 
 def test_fused_activity_rule_is_the_references(monkeypatch):
-    """At the default activity threshold the two differ only by the reference's padding: oscillators more than 90 dB
+    """At the default activity threshold the two differ only by the reference's padding: oscillators more than 70 dB
     under their note's peak."""
     m = NeuralPhysicalPiano(small_cfg()).to(DEV)
     n = 6000
@@ -93,8 +96,66 @@ def test_fused_activity_rule_is_the_references(monkeypatch):
     assert_close(fus, ref, audio_db=-70.0, grad_rel=5e-2)
 
 
+@pytest.mark.parametrize("curve_partials", [0, 6])
+def test_fused_coupled_bank_matches_reference(monkeypatch, curve_partials):
+    """The coupled strings' bus bank (cuda_ext.BusBank) against oscbank.bus_bank: every new parameter moved off its
+    start (unison spread, polarisations, admittance, longitudinal path, knock resonances, glide, image per key), the
+    residual's curves randomised; every oscillator rendered on both sides (activity_db 400)."""
+    cfg = small_cfg(string_model="coupled", residual_kind="aware", res_curve_partials=curve_partials, res_dim=32,
+                    res_heads=2, activity_db=400.0, strike_evenness=0.1)
+    m = NeuralPhysicalPiano(cfg).to(DEV)
+    g = torch.Generator().manual_seed(5)
+    with torch.no_grad():
+        m.context.curve_head[-1].weight.normal_(0, 0.3)
+        m.context.curve_head[-1].bias.normal_(0, 0.3)
+        for k, p in list(m.physics.coupled.named_parameters()) + [("delay", m.room.raw_delay),
+                                                                   ("pan", m.room.raw_pan_bus)]:
+            p.add_(0.3 * torch.randn(p.shape, generator=g).to(DEV))
+        m.physics.coupled.raw_glide.fill_(2.0)
+        m.physics.coupled.kr_db.fill_(-20.0)
+        m.physics.coupled.lm_gain_db.fill_(-10.0)
+    n = 6000
+    perf = perf_with_history(m, n, NOTES, sustain=lambda t: ((t > 0.2) & (t < 0.5)).float())
+    fus, ref = render_both(m, perf, n, monkeypatch)
+    assert_close(fus, ref, loose=("physics.raw_long_ratio", "physics.coupled.raw_lm1"))
+
+
+def test_longitudinal_kernel_matches_reference(monkeypatch):
+    """The longitudinal force (cuda_ext.Longitudinal) against NeuralPhysicalPiano._longitudinal's PyTorch recurrences:
+    output and the gradients of the sums, the modes' frequencies, decay and gains, from a non-zero state."""
+    m = NeuralPhysicalPiano(small_cfg(string_model="coupled"))
+    sr = m.cfg.sample_rate
+    g = torch.Generator().manual_seed(1)
+    P, J, L = 37, 4, 3000
+    Y = torch.randn(P, 2, L, generator=g) * torch.linspace(1, 0.1, L)
+    lf = 150 + 900 * torch.rand(P, J, generator=g)
+    la = 3 + 10 * torch.rand(P, generator=g)
+    lg = torch.rand(P, J, generator=g)
+    scale = torch.rand(P, generator=g) + 0.5
+    hp = torch.randn(P, 2, generator=g)
+    lm = torch.complex(torch.randn(P, J, generator=g), torch.randn(P, J, generator=g))
+    w = torch.randn(P, L, generator=g)
+    res = []
+    for fused in (True, False):
+        ins = [t.clone().to(DEV).requires_grad_(True) for t in (Y, lf, la, lg)]
+        state = {"hp": hp.to(DEV), "lm": lm.to(DEV)}
+        long = {"lm_f": ins[1], "lm_alpha": ins[2], "lm_gain": ins[3], "scale": scale.to(DEV)}
+        with monkeypatch.context() as mp:
+            if not fused:
+                mp.setattr(cuda_ext, "get", lambda: None)
+            F = m._longitudinal(ins[0], long, torch.arange(P, device=DEV), state)
+        (F * w.to(DEV)).sum().backward()
+        res.append((F.detach(), [t.grad for t in ins], state))
+    (Ff, gf, sf), (Fr, gr, sr_) = res
+    assert float((Ff - Fr).abs().max() / Fr.abs().max()) < 1e-4
+    for a, b in zip(gf, gr):
+        assert float((a - b).norm() / b.norm()) < 2e-3
+    assert torch.allclose(sf["hp"], sr_["hp"], rtol=1e-3, atol=1e-4)
+    assert torch.allclose(sf["lm"], sr_["lm"], rtol=1e-3, atol=1e-3)
+
+
 def test_fused_block_rendering_matches_single_pass():
-    m = NeuralPhysicalPiano(small_cfg()).to(DEV).eval()
+    m = NeuralPhysicalPiano(small_cfg(activity_db=400.0)).to(DEV).eval()
     n = 8000
     perf = perf_with_history(m, n, NOTES, sustain=lambda t: (t > 0.1).float())
     with torch.no_grad():

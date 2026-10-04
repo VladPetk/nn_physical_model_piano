@@ -40,7 +40,8 @@ the aware residual; the smoke runs ~5 s (the energy score's second render, the w
    recomputes `E sin(phi)`, `E cos(phi)` in two kernels (per sample, reduced over the oscillators: the contact time,
    damper, re-strike and curve gradients; per oscillator, reduced over the samples: frequency, decay, amplitude, damper
    rate). Nothing of size `[notes, oscillators, samples]` is ever stored. The activity test is the reference's (per
-   4096-sample chunk, each note's oscillators up to the last one within 90 dB of its peak, dampers included); unlike
+   4096-sample chunk, each note's oscillators up to the last one within 90 dB of its peak, dampers included; 70 dB
+   since 2026-10-03, `docs/physics_revamp.md` 11); unlike
    the reference, which renders a slice of notes up to its longest note's count, each note renders exactly its own
    (the reference rendered 2.2e9 oscillator-samples per batch for 1.08e9 that pass the test; read).
 3. **The sympathetic resonators as a CUDA kernel** (same files, `SympatheticBank._block_fused`): each resonator's
@@ -97,3 +98,12 @@ At 1.0 s per step (read; mine where it says so):
   control rate it would be 750 (a change to the network);
 - validation every 100 steps renders 64 excerpts four times (two draws, with and without the residual): ~8 % of a
   run's wall clock before, shrinking with the renders.
+
+## 6. The coupled strings (2026-10-03)
+
+The coupled model (`string_model=coupled`, `docs/physics_revamp.md`) has its own kernels: the bus bank (six outputs
+per oscillator, each with a sine and a cosine amplitude, and the glide) and the longitudinal force (a scan over
+512-sample segments in three passes). Its step without the score is 0.74 s against the mode model's 0.53 s at the
+same 70 dB activity threshold (~0.91 against ~0.70 s with the score, +30 %), peak memory 14.6 against 11.6 GB; the
+normal-mode decomposition is shared by a render's three `modes` calls and by a step's two renders. Numbers, checks and
+what is left: `docs/physics_revamp.md` 11.

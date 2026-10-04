@@ -98,6 +98,67 @@ class StringBank(torch.autograd.Function):
         return d_freq, d_alpha, d_amp, d_adamp, d_tc, d_conset, d_rs, dC, dm, None
 
 
+class BusBank(torch.autograd.Function):
+    """The coupled strings' bank over the whole window (``oscbank.bus_bank``) for ``P`` active notes: oscillators
+    ``[P, Q]`` with bus amplitudes ``amp[P, Q, NB, 2]`` (sine, cosine), the modes (the first ``Q0``) gliding with
+    ``ge``, ``gb`` ``[P]``. Returns the first ``NM`` buses summed per example ``[B, NM, L]``, the other buses per note
+    ``[P, NB - NM, L]`` and, with ``keys``, the mean of the first ``NM / 2`` buses per key row ``[rows, L]`` (else
+    empty). Differentiable as ``StringBank``, and in the amplitudes and the glide."""
+
+    @staticmethod
+    def forward(ctx, freq, alpha, amp, adamp, tc, c_onset, rs, ge, gb, C, m, fixed):
+        ext = get()
+        g0, w0, g1, w1, onset, rsd, row, nv, ints, sr, bidx, NM, n_ex, n_rows, keys = fixed
+        args = (freq.contiguous(), alpha.contiguous(), amp.contiguous(), adamp.contiguous(), g0, w0, g1, w1, onset,
+                tc.contiguous(), c_onset.contiguous(), rs.contiguous(), rsd, C.contiguous(), row, m.contiguous(), nv,
+                *ints, sr)
+        extra = (ge.contiguous(), gb.contiguous(), bidx, NM)
+        ctx.template = tuple(None if isinstance(a, torch.Tensor) else a for a in args + extra)
+        ctx.save_for_backward(*[a for a in args + extra if isinstance(a, torch.Tensor)])
+        ctx.keys, ctx.n_ex = keys, n_ex
+        return tuple(ext.bus_forward(*args, *extra, n_ex, n_rows, keys))
+
+    @staticmethod
+    def backward(ctx, gmix, glon, gkeys):
+        saved = iter(ctx.saved_tensors)
+        args = tuple(next(saved) if a is None else a for a in ctx.template)
+        bank, extra = args[:-4], args[-4:]
+        L = bank[-2]
+        P, NB = bank[2].shape[0], bank[2].shape[2]
+        NM = extra[-1]
+        opts = dict(device=bank[0].device, dtype=torch.float32)
+        gmix = torch.zeros(ctx.n_ex, NM, L, **opts) if gmix is None else gmix.contiguous()
+        glon = torch.zeros(P, NB - NM, L, **opts) if glon is None else glon.contiguous()
+        if not ctx.keys or gkeys is None:
+            gkeys = torch.zeros(0, **opts)
+        d = get().bus_backward(gmix, glon, gkeys.contiguous(), *bank, *extra, ctx.keys and gkeys.numel() > 0)
+        d_freq, d_alpha, d_amp, d_adamp, d_tc, d_conset, d_rs, d_ge, d_gb, dC, dm = d
+        return d_freq, d_alpha, d_amp, d_adamp, d_tc, d_conset, d_rs, d_ge, d_gb, dC, dm, None
+
+
+class Longitudinal(torch.autograd.Function):
+    """The longitudinal force per note (``NeuralPhysicalPiano._longitudinal`` before its scale) from the two
+    longitudinal sums ``lon[P, 2, L]``: the DC-blocked F_even + F_odd plus the free longitudinal modes ``sum_j c_j Re
+    z_j`` (``c``, ``omega`` = 2 pi f / sr ``[P, J]``, decay ``alpha[P]``), from the state ``hp0[P, 2]`` (last input,
+    output of the DC blocker) and ``z0[P, J, 2]``. Returns ``(out[P, L], hp1, z1)``, the final state without gradient
+    (no gradient flows from one block to the next)."""
+
+    @staticmethod
+    def forward(ctx, lon, c, alpha, omega, hp0, z0, sr, r_hp):
+        a = tuple(x.contiguous().float() for x in (lon, c, alpha, omega, hp0, z0))
+        out, hp1, z1 = get().long_forward(*a, float(sr), float(r_hp))
+        ctx.save_for_backward(a[0], a[1], a[2], a[3], a[5])
+        ctx.sr, ctx.r_hp = float(sr), float(r_hp)
+        ctx.mark_non_differentiable(hp1, z1)
+        return out, hp1, z1
+
+    @staticmethod
+    def backward(ctx, gout, _hp1, _z1):
+        lon, c, alpha, omega, z0 = ctx.saved_tensors
+        d_lon, d_c, d_alpha, d_omega = get().long_backward(gout.contiguous(), lon, c, alpha, omega, z0, ctx.sr, ctx.r_hp)
+        return d_lon, d_c, d_alpha, d_omega, None, None, None, None
+
+
 class Resonators(torch.autograd.Function):
     """``z_t = exp(-min(alpha + es_t adamp, max_decay) / sr + i 2 pi freq / sr) z_{t-1} + gin drive_t`` per resonator
     ``[B, K, S]``, from ``z0``; returns ``(out[B, L], zr_last, zi_last)`` with ``out`` the real parts summed over the

@@ -27,6 +27,7 @@ String model (per key k, partial n, coupled mode m), evaluated in closed form:
     earlier sounding instance of the key loses ``restrike`` nats when the key is struck again.
 """
 
+import contextlib
 import math
 
 import torch
@@ -34,6 +35,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from .config import PianoConfig
+from .coupled import SLOTS, CoupledStrings
+from .interactions import InteractionTables
 from .dsp import bounded
 
 N_KEYS = 88
@@ -106,6 +109,14 @@ VEL_MAP_SEGMENTS = 8
 # per-strike brightness and decay offsets keep the note's energy over this long (N1's window): at equal key and velocity
 # the piano's level barely follows its brightness or early decay (rank correlations -0.16 and +0.24, docs 12.7)
 STRIKE_LEVEL_SECONDS = 0.3
+
+
+def _register_weights(ki, knots=(0, 44, 87)):
+    """``[..., 3]`` hat weights of keys ``ki`` over three register knots (MIDI 21, 65, 108), summing to one."""
+    k = ki.float()[..., None]
+    lo = ((k - knots[0]) / (knots[1] - knots[0])).clamp(0, 1)
+    hi = ((k - knots[1]) / (knots[2] - knots[1])).clamp(0, 1)
+    return torch.cat([1 - lo, lo - hi, hi], -1)
 
 
 def hammer_velocity(u):
@@ -228,6 +239,10 @@ class PianoPhysics(nn.Module):
         # dB re the note's gain (M, about -25 dB re the tone over the first 60 ms through the body)
         self.register_buffer("prior_impulse_db", key_curve([(0, -18.0), (39, -15.0), (87, -12.0)]))
 
+        self.coupled = None  # set at the end of __init__ (the level prior is the mode model's)
+        self._core = None  # the coupled decomposition shared within one render (shared_core)
+        self.inter = None  # set at the end of __init__, as coupled
+
         # --- per-key string / hammer / damper parameters (learned offsets) ---
         self.raw_log_B = _p(N_KEYS)
         self.raw_cents = _p(N_KEYS)
@@ -289,6 +304,28 @@ class PianoPhysics(nn.Module):
             e = self._mf_energy_db()
             self.gain_db -= (e - e[39]).nan_to_num(0.0, 0.0, 0.0).clamp(-60, 60)
         self.register_buffer("prior_gain_db", self.gain_db.detach().clone())  # the level gauge (regularizer)
+        # the coupled strings (docs/physics_revamp.md); created after the level prior, which the mode model sets
+        self.coupled = CoupledStrings(cfg) if cfg.string_model == "coupled" else None
+        self.inter = InteractionTables() if cfg.interactions else None
+        if self.coupled is not None:
+            self.init_coupled()
+
+    @torch.no_grad()
+    def init_coupled(self):
+        """Start the coupled strings from this model's mode parameters: each string's pitch offset from the unison
+        detuning draw (string 1 at 0, the others at the aftersound modes' detunings, made zero-mean), the in-plane
+        polarisation 0.2 cent off. Call again after loading a mode model's weights."""
+        cp = self.coupled
+        det = bounded(self.raw_unison, 5.0)  # [K, M - 1] cents
+        c = torch.zeros(N_KEYS, 3, device=det.device)
+        m = min(2, det.shape[1])
+        c[:, 1:1 + m] = det[:, :m]
+        live = cp.live.to(c.device)
+        c = (c - (c * live).sum(-1, keepdim=True) / live.sum(-1, keepdim=True)) * live
+        cp.raw_cents.copy_(5.0 * torch.atanh((c / 5.0).clamp(-0.99, 0.99)))
+        # the in-plane polarisation 0.2 cent off the vertical: at 0 their bridge-silent combinations coincide, and the
+        # decomposition's gradient through the near-zero gaps made the fit from here chaotic (docs/physics_revamp.md 11)
+        cp.raw_dh.fill_(math.atanh(0.2))
 
     def _mf_energy_db(self, seconds=0.3):
         ki = torch.arange(N_KEYS)[None]
@@ -367,6 +404,21 @@ class PianoPhysics(nn.Module):
               + soft * (self.soft_gain_prior[ki] + bounded(self.soft_gain_db, 3.0)))
         return db if ctx_gain_db is None else db + ctx_gain_db
 
+    def partial_freqs(self, ki, cond):
+        """``(f1, B, fn)``: the sounding fundamental [B, K], inharmonicity [B, K] and partial frequencies [B, K, P] of keys
+        ``ki[B, K]`` under conditions ``cond[B]``."""
+        cents = self.prior_cents[ki] + bounded(self.raw_cents[ki], 30.0) + bounded(self.cond_cents[cond[:, None]], 30.0)
+        B = torch.exp(self.prior_log_B[ki] + bounded(self.raw_log_B[ki], 1.5))
+        # the tuner sets the *sounding* fundamental f1 = f0 sqrt(1 + B), so the stretch applies to f1
+        f1 = 440.0 * torch.pow(2.0, (ki + LOWEST_MIDI - 69).float() / 12 + cents / 1200)
+        f0 = f1 / torch.sqrt(1 + B)
+        return f1, B, f0[..., None] * self.harmonic * torch.sqrt(1 + B[..., None] * self.harmonic ** 2)
+
+    def bridge_scale(self, ki):
+        """The in-phase mode's extra decay rate at conductance 1 (1/s) of keys ``ki``: (R - 1) b1 x the learned factor."""
+        b1 = torch.exp(self.prior_log_b1[ki] + bounded(self.raw_log_b1[ki], 1.5))
+        return (self.prior_prompt_ratio[ki] - 1) * b1 * torch.exp(bounded(self.raw_prompt[ki], 1.5))
+
     # ------------------------------------------------------------------ modes
     def modes(self, ki, u, soft, cond, ctx=None, phantoms=True):
         """Modal parameters for strikes of keys ``ki[B,K]`` at normalised velocity ``u[B,K]``.
@@ -385,12 +437,8 @@ class PianoPhysics(nn.Module):
         ctx = ctx or {}
         zero = torch.zeros_like(u)
 
-        cents = self.prior_cents[ki] + bounded(self.raw_cents[ki], 30.0) + bounded(self.cond_cents[cond_k], 30.0)
-        B = torch.exp(self.prior_log_B[ki] + bounded(self.raw_log_B[ki], 1.5))
-        # the tuner sets the *sounding* fundamental f1 = f0 sqrt(1 + B), so the stretch applies to f1
-        f1 = 440.0 * torch.pow(2.0, (ki + LOWEST_MIDI - 69).float() / 12 + cents / 1200)
-        f0 = f1 / torch.sqrt(1 + B)
-        fn = f0[..., None] * n * torch.sqrt(1 + B[..., None] * n**2)  # [B,K,P]
+        f1, B, fn = self.partial_freqs(ki, cond)  # fn [B,K,P]
+        coupled = self.coupled is not None
 
         detune = torch.cat([torch.zeros_like(fn[..., :1]), bounded(self.raw_unison[ki], 5.0)], -1)
         freq = fn[..., None] * torch.pow(2.0, detune[..., None, :] / 1200)  # [B,K,P,M]
@@ -403,6 +451,10 @@ class PianoPhysics(nn.Module):
         if strike:
             s_decay = ctx["strike_log_decay"][..., None] + ctx["strike_decay_tilt"][..., None] * torch.log2(fn / 1000.0)
             log_decay = log_decay + s_decay
+        inter = self.inter
+        if inter is not None:  # decay x velocity, x the pedal's lift at the strike (interactions.py)
+            log_decay = (log_decay + inter("decay_vel", ki, u, n)
+                         + inter("decay_lift", ki, ctx.get("lift_on", zero), n))
         decay_scale = torch.exp(log_decay)
         p = DECAY_EXPONENT * torch.exp(bounded(self.raw_decay_p, 0.25))
         alpha_after = (b1[..., None] + b3[..., None] * 1e6 * (fn / 1000.0) ** p) * decay_scale
@@ -432,8 +484,11 @@ class PianoPhysics(nn.Module):
         parity = 1.0 - 2.0 * (n.remainder(2) == 0).to(comb.dtype) if cfg.bridge_end_comb else None
         if parity is not None:
             comb = comb * parity
-        gain_db = self.level_db(ki, u, soft, cond, ctx.get("gain_db"))
+        # coupled: una corda's level drop follows from the string the hammer misses (_coupled)
+        gain_db = self.level_db(ki, u, zero if coupled else soft, cond, ctx.get("gain_db"))
         log_shape = bounded(self.partial_gain[ki], PARTIAL_GAIN_BOUND) + self.coloration(ki, fn, cond)
+        if inter is not None:  # the strike's spectrum x velocity
+            log_shape = log_shape + inter("spec_vel", ki, u, n)
         if "spec" in ctx:  # context net: per-note spectral correction, smooth in log f
             log_shape = log_shape + log_f_bumps(ctx["spec"], fn)
         gain = torch.pow(10.0, gain_db / 20)
@@ -444,6 +499,9 @@ class PianoPhysics(nn.Module):
             h0 = hammer_spectrum(fn, (tc * torch.exp(ctx["strike_log_fc"]))[..., None], order[..., None], x2)
             e_var, e_0 = energy(hammer, alpha_prompt), energy(h0, alpha_prompt * torch.exp(-s_decay))
             gain = gain * torch.where(e_var > 0, torch.sqrt(e_0 / e_var.clamp(min=1e-30)), torch.ones_like(e_var))
+        if coupled:
+            return self._coupled(ki, u, soft, cond, ctx, fn, f1, decay_scale, alpha_after, alpha_prompt, tc, hammer,
+                                 x0, parity, gain, gain_db, log_shape, phantoms)
         base = gain[..., None] * hammer * comb * torch.exp(log_shape)
         if keep_partial is not None:
             base = base * keep_partial
@@ -461,20 +519,147 @@ class PianoPhysics(nn.Module):
         ok = (freq < 0.48 * cfg.sample_rate) & mode_ok[..., None, :]
         amp = amp * ok
 
-        # dampers: felt near the string end damps higher partials harder, saturating around n = 6
-        damp = self.damper_strength[ki] * torch.exp(self.prior_log_damp[ki] + bounded(self.raw_log_damp[ki], 1.0))
-        tilt = 0.6 + bounded(self.raw_damp_tilt[ki], 0.4)
-        alpha_damp = damp[..., None] * n.clamp(max=6.0) ** tilt[..., None]
-
-        restrike = self.prior_restrike[ki] * torch.exp(bounded(self.raw_restrike[ki], 1.0))
-        impulse_db = (gain_db + self.prior_impulse_db[ki] + bounded(self.raw_impulse_db[ki], 20.0)
-                      + bounded(self.raw_impulse_vel, 20.0) * (u - 0.6) + ctx.get("impulse_db", zero))
+        alpha_damp, restrike, impulse_db = self._dampers_restrike_impulse(ki, u, gain_db, ctx)
         out = {"freq": freq, "alpha": alpha, "amp": amp, "alpha_damp": alpha_damp, "tc": tc,
                "restrike": restrike, "impulse": torch.pow(10.0, impulse_db / 20)}
         if phantoms and cfg.n_phantoms > 0:
             ref_db = self.level_db(ki, torch.full_like(u, 64 / 127), zero, cond)
             ph_amp = amp if parity is None else amp * parity[..., None]
             out.update(self._phantoms(ki, freq, alpha, ph_amp, alpha_damp, f1, ref_db, cond))
+        return out
+
+    def _dampers_restrike_impulse(self, ki, u, gain_db, ctx):
+        """The dampers' extra decay per partial (felt near the string end damps higher partials harder, saturating
+        around n = 6), the re-strike's loss and the knock impulse's level; with the interaction tables, the first two
+        against velocity."""
+        n = self.harmonic
+        zero = torch.zeros_like(u)
+        damp = self.damper_strength[ki] * torch.exp(self.prior_log_damp[ki] + bounded(self.raw_log_damp[ki], 1.0))
+        tilt = 0.6 + bounded(self.raw_damp_tilt[ki], 0.4)
+        alpha_damp = damp[..., None] * n.clamp(max=6.0) ** tilt[..., None]
+        restrike = self.prior_restrike[ki] * torch.exp(bounded(self.raw_restrike[ki], 1.0))
+        if self.inter is not None:
+            alpha_damp = alpha_damp * torch.exp(self.inter("damp_vel", ki, u, n))
+            restrike = restrike * torch.exp(self.inter("restrike_vel", ki, u))
+        impulse_db = (gain_db + self.prior_impulse_db[ki] + bounded(self.raw_impulse_db[ki], 20.0)
+                      + bounded(self.raw_impulse_vel, 20.0) * (u - 0.6) + ctx.get("impulse_db", zero))
+        return alpha_damp, restrike, impulse_db
+
+    @contextlib.contextmanager
+    def shared_core(self, cond):
+        """Within this context every ``modes`` call of the coupled model shares one normal-mode decomposition per
+        condition and key (it depends only on the parameters and the conditions ``cond``): computed here, in the
+        caller's gradient mode, and dropped on exit. A render calls ``modes`` three times (the residual's view, the
+        notes, the sympathetic bank's keys); a training step renders twice with the same parameters (the energy score's
+        second draw), so ``train.py`` opens it around both. Nested, the outer one's decomposition is kept (if it covers
+        these conditions)."""
+        if self.coupled is None:
+            yield
+            return
+        outer = self._core
+        if outer is not None and self._coupled_core(cond) is outer:
+            yield
+            return
+        self._core = None
+        self._core = self._coupled_core(cond)
+        try:
+            yield
+        finally:
+            self._core = outer
+
+    def _coupled_core(self, cond):
+        """The decomposition for the conditions in ``cond``, all keys: ``(cu, B_all, fn_all, y_all, ys_all, kappa, lam,
+        s_v, s_h, rinv)``, each [Cu, 88, P(, ...)] (``kappa`` [88])."""
+        cu = torch.unique(cond)
+        core = self._core
+        if core is not None and core[0].shape == cu.shape and bool((core[0] == cu).all()):
+            return core
+        cp = self.coupled
+        allk = torch.arange(N_KEYS, device=cond.device)[None].expand(len(cu), -1)
+        _, B_all, fn_all = self.partial_freqs(allk, cu)  # [Cu, 88, P]
+        y_all, ys_all = cp.admittance(fn_all, cu, self.bridge_conductance(fn_all, cu))
+        valid_all = fn_all < 0.48 * self.cfg.sample_rate
+        kappa = self.bridge_scale(allk[0]) / cp.n_strings.to(fn_all.dtype)  # one string's bridge loss at y = 1
+        lam, s_v, s_h, rinv = cp.modes(fn_all, B_all[0], kappa, y_all, valid_all)
+        return cu, B_all, fn_all, y_all, ys_all, kappa, lam, s_v, s_h, rinv
+
+    def _coupled(self, ki, u, soft, cond, ctx, fn, f1, decay_scale, alpha_after, alpha_prompt, tc, hammer, x0,
+                 parity, gain, gain_db, log_shape, with_long):
+        """``modes`` for ``cfg.string_model == "coupled"`` (docs/physics_revamp.md 1-6). Returns, besides ``tc``,
+        ``restrike``, ``impulse``, ``alpha_damp`` as the mode model:
+
+        - ``freq``, ``alpha``, ``amp`` [B, K, P, SLOTS]: each normal mode's frequency, amplitude decay and magnitude
+          (sqrt(|A_V|^2 + |A_H|^2); for the activity test and the score's partial view); ``partial_freq`` [B, K, P];
+        - ``bus_amp`` [B, K, P, SLOTS, 4, 2]: per mode the (sine, cosine) amplitude on the vertical and horizontal
+          radiation buses and the two longitudinal sums (odd and even partials, n (-1)^n x the displacement);
+        - ``long``: the longitudinal path per note (``scale``, ``lm_f`` [B, K, J], ``lm_alpha``, ``lm_gain`` [B, K, J],
+          ``v_share``); ``glide`` (e, beta [B, K]); ``kres`` (freq, alpha, amp [B, K, R]): the knock's resonances;
+        - ``single_alpha``, ``single_kappa`` [B, K, P]: one string's decay and its bridge part (the sympathetic bank).
+
+        The decomposition is per condition and key; the note's decay offsets (the residual's, the strike's) scale its
+        modes' decays afterwards (exact for the internal losses, an approximation for the bridge's)."""
+        cfg, cp = self.cfg, self.coupled
+        dev = fn.device
+        n = self.harmonic
+        _, inv = torch.unique(cond, return_inverse=True)
+        cu, B_all, fn_all, y_all, ys_all, kappa, lam, s_v, s_h, rinv = self._coupled_core(cond)
+        gi = (inv[:, None], ki)
+        lam, s_v, s_h, rinv, y, ys = lam[gi], s_v[gi], s_h[gi], rinv[gi], y_all[gi], ys_all[gi]  # [B, K, P, ...]
+        # the excitation: every string's blow (its strike point, its evenness, una corda), both polarisations
+        live = cp.live[ki]  # [B, K, 3]
+        xs = x0[..., None] * (1 + cp.string_xoff()[ki])  # [B, K, 3]
+        comb = torch.sin(math.pi * n[:, None] * xs[..., None, :])  # [B, K, P, 3]
+        even = cp.string_even()[ki] + ctx.get("strike_even", torch.zeros_like(live))
+        if self.inter is not None:  # the unison's evenness x velocity
+            even = even + self.inter("even_vel", ki, u)
+        miss = torch.zeros_like(live)
+        miss[..., 0] = soft * cp.una_corda()[ki]
+        w = torch.exp(even) * live * (1 - miss)
+        base = gain[..., None] * hammer * torch.exp(log_shape)  # [B, K, P] without the comb
+        if parity is not None:
+            base = base * parity
+        eV = base[..., None] * comb * w[..., None, :] / cp.n_strings[ki].to(base.dtype)[..., None, None]
+        eH = cp.h_share()[ki][..., None, None] * eV
+        e = torch.cat([eV, eH, torch.zeros_like(eV[..., :1])], -1)  # [B, K, P, 7]
+        x = e.gather(-1, cp.slots[ki][:, :, None, :].expand(*e.shape[:-1], SLOTS))
+        c = (rinv @ (-1j * x.double())[..., None])[..., 0]  # [B, K, P, SLOTS]
+        AV, AH = s_v * c, s_h * c
+        # displacement for the longitudinal sums: n (-1)^n x the vertical motion, its agraffe-end sign
+        disp = AV * (parity.double()[:, None] if parity is not None else 1.0)
+        nd = n.double()
+        wl = nd * torch.where(n.remainder(2) == 0, 1.0, -1.0).double()
+        wl = wl * (fn < 0.25 * cfg.sample_rate).double()  # [B, K, P]: products stay below Nyquist
+        odd = (n.remainder(2) == 1).double()
+        L_odd, L_even = disp * (wl * odd)[..., None], disp * (wl * (1 - odd))[..., None]
+        # radiation tied to the admittance at the key (build 3): |y / y_smooth|^gamma
+        AV = AV * ((y.abs() / ys.abs().clamp(min=1e-12)) ** cp.gamma().double())[..., None]
+        buses = torch.stack([AV, AH, L_odd, L_even], -1)  # [B, K, P, SLOTS, 4]
+        bus_amp = torch.stack([-buses.imag, buses.real], -1).float()
+        freq = fn[..., None] + lam.real.float() / (2 * math.pi)
+        alpha = lam.imag.float() * decay_scale[..., None] + alpha_after[..., None]
+        amp = torch.sqrt(AV.abs() ** 2 + AH.abs() ** 2).float()
+        alpha_damp, restrike, impulse_db = self._dampers_restrike_impulse(ki, u, gain_db, ctx)
+        out = {"freq": freq, "alpha": alpha, "amp": amp, "bus_amp": bus_amp, "partial_freq": fn, "alpha_damp": alpha_damp,
+               "tc": tc, "restrike": restrike, "impulse": torch.pow(10.0, impulse_db / 20)}
+        one = (kappa[ki][..., None] * y.real.float()) * decay_scale
+        out["single_alpha"], out["single_kappa"] = alpha_after + one, one
+        # the longitudinal path (build 4), the knock's resonances (build 5), the glide (build 6)
+        regw = _register_weights(ki)  # [B, K, 3]
+        ref_db = self.level_db(ki, torch.full_like(u, 64 / 127), torch.zeros_like(u), cond)
+        long_db = (self.prior_phantom_db[ki] + bounded(self.raw_phantom_db[ki], 20.0) + bounded(cp.raw_long_db[ki], 20.0)
+                   + cp.long_cal_db[ki] - ref_db - 20 * math.log10(42.0))  # S^2 carries n m a_n a_m; ~42 = 6 x 7
+        lm1 = f1 * 15.0 * torch.exp(bounded(self.raw_long_ratio[ki], 0.3) + bounded(cp.raw_lm1[ki], 0.3))
+        j = torch.arange(1, cp.LM_MODES + 1, device=dev, dtype=fn.dtype)
+        out["long"] = {"scale": torch.pow(10.0, long_db / 20) * (1.0 if with_long else 0.0), "lm_f": lm1[..., None] * j,
+                       "lm_alpha": 1.0 / (0.15 * torch.exp(bounded(cp.raw_lm_tau[ki], 1.0))),
+                       "lm_gain": torch.pow(10.0, (regw @ cp.lm_gain_db) / 20),
+                       "v_share": 10 ** ((-30.0 + bounded(cp.raw_long_v, 20.0)) / 20)}
+        kf = cp.kr_f0 * torch.exp(regw @ bounded(cp.kr_raw_f, 0.5))  # [B, K, R]
+        ktau = cp.kr_tau0 * torch.exp(regw @ bounded(cp.kr_raw_tau, 1.0))
+        out["kres"] = {"freq": kf, "alpha": 1.0 / ktau,
+                       "amp": out["impulse"][..., None] * torch.pow(10.0, (regw @ cp.kr_db) / 20)}
+        out["glide"] = (1e-3 * torch.tanh(cp.raw_glide[ki]) * torch.pow(10.0, (gain_db - ref_db) / 10),
+                        2 * alpha_prompt[..., 0])
         return out
 
     def _phantoms(self, ki, freq, alpha, amp, alpha_damp, f1, ref_db, cond):
@@ -531,4 +716,8 @@ class PianoPhysics(nn.Module):
         reg = reg + ((self.gain_db - self.prior_gain_db).mean() / 10) ** 2
         reg = reg + (bounded(self.cond_gain_db[conds], 12.0) / 10).pow(2).mean()
         reg = reg + (bounded(self.cond_vel_curve[conds], 12.0).mean(1) / 10).pow(2).mean()
+        if self.coupled is not None:
+            reg = reg + self.coupled.regularizer()
+        if self.inter is not None:
+            reg = reg + self.inter.regularizer()
         return reg

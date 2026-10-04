@@ -391,3 +391,30 @@ Read, unless marked mine:
   → 0.634, the physics alone 0.624-0.633), a GAN that acts only through the residual cannot be judged. Next: make the
   residual learn something that holds on new pieces; then the GAN again, or a GAN into the physics (with the split).
   The fresh-critic test of C3's renders (pass mark 1) was not run.
+
+## 13. Three fixes to what the score reads (2026-10-03, branch `physics_revamp`)
+
+Found by a review of the loss code (read):
+- **Mirrored edges.** Every spectrum of the scored 2 s slice was a centred STFT with reflect padding, so the frames
+  near either edge read a mirror of the slice's own audio (17 of 201 frames at each end at 8192 points: an attack
+  20 ms before the end reads ~1.6 times its energy, `tests/test_partial_view.py`), and the FFT high-pass wrapped the
+  slice's end into its start. Now (`losses.extend_scored`, `crop_frames`; `CompositeLoss.scored`) the spectra read
+  8,400 samples of the rendered warm-up before the slice and silence after it, and keep the frames centred on the
+  scored samples (the same count as before).
+- **Onsets.** The partial view read each note from its MIDI onset (minus 10 ms) and counted its age from there; the
+  sound starts ~7 ms later at middle C, ~15 ms in the bass (`ONSET_DELAY_MS`, the law the onset term already used).
+  Now `composite.sound_onsets` / `scored_notes` add it, for training and for `validate_composite`.
+- **A0, A♯0.** The partial view's floor was 30 Hz, above both fundamentals; now 25 Hz.
+
+What they move (`scratch/loss_fixes/compare.py`, phase-composite B's `best.pt`, physics alone, 48 validation excerpts,
+d(render, recording) / d(render, second draw), not level matched):
+
+| | band | partials | between | pooled_exposed | between_pooled | level |
+|---|---|---|---|---|---|---|
+| before | 0.422 / 0.315 | 0.442 / 0.330 | 0.263 / 0.176 | 0.130 / 0.067 | 0.210 / 0.101 | 0.125 / 0.035 |
+| after | 0.420 / 0.311 | 0.441 / 0.329 | 0.264 / 0.174 | 0.129 / 0.069 | 0.185 / 0.107 | 0.124 / 0.040 |
+
+Five terms move by under 1 %; `between_pooled` (energy between the partials by time since the latest onset) falls
+from 0.210 to 0.185 (its energy-score form 0.160 → 0.132): part of its mismatch was mirrored attacks and early
+readings landing in the wrong age cells. The A0 floor changes nothing on these excerpts. Scores logged before this
+change are not comparable on `between_pooled`. Whether the gradients changed is read by the coherence probe, not here.
