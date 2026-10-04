@@ -268,3 +268,132 @@ def apply_mined_priors(model, mined, log=print, min_notes=5, min_reliable=3, b_p
         + " | cents re prior " + " ".join(f"{LOWEST_MIDI + k:.0f}:{v:+.1f}" for k, v in c_pts))
     return {"B_ratio": [(LOWEST_MIDI + k, math.exp(v)) for k, v in b_pts],
             "cents_re_prior": [(LOWEST_MIDI + k, v) for k, v in c_pts]}
+
+
+def partial_envelopes(model, u, cond, times):
+    """Each partial's energy envelope ``[V, 88, P, T]`` for every key struck at velocities ``u[V]`` under condition
+    ``cond`` (an int), summed incoherently over its modes (beats ignored): ``sum_m |A_m|^2 exp(-2 alpha_m t)``. The
+    coupled model's vertical (with its radiation tie) and in-plane buses together; keys held, no pedal."""
+    dev = times.device
+    V = u.shape[0]
+    ki = torch.arange(88, device=dev)[None].expand(V, -1)
+    m = model.physics.modes(ki, u[:, None].expand(-1, 88), torch.zeros(V, 88, device=dev),
+                            torch.full((V,), cond, device=dev), phantoms=False)
+    if "bus_amp" in m:
+        a2 = (m["bus_amp"][..., :2, :].double() ** 2).sum((-1, -2))
+    else:
+        a2 = m["amp"].double() ** 2
+    al = m["alpha"].double()
+    return (a2[..., None] * torch.exp(-2 * al[..., None] * times.double())).sum(-2)
+
+
+@torch.no_grad()
+def longitudinal_energy(model, u, cond, seconds=0.5, keys_per_slice=4):
+    """The coupled model's longitudinal force (``NeuralPhysicalPiano._longitudinal``, its scale included): energy over
+    the first ``seconds`` of every key held at velocity ``u``, ``[88]``."""
+    from .oscbank import bus_bank
+
+    dev = next(model.parameters()).device
+    sr = model.cfg.sample_rate
+    L = int(seconds * sr)
+    out = []
+    for k0 in range(0, 88, keys_per_slice):
+        ki = torch.arange(k0, min(88, k0 + keys_per_slice), device=dev)[None]
+        K = ki.shape[1]
+        m = model.physics.modes(ki, torch.full((1, K), u, device=dev), torch.zeros(1, K, device=dev),
+                                torch.tensor([cond], device=dev), phantoms=True)
+        f, al = m["freq"][0].flatten(1), m["alpha"][0].flatten(1)
+        ba = m["bus_amp"][0][..., 2:, :].flatten(1, 2)  # the two longitudinal sums
+        z = torch.zeros(K, device=dev)
+        Y = bus_bank(f, al, ba, torch.zeros_like(f), m["tc"][0], torch.zeros(K, L, device=dev), z, z,
+                     torch.zeros(K, dtype=torch.float64, device=dev), torch.full((K, 1), math.inf, device=dev), 0.0, sr)
+        long = {k: (v[0] if torch.is_tensor(v) and v.dim() >= 2 else v) for k, v in m["long"].items()}
+        J = long["lm_f"].shape[-1]
+        st = {"hp": torch.zeros(K, 2, device=dev), "lm": torch.zeros(K, J, dtype=torch.complex64, device=dev)}
+        out.append(model._longitudinal(Y, long, torch.arange(K, device=dev), st).double().pow(2).sum(-1))
+    return torch.cat(out)
+
+
+@torch.no_grad()
+def phantom_energy(teacher, u, cond, seconds=0.5):
+    """A mode model's phantom partials: energy over the first ``seconds`` of every key held at velocity ``u``, ``[88]``
+    (in samples' units, as ``longitudinal_energy``)."""
+    dev = next(teacher.parameters()).device
+    sr = teacher.cfg.sample_rate
+    ki = torch.arange(88, device=dev)[None]
+    m = teacher.physics.modes(ki, torch.full((1, 88), u, device=dev), torch.zeros(1, 88, device=dev),
+                              torch.tensor([cond], device=dev), phantoms=True)
+    if "ph_amp" not in m:
+        return torch.zeros(88, dtype=torch.float64, device=dev)
+    a2, al = m["ph_amp"][0].double() ** 2, m["ph_alpha"][0].double()
+    ok = m["ph_freq"][0] < 0.48 * sr
+    return (a2 / 2 * -torch.expm1(-2 * al * seconds) / (2 * al) * sr * ok).sum(-1)
+
+
+@torch.no_grad()
+def calibrate_longitudinal(model, teacher, cond, u=0.6, below_db=20.0, log=print):
+    """Set the coupled model's longitudinal level per key (``coupled.long_cal_db``) so that the force's energy over
+    0.5 s at velocity ``u`` is ``below_db`` under the teacher's phantom partials' (docs/physics_revamp.md 4); keys where
+    either is silent get -60 dB. Below, because at equal energy the force (every sum and difference tone of every
+    mode, and a spike at the attack) scored far worse than the phantoms (scratch check: composite 0.83 against 0.66
+    without it, B_comp 0.62); its trainable level (+-20 dB) reaches the phantoms' if the score asks for it. Returns
+    the offsets (dB)."""
+    cp = model.physics.coupled
+    cp.long_cal_db.zero_()
+    e_l, e_p = longitudinal_energy(model, u, cond), phantom_energy(teacher, u, cond)
+    ok = (e_l > 0) & (e_p > 0)
+    cal = torch.where(ok, 10 * torch.log10(e_p.clamp(min=1e-300) / e_l.clamp(min=1e-300)) - below_db,
+                      torch.full_like(e_l, -60.0))
+    cp.long_cal_db.copy_(cal.float().clamp(-60.0, 60.0))
+    if log:
+        q = cal[ok]
+        log(f"longitudinal level calibrated to {below_db:.0f} dB under the phantoms at u={u}: offsets {float(q.min()):+.1f} to {float(q.max()):+.1f}"
+            f" dB (median {float(q.median()):+.1f}) over {int(ok.sum())} keys")
+    return cal
+
+
+def distill_coupled(model, teacher, cond, steps=400, lr=0.03, log=print, frozen=()):
+    """Fit the coupled strings' own parameters (``physics.coupled``) so that each partial's energy envelope matches a
+    mode model's (``teacher``; docs/physics_revamp.md 10): every key at four velocities, on a log time grid to 8 s,
+    in dB with a floor 80 dB under the note's strike, each partial weighted by its share of the teacher's energy at
+    that time, plus the note's total. The coupled model's start from a mode model's weights (``init_coupled``) keeps
+    its levels at the strike but not its decays: the in-plane polarisation and the aftersound follow from the
+    coupling, the mode model's from free per-key levels. Then the longitudinal force's level per key is set to the
+    teacher's phantom partials' (``calibrate_longitudinal``). Returns the envelope losses before and after."""
+    dev = next(model.parameters()).device
+    times = torch.cat([torch.zeros(1), torch.logspace(math.log10(0.05), math.log10(8.0), 16)]).to(dev)
+    u = torch.tensor([0.25, 0.5, 0.75, 0.95], device=dev)
+    with torch.no_grad():
+        target = partial_envelopes(teacher, u, cond, times)
+    sounds = (target.sum(-2)[..., 0] > 0).double()[..., None, None]  # notes with a partial below Nyquist
+    floor = target.sum(-2)[..., :1, None].clamp(min=1e-30) * 1e-8  # [V, 88, 1, 1]
+    w = (target + floor) / (target + floor).sum(-2, keepdim=True) * sounds
+    t_db = 10 * torch.log10(target + floor)
+    t_tot = 10 * torch.log10(target.sum(-2) + floor[..., 0])
+    params = [p for k, p in model.physics.coupled.named_parameters() if p.requires_grad and not k.startswith(tuple(frozen))]
+    opt = torch.optim.Adam(params, lr=lr)
+
+    def loss_fn():
+        e = partial_envelopes(model, u, cond, times)
+        d = 10 * torch.log10(e + floor) - t_db
+        tot = 10 * torch.log10(e.sum(-2) + floor[..., 0]) - t_tot
+        return (w * d ** 2).sum(-2).mean() + (sounds[..., 0] * tot ** 2).mean()
+
+    with torch.no_grad():
+        first = float(loss_fn())
+    for step in range(steps):
+        for g in opt.param_groups:  # down to a tenth: the fit settles (constant, repeat runs ended 1.0-2.5 dB rms)
+            g["lr"] = lr * (1 - 0.9 * step / steps)
+        opt.zero_grad(set_to_none=True)
+        loss = loss_fn() + model.physics.coupled.regularizer()
+        loss.backward()
+        opt.step()
+        if log and (step + 1) % max(1, steps // 8) == 0:
+            log(f"distil coupled strings: step {step + 1}/{steps}, envelope loss {float(loss):.2f} dB^2")
+    with torch.no_grad():
+        last = float(loss_fn())
+    if log:
+        log(f"distil coupled strings: envelope loss {first:.2f} -> {last:.2f} dB^2 (rms {math.sqrt(first):.1f} -> "
+            f"{math.sqrt(last):.1f} dB)")
+    calibrate_longitudinal(model, teacher, cond, log=log)
+    return first, last

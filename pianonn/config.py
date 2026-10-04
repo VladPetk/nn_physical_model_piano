@@ -27,13 +27,18 @@ class PianoConfig:
     symp_decimate: int = 1
     body_seconds: float = 0.3  # learnable soundboard/case FIR (bridge force -> pressure), one per channel
     hall_seconds: float = 2.5  # parametric per-year hall tail
+    # the stereo image (docs/physics_revamp.md 14): both microphones hear one board (the left body FIR, a gain per octave
+    # band and microphone), so the direct sound arrives in phase; the hall tails a diffuse field seen by microphones
+    # hall_mic_d m apart (coherence sinc(2 f d / c)); off / 0: two independent bodies and tails (the earlier models)
+    shared_board: bool = False
+    hall_mic_d: float = 0.0
     noise_bands: int = 32
     ctx_hidden: int = 128
     synth_chunk: int = 4096  # samples per oscillator-bank chunk (activity is decided per chunk)
     bank_elements: int = 40_000_000  # notes x oscillators x samples per oscillator-bank call (memory ~ 30 B each)
     rec_chunk: int = 256  # chunk length for the parallel linear recurrence
     init_gain_db: float = -34.0
-    activity_db: float = 90.0  # a note is skipped in a chunk once all its partials are this far below its peak
+    activity_db: float = 70.0  # a note is skipped in a chunk once all its partials are this far below its peak
     use_noise: bool = True
     use_impulse: bool = True  # deterministic knock: the hammer's force pulse straight into the body
     use_sympathetic: bool = False  # off by default: ~2x per training step (review 3); switch on in later stages
@@ -79,6 +84,17 @@ class PianoConfig:
     # it (15). How the hammer meets the unison's strings and their polarisations changes with every blow:
     strike_partial_decay: object = 0.0  # sd of the log of each partial's prompt decay rate (its early energy kept)
     strike_after: object = 0.0  # sd of a random part of each partial's aftersound amplitudes, re their key's value
+    # the strings (docs/physics_revamp.md): "modes" (an in-phase mode and two aftersound modes per partial, independent;
+    # every checkpoint before the revamp) or "coupled" (pianonn.coupled: the unison's strings in both polarisations
+    # coupled through the bridge admittance, two radiation buses, the longitudinal force, the knock's resonances and the
+    # pitch glide)
+    string_model: str = "modes"
+    strike_evenness: object = 0.0  # coupled: sd of the log evenness of each string's blow, drawn per strike
+    prune_db: float = 50.0  # coupled: a mode is not rendered when its energy is this far under its partial's strongest
+    # interaction tables (pianonn/interactions.py, docs/physics_revamp.md 7): decay, damper, re-strike, spectrum and the
+    # unison's evenness against velocity, decay against the pedal's lift; each starts at zero and holds zero mean over
+    # the factor it adds
+    interactions: bool = False
     # the learned residual: "gru" (ContextNet: MIDI only, per-note corrections fixed at the onset) or "aware"
     # (residual.AwareResidual: sees each note's expected energy per octave group of partials from the physics, lets
     # the sounding notes attend to each other, and gives each note a gain curve per group over time)
@@ -98,6 +114,9 @@ class PianoConfig:
     res_noise_bands: int = 16
     res_note_noise: int = 0
     res_latent: int = 0
+    # the aware residual's GRU summary of the MIDI history (12 s) as an input; off: its outputs depend on the sounding
+    # notes, their physics and the pedals only (docs/physics_revamp.md 12: can it recognise training passages?)
+    res_history: bool = True
     checkpoint: bool = True
 
     def to_dict(self):

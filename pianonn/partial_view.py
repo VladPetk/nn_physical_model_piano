@@ -48,7 +48,7 @@ import math
 import torch
 from torch import nn
 
-from .losses import highpass, log_f_band_masks
+from .losses import crop_frames, highpass, log_f_band_masks
 
 SIZES = (256, 512, 1024, 2048, 4096, 8192)
 POOL_PARTIALS = (0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32)  # pooled groups start at these partial indices (1, 2, ..., 33+)
@@ -97,7 +97,7 @@ def note_sizes(f0, sr, periods=4.0):
 
 
 class PartialView(nn.Module):
-    def __init__(self, sr, hop=240, floor_db=-80.0, rel_db=50.0, keep_db=70.0, f_lo=30.0, f_hi=None, hp_hz=20.0,
+    def __init__(self, sr, hop=240, floor_db=-80.0, rel_db=50.0, keep_db=70.0, f_lo=25.0, f_hi=None, hp_hz=20.0,
                  between_lo=60.0, gate_oct=None, exposure_pow=2.0):
         super().__init__()
         self.exposure_pow = exposure_pow
@@ -113,10 +113,11 @@ class PartialView(nn.Module):
         for n in (2048, 8192):
             self.register_buffer(f"b_mask{n}", log_f_band_masks(n, sr, c).float())
 
-    def _power(self, x, n):
-        """``|STFT|^2`` normalised so a sinusoid of amplitude A reads A^2 at its peak bin: ``[ch, n//2+1, frames]``."""
+    def _power(self, x, n, crop=None):
+        """``|STFT|^2`` normalised so a sinusoid of amplitude A reads A^2 at its peak bin: ``[ch, n//2+1, frames]``;
+        with ``crop`` (``x`` from ``losses.extend_scored``) the frames centred on the scored samples."""
         w = torch.hann_window(n, device=x.device)
-        X = torch.stft(x, n, self.hop, window=w, return_complex=True, center=True)
+        X = crop_frames(torch.stft(x, n, self.hop, window=w, return_complex=True, center=True), self.hop, crop)
         return (X.real ** 2 + X.imag ** 2) / (n / 4) ** 2
 
     def select(self, notes, b, t_window):
@@ -131,26 +132,29 @@ class PartialView(nn.Module):
         n_idx, p_idx = ok.nonzero(as_tuple=True)
         return n_idx, p_idx, f[n_idx, p_idx], on[n_idx]
 
-    def forward(self, pred, target, notes, cache=None):
+    def forward(self, pred, target, notes, cache=None, crop=None):
         """``pred``, ``target``: the scored audio ``[B, ch, T]``; ``notes``: ``{"freq", "amp", "alpha": [B, N, P(, M)],
         "onset": [B, N] (s re the first scored sample), "mask": [B, N]}``, and for the exposure ``"alpha_damp": [B, N, P],
         "damp", "restrike": [B, N, F]`` at ``"ctrl_hop"`` s from ``"t_ref"`` s (the rendered window's first sample re
         the first scored sample; without them the dampers are ignored). Returns ``{"partials", "pooled",
         "pooled_exposed", "between", "between_pooled": [B]}``, each the mean |log10 difference| over its counted
         cells. ``cache``: a dict shared by calls with the same ``pred`` and ``notes`` (the energy score compares one
-        render with two references): everything of the prediction's side is computed once."""
+        render with two references): everything of the prediction's side is computed once. ``crop``: ``pred`` and
+        ``target`` come from ``losses.extend_scored`` (real audio before the scored window, silence after it), and
+        every spectrum keeps the frames centred on the scored samples."""
         cache = {} if cache is None else cache
         sr = self.sr
         if "view_hp" not in cache:
             cache["view_hp"] = highpass(pred, sr, self.hp_hz)
         pred, target = cache["view_hp"], highpass(target, sr, self.hp_hz)
-        B, ch, T = pred.shape
+        B, ch = pred.shape[:2]
+        T = pred.shape[-1] if crop is None else crop[1]
         out_p, out_b = [], []
         sums = {k: [] for k in POOL_MIN}
         n_between = int(self.b_mask2048.shape[0]) * len(BETWEEN_AGES)
         for b in range(B):
             if ("view", b) not in cache:
-                cache[("view", b)] = self._pred_side(pred[b], notes, b, T / sr)
+                cache[("view", b)] = self._pred_side(pred[b], notes, b, T / sr, crop)
             pc = cache[("view", b)]
             if pc is None:
                 for o in (out_p, out_b):
@@ -163,7 +167,7 @@ class PartialView(nn.Module):
             fr, parts, live, age, E_p = (pc[k] for k in ("fr", "parts", "live", "age", "E_p"))
             E_t, spec_t = [], {}
             for n, (j, w) in pc["bins"].items():
-                P_t = self._power(target[b], n).detach()
+                P_t = self._power(target[b], n, crop).detach()
                 spec_t[n] = P_t
                 E_t.append((P_t[:, j, :] * w[None, :, :, None]).sum(2))
             E_t = torch.cat(E_t, 1)
@@ -182,7 +186,7 @@ class PartialView(nn.Module):
             out[k] = pooled_l1(P, T_, cnt, eps.amin(0), POOL_MIN[k])
         return out
 
-    def _pred_side(self, x, notes, b, t_window):
+    def _pred_side(self, x, notes, b, t_window, crop=None):
         """What ``forward`` reads of the prediction ``x[ch, T]`` (high-passed) of example ``b`` and does not depend on
         the reference: the readings' selection, analysis sizes and bins, the prediction's spectra and readings, when
         each reading counts, the note ages and the exposure. None when nothing is read."""
@@ -196,7 +200,7 @@ class PartialView(nn.Module):
         E_p, spec_p, bins = [], {}, {}
         for n in sorted(set(size.tolist())):
             sel = size == n
-            P_p = self._power(x, n)
+            P_p = self._power(x, n, crop)
             spec_p[n] = P_p
             k = fr[sel] * n / sr  # fractional bin
             j = torch.round(k).long()[:, None] + torch.arange(-1, 2, device=k.device)  # [Q, 3]
@@ -209,7 +213,8 @@ class PartialView(nn.Module):
         t = torch.arange(frames, device=x.device) * hop / sr
         live = (t[None, :] >= on[:, None] - 0.01).float()  # [Q, frames]: from the note's sound onset on
         return {"fr": fr, "starts": on, "parts": p_idx, "live": live, "age": t[None, :] - on[:, None], "E_p": E_p,
-                "spec_p": spec_p, "bins": bins, "x": x, "share": self.exposure(notes, b, n_idx, p_idx, fr, size, on, t)}
+                "spec_p": spec_p, "bins": bins, "x": x, "crop": crop,
+                "share": self.exposure(notes, b, n_idx, p_idx, fr, size, on, t)}
 
     @torch.no_grad()
     def exposure(self, notes, b, n_idx, p_idx, fr, size, on, t):
@@ -266,7 +271,7 @@ class PartialView(nn.Module):
         tot, cnt = x_t.new_zeros(()), x_t.new_zeros(())
         pooled = []
         for n, M, free, bins, ok, mp, pb, sp, eps in pc["between"]:
-            P_t = spec_t[n] if n in spec_t else self._power(x_t, n).detach()
+            P_t = spec_t[n] if n in spec_t else self._power(x_t, n, pc["crop"]).detach()
             num_t = torch.einsum("kf,cft->ckt", M, P_t * free)
             mt = num_t / bins.clamp(min=1)[None]
             d = (torch.log10(mp + eps) - torch.log10(mt + eps)).abs() * ok
@@ -287,7 +292,7 @@ class PartialView(nn.Module):
         pc["between_ages"] = torch.nn.functional.one_hot(age, len(BETWEEN_AGES)).float()  # [frames, ages]
         out = []
         for n, lo, hi in ((8192, 0.0, 200.0), (2048, 200.0, math.inf)):
-            P_p = spec_p[n] if n in spec_p else self._power(x_p, n)
+            P_p = spec_p[n] if n in spec_p else self._power(x_p, n, pc["crop"])
             F = P_p.shape[1]
             k = torch.round(fr * n / sr).long()
             near = torch.zeros(F, frames, device=x_p.device)

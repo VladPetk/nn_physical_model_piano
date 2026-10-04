@@ -721,3 +721,41 @@ def test_partial_groups_follow_the_partial_number():
     ph = torch.tensor([[205.0, 395.0]])  # phantoms near partials 2 and 4
     Wp = partial_group_weights(1, ph, f_part, M, 8)
     assert Wp[0].argmax(0).tolist() == [1, 3]
+
+
+def test_shared_board_aligns_the_direct_sound_and_the_hall_has_the_diffuse_coherence():
+    """``shared_board``: both microphones' direct paths are the left body through real band gains, so their cross
+    spectrum has (nearly) no phase (and +6 dB in one band shows as +6 dB there); ``hall_mic_d``: the two hall carriers' coherence
+    follows sinc(2 f d / c) (near 1 at 100 Hz for d = 0.3 m, under 0.1 at 2-4 kHz), and d = 0 keeps the earlier
+    independent tails exactly."""
+    from pianonn.room import SPEED_OF_SOUND, band_carriers
+
+    m = NeuralPhysicalPiano(small_cfg(shared_board=True, hall_mic_d=0.3))
+    R, sr = m.room, m.cfg.sample_rate
+    cond = torch.tensor([3])
+    with torch.no_grad():
+        R.mic_eq_db[3, 0, 1, 5] = 6.0  # the right microphone's 1 kHz band
+        d = R.direct(R.body[cond], cond)[0]
+    L = d.shape[-1]
+    X = torch.fft.rfft(d.double(), 2 * L)
+    f = torch.fft.rfftfreq(2 * L, 1 / sr)
+    band = (f > 300) & (f < 4000) & (X[0].abs() > 1e-3 * X[0].abs().max())
+    gain_db = 20 * torch.log10(X[1].abs() / X[0].abs()) - (R.mic_gain_db[3, 1] - R.mic_gain_db[3, 0])
+    ph = torch.angle(X[1][band] * X[0][band].conj()).abs()  # the band gains are cut to the body's length: ~0.01 rad
+    assert ph.median() < 0.01 and torch.quantile(ph, 0.95) < 0.05
+    at = lambda hz: float(gain_db[int(torch.argmin((f - hz).abs()))])  # noqa: E731
+    assert abs(at(1000) - 6.0) < 0.2 and abs(at(250)) < 0.2
+    c = R.carriers.double().sum(1)  # [ch, L]: the band carriers sum to the noise
+    Y = torch.fft.rfft(c, dim=-1)
+    fy = torch.fft.rfftfreq(c.shape[-1], 1 / sr)
+
+    def coh(lo, hi):
+        b = (fy >= lo) & (fy < hi)
+        cr = (Y[0, b] * Y[1, b].conj()).sum()
+        return float(cr.abs() ** 2 / ((Y[0, b].abs() ** 2).sum() * (Y[1, b].abs() ** 2).sum()))
+
+    want = float(torch.special.sinc(torch.tensor(2 * 100 * 0.3 / SPEED_OF_SOUND))) ** 2
+    assert abs(coh(90, 110) - want) < 0.05 and coh(2000, 4000) < 0.1
+    off = NeuralPhysicalPiano(small_cfg())
+    sr_o, hs = off.cfg.sample_rate, off.cfg.hall_seconds
+    assert torch.equal(off.room.carriers[1], band_carriers(sr_o, hs, seed=2))

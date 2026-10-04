@@ -91,3 +91,43 @@ def test_a_small_mistuning_is_tolerated():
     y = _note(220.0 * 2 ** (5 / 1200))[None, None].repeat(1, 2, 1)  # 5 cents sharp
     d = v(y, x, _notes(220.0))
     assert d["partials"].item() < 0.1
+
+
+def test_scored_frames_read_context_not_a_mirror():
+    """``extend_scored`` + ``crop_frames``: as many frames as a centred STFT of the scored slice, the same readings in
+    the slice's interior, and an attack 20 ms before the slice's end not counted again through its mirror (reflect
+    padding puts a copy 20 ms after the end, which the last frames' 8192-point windows read: ~1.6 times the energy)."""
+    from pianonn.losses import PianoLoss, extend_scored
+    s, T = SR, 2 * SR
+    full = torch.zeros(1, 1, s + T)
+    t0 = s + T - int(0.02 * SR)
+    full[..., t0: t0 + 48] = torch.hann_window(48)  # a click
+    piano = PianoLoss(SR, weights=(1.0, 0.0, 0.0))
+    old = piano.band_list(full[..., s:])
+    x, crop = extend_scored(full, s)
+    new = piano.band_list(x, crop)
+    assert [e.shape for e in old] == [e.shape for e in new]
+    ratio = (old[0].sum() / new[0].sum()).item()  # the 8192-point group (bands below 200 Hz)
+    assert 1.4 < ratio < 2.0, ratio
+    # a steady tone: the interior frames agree (to -50 dB re the loudest band: the edges' high-pass ringing differs)
+    tt = torch.arange(s + T) / SR
+    tone = (0.1 * torch.sin(2 * math.pi * 220 * tt))[None, None]
+    a, b = piano.band_list(tone[..., s:]), piano.band_list(*extend_scored(tone, s))
+    for ea, eb in zip(a, b):
+        mid = slice(40, -40)
+        assert torch.allclose(ea[..., mid], eb[..., mid], rtol=1e-3, atol=1e-5 * float(ea.max()))
+
+
+def test_sound_onsets_follow_the_delay_law():
+    from pianonn.composite import sound_onsets
+    batch = {"pitch": torch.tensor([[60, 30, 108]]), "velocity": torch.tensor([[64, 64, 64]])}
+    on = sound_onsets(batch, torch.zeros(1, 3))
+    assert torch.allclose(on, torch.tensor([[0.00717, 0.00717 + 0.00819, 0.0]]), atol=1e-6)
+
+
+def test_lowest_key_fundamental_is_read():
+    f = torch.tensor([[[27.5, 55.0]]])
+    notes = {"freq": f, "amp": torch.ones(1, 1, 2, 1), "alpha": torch.ones(1, 1, 2, 1), "onset": torch.zeros(1, 1),
+             "mask": torch.ones(1, 1, dtype=torch.bool)}
+    n_idx, p_idx, fr, _ = PartialView(SR).select(notes, 0, 2.0)
+    assert 27.5 in fr.tolist()

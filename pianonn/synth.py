@@ -23,7 +23,7 @@ from . import cuda_ext
 from .config import PianoConfig
 from .dsp import bounded, fft_convolve, frames_to_samples, interp_bands, linear_recurrence, sample_curve, sample_keyed
 from .physics import LOWEST_MIDI, N_KEYS, PianoPhysics, hammer_velocity, key_curve, log_f_bumps
-from .oscbank import RESTRIKE_RAMP, group_weights, osc_bank, partial_group_weights
+from .oscbank import RESTRIKE_RAMP, bus_bank, group_weights, osc_bank, partial_group_weights
 from .residual import AwareResidual
 from .room import Room
 
@@ -167,9 +167,14 @@ class SympatheticBank(nn.Module):
         S, D, k = cfg.symp_partials, cfg.symp_decimate, self.keys
         state = state or {}
         sr = cfg.sample_rate / D
-        freq = key_modes["freq"][:, k, :S, 0]
-        alpha = key_modes["alpha"][:, k, :S, 0]
-        kappa = (alpha - key_modes["alpha"][:, k, :S, 1]).clamp(min=0)
+        if "single_alpha" in key_modes:  # the coupled strings: one string's decay and its bridge part
+            freq = key_modes["partial_freq"][:, k, :S]
+            alpha = key_modes["single_alpha"][:, k, :S]
+            kappa = key_modes["single_kappa"][:, k, :S].clamp(min=0)
+        else:
+            freq = key_modes["freq"][:, k, :S, 0]
+            alpha = key_modes["alpha"][:, k, :S, 0]
+            kappa = (alpha - key_modes["alpha"][:, k, :S, 1]).clamp(min=0)
         alpha_damp = key_modes["alpha_damp"][:, k, :S]
         top = min(cfg.symp_max_hz, 0.45 * sr) if cfg.symp_max_hz > 0 else 0.45 * sr
         valid = (freq < top).to(freq.dtype)
@@ -522,6 +527,10 @@ class NeuralPhysicalPiano(nn.Module):
         psd = strike_sd_table(cfg, STRIKE_PARTIAL_DIMS)
         self.strike_partial_on = psd is not None
         self.strike_on = self.strike_on or self.strike_partial_on
+        esd = strike_sd_table(cfg, ("evenness",)) if cfg.string_model == "coupled" else None
+        self.strike_even_on = esd is not None
+        self.strike_on = self.strike_on or self.strike_even_on
+        self.register_buffer("strike_even_sd", esd[0] if esd is not None else torch.zeros(N_KEYS), persistent=False)
         self.register_buffer("strike_partial_sd", psd if psd is not None else torch.zeros(len(STRIKE_PARTIAL_DIMS), N_KEYS),
                              persistent=False)
         # the aware residual's gain curves: per octave group of partials (0), or one group per partial for this many
@@ -539,6 +548,9 @@ class NeuralPhysicalPiano(nn.Module):
         z = torch.randn(*ki.shape, len(STRIKE_DIMS), generator=generator, device=ki.device)
         x = z.clamp(-STRIKE_CLIP, STRIKE_CLIP) * self.strike_sd.T[ki]
         out = {d: x[..., i] for i, d in enumerate(STRIKE_DIMS)}
+        if self.strike_even_on:  # [B, N, 3]: each string's share of the blow (coupled strings)
+            ze = torch.randn(*ki.shape, 3, generator=generator, device=ki.device).clamp(-STRIKE_CLIP, STRIKE_CLIP)
+            out["even"] = ze * self.strike_even_sd[ki][..., None]
         if self.strike_partial_on:  # [B, N, P] and [B, N, P, M - 1]
             P, M = self.cfg.n_partials, self.cfg.n_modes
             zd = torch.randn(*ki.shape, P, generator=generator, device=ki.device).clamp(-STRIKE_CLIP, STRIKE_CLIP)
@@ -564,6 +576,8 @@ class NeuralPhysicalPiano(nn.Module):
         for d in STRIKE_PARTIAL_DIMS:
             if d in var:
                 out["strike_" + d] = var[d]
+        if "even" in var:
+            out["strike_even"] = var["even"]
         return out
 
     def key_rolls(self, ki, onset, release, u, mask, F):
@@ -712,6 +726,258 @@ class NeuralPhysicalPiano(nn.Module):
                 keys.append(C.new_zeros(B * N_KEYS, L).index_add(0, row[idx], y).view(B, N_KEYS, L))
         return torch.cat(out, -1), (torch.cat(keys, -1) if per_key else None)
 
+    @torch.no_grad()
+    def init_coupled(self):
+        """Start the coupled strings and their room from this model's mode parameters (after loading a mode model)."""
+        if self.cfg.string_model == "coupled":
+            self.physics.init_coupled()
+            self.room.init_buses()
+
+    def _coupled_sets(self, modes, ki, cond):
+        """The coupled strings' oscillator sets ``[(freq, alpha, bus_amp, adamp)]`` per note ``[B, N, Q(, 6, 2)]``: the
+        normal modes (pruned: a mode whose energy is ``cfg.prune_db`` under its partial's strongest is not rendered)
+        and the knock's resonances. Buses: the vertical and in-plane radiation per microphone, each mode's complex
+        amplitude times the key's gain and delay (a phase) per microphone, then the two longitudinal sums."""
+        gains, delays = self.room.bus_image(ki, cond)  # [B, N, 2, ch]
+        f, al, ba = modes["freq"], modes["alpha"], modes["bus_amp"]  # [B, N, P, S], ..., [B, N, P, S, 4, 2]
+        with torch.no_grad():
+            e = modes["amp"] ** 2 / (2 * al.clamp(min=1e-3))
+            keep = (e >= e.amax(-1, keepdim=True) * 10 ** (-self.cfg.prune_db / 10)).to(ba.dtype)
+        ba = ba * keep[..., None, None]
+
+        def image(A_s, A_c, fr, bus):  # [..., ] amplitudes of one bus -> [..., ch, 2] per microphone
+            g, d = gains[..., bus, :], delays[..., bus, :]  # [B, N, ch]
+            extra = A_s.dim() - 2
+            g, d = g.reshape(*g.shape[:2], *([1] * extra), -1), d.reshape(*d.shape[:2], *([1] * extra), -1)
+            ph = -2 * math.pi * fr[..., None] * d
+            A = torch.complex(A_c, -A_s)[..., None] * g * torch.exp(torch.complex(torch.zeros_like(ph), ph))
+            return torch.stack([-A.imag, A.real], -1)  # [..., ch, 2]
+
+        v = image(ba[..., 0, 0], ba[..., 0, 1], f, 0)
+        h = image(ba[..., 1, 0], ba[..., 1, 1], f, 1)
+        tr = torch.cat([v, h, ba[..., 2:, :]], -2)  # [B, N, P, S, 2 ch + 2 ch + 2, 2]
+        B, N, P, S = f.shape
+        NB = tr.shape[-2]
+        adamp = modes["alpha_damp"][..., None].expand(B, N, P, S)
+        sets = [(f.reshape(B, N, P * S), al.reshape(B, N, P * S), tr.reshape(B, N, P * S, NB, 2), adamp.reshape(B, N, P * S))]
+        kr = modes["kres"]
+        kv = image(kr["amp"], torch.zeros_like(kr["amp"]), kr["freq"], 0)  # [B, N, R, ch, 2]
+        kb = torch.cat([kv, kv.new_zeros(*kv.shape[:3], NB - kv.shape[-2], 2)], -2)
+        sets.append((kr["freq"], kr["alpha"], kb, torch.zeros_like(kr["freq"])))
+        return sets
+
+    def _longitudinal(self, Y, long, idx, state):
+        """The longitudinal force of the active notes ``idx`` from their longitudinal sums ``Y[P, 2, L]`` (odd, even
+        partials): F_even = S_odd^2 + S_even^2, F_odd = -2 S_odd S_even, through a direct (high-passed) path and the
+        free longitudinal modes (odd modes driven by F_odd, even by F_even), times the note's scale. ``state``: per note
+        (all of them) the recurrences' carry across chunks and blocks. Returns ``F[P, L]``."""
+        sr = self.cfg.sample_rate
+        r = math.exp(-2 * math.pi * 20.0 / sr)  # DC blocker at ~20 Hz: y_t = r y_t-1 + x_t - x_t-1
+        if Y.is_cuda and cuda_ext.get() is not None:  # the fused kernel: sequential per note, nothing stored
+            la, lf, lg = long["lm_alpha"][idx], long["lm_f"][idx], long["lm_gain"][idx]
+            c = lg * (2 * (1 - torch.exp(-la / sr)))[:, None]  # unit peak gain
+            z0 = torch.view_as_real(state["lm"][idx].detach().to(torch.complex64))
+            out, hp1, z1 = cuda_ext.Longitudinal.apply(Y, c, la, 2 * math.pi * lf / sr, state["hp"][idx].detach(), z0, sr, r)
+            state["hp"] = state["hp"].index_put((idx,), hp1)
+            state["lm"] = state["lm"].index_put((idx,), torch.view_as_complex(z1.contiguous()))
+            return out * long["scale"][idx][:, None]
+        So, Se = Y[:, 0], Y[:, 1]
+        fe, fo = So * So + Se * Se, -2 * So * Se
+        x = fe + fo
+        prev_x, prev_y = state["hp"][idx, 0], state["hp"][idx, 1]
+        dx = torch.cat([x[:, :1] - prev_x[:, None], x[:, 1:] - x[:, :-1]], -1)
+        log_r = torch.full_like(dx, math.log(r))
+        hp, last = linear_recurrence(torch.complex(dx, torch.zeros_like(dx)), torch.complex(log_r, torch.zeros_like(log_r)),
+                                     torch.complex(prev_y, torch.zeros_like(prev_y)), self.cfg.rec_chunk)
+        state["hp"] = state["hp"].index_put((idx, torch.zeros_like(idx)), x[:, -1])
+        state["hp"] = state["hp"].index_put((idx, torch.ones_like(idx)), last.real)
+        out = hp.real
+        lf, la, lg = long["lm_f"][idx], long["lm_alpha"][idx], long["lm_gain"][idx]  # [P, J], [P], [P, J]
+        J = lf.shape[-1]
+        drive = torch.stack([fo if j % 2 == 0 else fe for j in range(J)], 1)  # j = 0 is LM1 (odd)
+        log_a = torch.complex(-la[:, None].expand(-1, J) / sr, 2 * math.pi * lf / sr)  # [P, J]
+        z0 = state["lm"][idx]
+        z, zl = linear_recurrence(torch.complex(drive, torch.zeros_like(drive)), log_a[..., None].expand_as(drive).contiguous(),
+                                  z0, self.cfg.rec_chunk)
+        state["lm"] = state["lm"].index_put((idx,), zl)
+        norm = 2 * (1 - torch.exp(-la / sr))  # unit peak gain
+        out = out + (z.real * (lg * norm[:, None])[..., None]).sum(1)
+        return out * long["scale"][idx][:, None]
+
+    def render_coupled(self, modes, ki, onset, mask, C, hist, rs_delay, cond, start, length, per_key=False, curves=None,
+                       state=None):
+        """The coupled strings for samples ``[start, start + length)``: the two radiation buses ``[B, 2, ch, L]`` (the
+        longitudinal force joined to the in-plane bus, a share to the vertical), per key the vertical bridge force
+        ``[B, 88, L]`` (for the sympathetic bank) and the longitudinal path's ``state`` for the next block. The
+        reference: ``oscbank.bus_bank`` per activity chunk, the same activity test as ``render_strings``."""
+        if C.is_cuda and cuda_ext.get() is not None:
+            return self._render_coupled_fused(modes, ki, onset, mask, C, hist, rs_delay, cond, start, length, per_key,
+                                              curves, state)
+        cfg = self.cfg
+        sr, hop = cfg.sample_rate, cfg.hop
+        B, N = ki.shape
+        ch = cfg.channels
+        BN = B * N
+        flat = lambda x: x.reshape(BN, *x.shape[2:])  # noqa: E731
+        sets = [tuple(flat(x) for x in st) for st in self._coupled_sets(modes, ki, cond)]
+        tc, on, msk = flat(modes["tc"]), flat(onset), flat(mask)
+        rs_nats, rsd, kf = flat(modes["restrike"]), flat(rs_delay), flat(ki)
+        ge, gb = (flat(x) for x in modes["glide"])
+        long = {k: (flat(v) if torch.is_tensor(v) and v.dim() >= 2 else v) for k, v in modes["long"].items()}
+        bi = torch.arange(B, device=ki.device).repeat_interleave(N)
+        row = bi * N_KEYS + kf
+        C_rows = C.reshape(B * N_KEYS, -1)
+        if state is None:
+            J = long["lm_f"].shape[-1]
+            state = {"hp": C.new_zeros(BN, 2), "lm": torch.zeros(BN, J, dtype=torch.complex64, device=C.device)}
+        if curves is not None:
+            c_flat, c_hop = curves.reshape(BN, *curves.shape[2:]), cfg.res_control * hop
+            centers = None if self.curve_partials else self.context.centers
+            f_part = flat(modes["partial_freq"]) if self.curve_partials else None
+        c_onset = sample_keyed(C, ki, onset.clamp(min=-hist / sr) + hist / sr, sr, hop).reshape(BN)
+        gains, _ = self.room.bus_image(ki, cond)
+        with torch.no_grad():
+            mags = [st[2].abs().amax((-2, -1)) for st in sets]
+            log_amps = [torch.log(mg + 1e-30) for mg in mags]
+            thresh = log_amps[0].amax(-1) - cfg.activity_db * math.log(10) / 20
+        out, keys = [], []
+        for s0 in range(start, start + length, cfg.synth_chunk):
+            L = min(cfg.synth_chunk, start + length - s0)
+            with torch.no_grad():
+                tau0 = (s0 / sr - on).clamp(min=0)
+                c0 = frames_to_samples(C_rows, s0 + hist, 1, hop)[:, 0][row]
+                d0 = (c0 - c_onset).clamp(min=0)
+                n_valid = []
+                for (freq, alpha, amp, adamp), la in zip(sets, log_amps):
+                    act = (la - alpha * tau0[:, None] - adamp * d0[:, None]) > thresh[:, None]
+                    n_valid.append(torch.where(act.any(-1), act.shape[-1] - act.flip(-1).int().argmax(-1), 0))
+                idx = (msk & (on < (s0 + L) / sr) & (n_valid[0] > 0)).nonzero().squeeze(1)
+            if idx.numel() == 0:
+                out.append(C.new_zeros(B, 2, ch, L))
+                keys.append(C.new_zeros(B, N_KEYS, L) if per_key else None)
+                continue
+            c_note = frames_to_samples(C_rows.index_select(0, row[idx]), s0 + hist, L, hop)
+            sel = lambda x: x.index_select(0, idx)  # noqa: E731
+            Y = None
+            for si, (freq, alpha, amp, adamp) in enumerate(sets):
+                hi = int(n_valid[si][idx].max())
+                if hi == 0:
+                    continue
+                grp = {}
+                if curves is not None and si == 0:
+                    c_lo, c_hi = s0 // c_hop, min(c_flat.shape[-1], (s0 + L - 1) // c_hop + 2)
+                    if self.curve_partials:
+                        S = modes["freq"].shape[-1]
+                        W = partial_group_weights(0, sel(freq)[:, :hi].detach(), sel(f_part), S, self.curve_partials)
+                    else:
+                        W = group_weights(sel(freq)[:, :hi].detach(), centers)
+                    grp = dict(W=W, m=sel(c_flat)[..., c_lo:c_hi], c_start=s0 - c_lo * c_hop, c_hop=c_hop)
+                y = bus_bank(sel(freq)[:, :hi], sel(alpha)[:, :hi], sel(amp)[:, :hi], sel(adamp)[:, :hi], sel(tc), c_note,
+                             sel(c_onset), sel(rs_nats), sel(on), sel(rsd), s0 / sr, sr,
+                             glide=(sel(ge), sel(gb)) if si == 0 else None, **grp)
+                Y = y if Y is None else Y + y
+            if Y is None:
+                out.append(C.new_zeros(B, 2, ch, L))
+                keys.append(C.new_zeros(B, N_KEYS, L) if per_key else None)
+                continue
+            # buses: [vertical per microphone, in-plane per microphone, longitudinal odd, even]
+            F = self._longitudinal(Y[:, 2 * ch: 2 * ch + 2], long, idx, state)
+            g = flat(gains).index_select(0, idx)  # [P, 2, ch]
+            vb = Y[:, :ch] + (long["v_share"] * F)[:, None] * g[:, 0, :, None]
+            hb = Y[:, ch: 2 * ch] + F[:, None] * g[:, 1, :, None]
+            out.append(torch.stack([C.new_zeros(B, ch, L).index_add(0, bi[idx], vb),
+                                    C.new_zeros(B, ch, L).index_add(0, bi[idx], hb)], 1))
+            if per_key:
+                mono = Y[:, :ch].mean(1)
+                keys.append(C.new_zeros(B * N_KEYS, L).index_add(0, row[idx], mono).view(B, N_KEYS, L))
+        return torch.cat(out, -1), (torch.cat(keys, -1) if per_key else None), state
+
+    def _render_coupled_fused(self, modes, ki, onset, mask, C, hist, rs_delay, cond, start, length, per_key, curves,
+                              state):
+        """``render_coupled`` with the fused CUDA bus bank (``pianonn.cuda_ext.BusBank``): the activity test of
+        ``_render_strings_fused`` (each note renders exactly its own active oscillators), every active note over the
+        whole segment in one launch. The kernel sums the radiation buses per example and keeps only the two
+        longitudinal sums per note, for the longitudinal force (their square)."""
+        cfg = self.cfg
+        sr, hop = cfg.sample_rate, cfg.hop
+        B, N = ki.shape
+        ch = cfg.channels
+        BN = B * N
+        dev = ki.device
+        flat = lambda x: x.reshape(BN, *x.shape[2:])  # noqa: E731
+        sets = [tuple(flat(x) for x in st) for st in self._coupled_sets(modes, ki, cond)]
+        tc, on, msk = flat(modes["tc"]), flat(onset), flat(mask)
+        rs_nats, rsd, kf = flat(modes["restrike"]), flat(rs_delay), flat(ki)
+        ge, gb = (flat(x) for x in modes["glide"])
+        long = {k: (flat(v) if torch.is_tensor(v) and v.dim() >= 2 else v) for k, v in modes["long"].items()}
+        bi = torch.arange(B, device=dev).repeat_interleave(N)
+        row = bi * N_KEYS + kf
+        C_rows = C.reshape(B * N_KEYS, -1)
+        if state is None:
+            J = long["lm_f"].shape[-1]
+            state = {"hp": C.new_zeros(BN, 2), "lm": torch.zeros(BN, J, dtype=torch.complex64, device=dev)}
+        c_onset = sample_keyed(C, ki, onset.clamp(min=-hist / sr) + hist / sr, sr, hop).reshape(BN)
+        gains, _ = self.room.bus_image(ki, cond)
+        chunk = cfg.synth_chunk
+        s0 = torch.arange(start, start + length, chunk, device=dev)
+        with torch.no_grad():
+            log_amps = [torch.log(st[2].abs().amax((-2, -1)) + 1e-30) for st in sets]
+            thresh = log_amps[0].amax(-1) - cfg.activity_db * math.log(10) / 20
+            tau0 = (s0.float()[None] / sr - on[:, None]).clamp(min=0)
+            pos = (s0.double() + hist) / hop
+            i0 = pos.floor().long().clamp(0, C_rows.shape[-1] - 2)
+            w = (pos - i0).clamp(0, 1).to(C_rows.dtype)
+            c0 = (C_rows[:, i0] * (1 - w) + C_rows[:, i0 + 1] * w)[row]
+            d0 = (c0 - c_onset[:, None]).clamp(min=0)
+            nvs = []
+            for (freq, alpha, amp, adamp), la in zip(sets, log_amps):
+                act = (la[:, None] - alpha[:, None] * tau0[..., None] - adamp[:, None] * d0[..., None]) > thresh[:, None, None]
+                nvs.append(torch.where(act.any(-1), act.shape[-1] - act.flip(-1).int().argmax(-1), 0))
+            ends = (s0 + chunk).clamp(max=start + length).float() / sr
+            alive = msk[:, None] & (on[:, None] < ends[None]) & (nvs[0] > 0)
+            idx = alive.any(1).nonzero().squeeze(1)
+        P = idx.numel()
+        if P == 0:
+            return (C.new_zeros(B, 2, ch, length), (C.new_zeros(B, N_KEYS, length) if per_key else None), state)
+        sel = lambda x: x.index_select(0, idx)  # noqa: E731
+        with torch.no_grad():
+            nv = (torch.stack(nvs, -1) * alive[..., None]).index_select(0, idx).int().contiguous()
+        Q0 = sets[0][0].shape[-1]
+        freq, alpha, adamp = (torch.cat([sel(st[i]) for st in sets], -1).float() for i in (0, 1, 3))
+        amp = torch.cat([sel(st[2]) for st in sets], 1).float()  # [P, Q, NB, 2]
+        Qk = freq.shape[-1] - Q0
+        if curves is not None:  # set 0 (the modes) follows the curves, the knock's resonances (group -1) do not
+            m = sel(curves.reshape(BN, *curves.shape[2:]))
+            with torch.no_grad():
+                if self.curve_partials:
+                    S = modes["freq"].shape[-1]
+                    g0 = (torch.arange(Q0, device=dev) // S).clamp(max=self.curve_partials - 1).expand(P, Q0)
+                    w0, g1, w1 = torch.ones(P, Q0, device=dev), g0, torch.zeros(P, Q0, device=dev)
+                else:
+                    vals, ids = group_weights(freq[:, :Q0].detach(), self.context.centers).topk(2, dim=1)
+                    g0, g1, w0, w1 = ids[:, 0], ids[:, 1], vals[:, 0], vals[:, 1]
+                pad_i, pad_f = torch.full((P, Qk), -1, device=dev), torch.zeros(P, Qk, device=dev)
+                g0 = torch.cat([g0, pad_i], -1).int().contiguous()
+                g1 = torch.cat([g1, pad_i.clamp(min=0)], -1).int().contiguous()
+                w0 = torch.cat([w0, pad_f], -1).float().contiguous()
+                w1 = torch.cat([w1, pad_f], -1).float().contiguous()
+        else:
+            m = freq.new_zeros(0)
+            g0 = g1 = torch.zeros(0, dtype=torch.int32, device=dev)
+            w0 = w1 = freq.new_zeros(0)
+        ints = (int(hist), int(hop), int(cfg.res_control * hop), int(chunk), int(Q0), int(start), int(length))
+        b_idx = bi.index_select(0, idx)
+        fixed = (g0, w0, g1, w1, sel(on).double().contiguous(), sel(rsd).float().contiguous(), sel(row).contiguous(),
+                 nv, ints, float(sr), b_idx.contiguous(), 2 * ch, B, B * N_KEYS, bool(per_key))
+        mix, lon, kk = cuda_ext.BusBank.apply(freq, alpha, amp, adamp, sel(tc).float(), sel(c_onset).float(),
+                                              sel(rs_nats).float(), sel(ge).float(), sel(gb).float(), C_rows, m, fixed)
+        F = self._longitudinal(lon, long, idx, state)  # [P, L]
+        g = flat(gains).index_select(0, idx)  # [P, 2, ch]
+        vb = C.new_zeros(B, ch, length).index_add(0, b_idx, (long["v_share"] * F)[:, None] * g[:, 0, :, None])
+        hb = C.new_zeros(B, ch, length).index_add(0, b_idx, F[:, None] * g[:, 1, :, None])
+        out = torch.stack([mix[:, :ch] + vb, mix[:, ch:] + hb], 1)
+        return out, (kk.view(B, N_KEYS, length) if per_key else None), state
+
     def _render_strings_fused(self, modes, ki, onset, mask, C, hist, rs_delay, pan, start, length, per_key, curves):
         """``render_strings`` with the fused CUDA kernels (``pianonn.cuda_ext.StringBank``): the same activity test per
         chunk of ``cfg.synth_chunk`` samples (each note's oscillators up to the last one within ``activity_db`` of its
@@ -857,6 +1123,10 @@ class NeuralPhysicalPiano(nn.Module):
         return torch.cat(out, -1)
 
     def forward(self, perf, n_samples, block_seconds=None, generator=None, residual=True, floor=None, extras=()):
+        with self.physics.shared_core(perf["condition"]):  # the coupled decomposition once per render
+            return self._forward(perf, n_samples, block_seconds, generator, residual, floor, extras)
+
+    def _forward(self, perf, n_samples, block_seconds=None, generator=None, residual=True, floor=None, extras=()):
         """``extras``: ``"residual_out"`` adds ``out["noise_res_out"]``, the residual noise at the microphones (the
         budget measures it against the output); ``"texture_view"`` adds ``out["audio_texture"]``, numerically the
         same audio, in which only the noise bank's and the residual's parameters are differentiable: the noise is
@@ -887,10 +1157,12 @@ class NeuralPhysicalPiano(nn.Module):
         C = torch.cat([engagement.new_zeros(B, N_KEYS, 1), torch.cumsum(engagement[..., :-1], -1) * hop / sr], -1)
 
         soft_on = sample_curve(pedals[:, 1], onset.clamp(min=-t_hist) + t_hist, sr, hop)
+        # the interaction tables' pedal factor: the lift at each strike
+        lift_ctx = {"lift_on": sample_curve(lift, onset.clamp(min=-t_hist) + t_hist, sr, hop)} if cfg.interactions else {}
         ctx, frame_ctx, curves = {}, None, None
         if residual and cfg.residual_kind == "aware":
             with torch.no_grad():  # what the physics alone would play: the residual's view, not steered through
-                modes0 = self.physics.modes(ki, u, soft_on, cond, None, phantoms=cfg.n_phantoms > 0)
+                modes0 = self.physics.modes(ki, u, soft_on, cond, lift_ctx or None, phantoms=cfg.n_phantoms > 0)
                 modes0["amp"] = modes0["amp"] * mask[..., None, None]
                 if "ph_amp" in modes0:
                     modes0["ph_amp"] = modes0["ph_amp"] * mask[..., None]
@@ -909,38 +1181,61 @@ class NeuralPhysicalPiano(nn.Module):
         # ``out["ctx"]`` stays the context net's own (the residual budget penalises it)
         var = self.strike_offsets(ki, generator)
         note_ctx = self.with_strike(ctx, var, torch.zeros_like(u))
+        if lift_ctx:
+            note_ctx = {**(note_ctx or {}), **lift_ctx}
         if var is not None:
             onset = onset + var["onset_ms"] / 1000
+        coupled = cfg.string_model == "coupled"
         modes = self.physics.modes(ki, u, soft_on, cond, note_ctx, phantoms=cfg.n_phantoms > 0)
-        if cfg.use_room and self.room.ring_on:  # the board's ring-up keeps the partials' levels (config body_ring_ms)
-            modes["amp"] = modes["amp"] * self.room.ring_gain(modes["freq"][..., :1]).rsqrt()
         m = mask[..., None]
-        modes["amp"] = modes["amp"] * m[..., None]
-        if "ph_amp" in modes:
-            modes["ph_amp"] = modes["ph_amp"] * m
+        if coupled:
+            if cfg.use_room and self.room.ring_on:  # as below: the ring-up keeps the partials' levels (radiated buses)
+                r = self.room.ring_gain(modes["partial_freq"]).rsqrt()  # [B, N, P]
+                modes["amp"] = modes["amp"] * r[..., None]
+                ba = modes["bus_amp"]
+                modes["bus_amp"] = torch.cat([ba[..., :2, :] * r[..., None, None, None], ba[..., 2:, :]], -2)
+            mf = mask.to(modes["amp"].dtype)
+            modes["amp"] = modes["amp"] * mf[..., None, None]
+            modes["bus_amp"] = modes["bus_amp"] * mf[..., None, None, None, None]
+            modes["kres"] = dict(modes["kres"], amp=modes["kres"]["amp"] * mf[..., None])
+            modes["long"] = dict(modes["long"], scale=modes["long"]["scale"] * mf)
+        else:
+            if cfg.use_room and self.room.ring_on:  # the board's ring-up keeps the partials' levels (config body_ring_ms)
+                modes["amp"] = modes["amp"] * self.room.ring_gain(modes["freq"][..., :1]).rsqrt()
+            modes["amp"] = modes["amp"] * m[..., None]
+            if "ph_amp" in modes:
+                modes["ph_amp"] = modes["ph_amp"] * m
         rs_delay = self.next_strikes(ki, onset, mask)
-        pan = self.room.pan_gains(ki, cond)
+        pan = self.room.bus_image(ki, cond)[0][..., 0, :] if coupled else self.room.pan_gains(ki, cond)
 
         if cfg.use_sympathetic:
             all_keys = torch.arange(N_KEYS, device=pitch.device).expand(B, N_KEYS)
             half = torch.full((B, N_KEYS), 0.6, device=pitch.device)
             key_modes = self.physics.modes(all_keys, half, torch.zeros_like(half), cond, phantoms=False)
         block = int(block_seconds * sr) if block_seconds else n_samples
-        strings, symp, state = [], [], None
+        strings, symp, state, lstate = [], [], None, None
         for s0 in range(0, n_samples, block):
             L = min(block, n_samples - s0)
-            s, own = self.render_strings(modes, ki, onset, mask, C, H * hop, rs_delay, pan, s0, L, per_key=cfg.use_sympathetic,
-                                         curves=curves)
+            if coupled:  # [B, 2 buses, ch, L]
+                s, own, lstate = self.render_coupled(modes, ki, onset, mask, C, H * hop, rs_delay, cond, s0, L,
+                                                     per_key=cfg.use_sympathetic, curves=curves, state=lstate)
+            else:
+                s, own = self.render_strings(modes, ki, onset, mask, C, H * hop, rs_delay, pan, s0, L,
+                                             per_key=cfg.use_sympathetic, curves=curves)
             strings.append(s)
             if cfg.use_sympathetic:
                 y, state = self.symp(own.sum(1), own, key_modes, engagement, s0 + H * hop, state)
                 symp.append(y)
-        out = {"strings": torch.cat(strings, -1)}
-        tonal = out["strings"]
+        tonal = torch.cat(strings, -1)  # [B, ch, T], coupled [B, 2, ch, T]
+        out = {"strings": tonal.sum(1) if coupled else tonal}
+        if coupled:
+            out["strings_bus"] = tonal
+        # the vertical bus (coupled) or the one bridge force takes the sympathetic strings, the knock and the noises
+        vert = (lambda x, y: torch.stack([x[:, 0] + y, x[:, 1]], 1)) if coupled else (lambda x, y: x + y)  # noqa: E731
         if cfg.use_sympathetic:
             out["symp"] = torch.cat(symp, -1)
-            tonal = tonal + out["symp"][:, None]
-        texture = torch.zeros_like(tonal)  # stochastic and attack components
+            tonal = vert(tonal, out["symp"][:, None])
+        texture = torch.zeros_like(tonal[:, 0] if coupled else tonal)  # stochastic and attack components
         if cfg.use_impulse:
             out["impulse"] = self.render_impulses(modes["impulse"], modes["tc"], onset, mask, pan, n_samples)
             texture = texture + out["impulse"]
@@ -960,25 +1255,32 @@ class NeuralPhysicalPiano(nn.Module):
                 noise, res, _, _ = self.render_noise(*args)
             out["noise"] = noise
             texture = texture + noise[:, None]
-            out["dry_phys"] = tonal + texture  # before the residual
+            out["dry_phys"] = vert(tonal, texture)  # before the residual
             if res is not None:
                 out["noise_res"] = res
                 texture = texture + res[:, None]
         gains = frame_ctx["band_gain"] if residual and frame_ctx is not None else None
-        dry = tonal + texture
+        dry = vert(tonal, texture)
         if gains is not None:
-            dry = self.apply_band_gains(dry, gains, block)
+            dry = (self.apply_band_gains(dry.flatten(1, 2), gains, block).view_as(dry) if coupled
+                   else self.apply_band_gains(dry, gains, block))
         out["dry"] = dry
         ir = self.room(cond) if cfg.use_room else None
-        audio = fft_convolve(dry, ir) if cfg.use_room else dry
+        if coupled:  # each bus through its own body
+            audio = fft_convolve(dry, ir).sum(1) if cfg.use_room else dry.sum(1)
+        else:
+            audio = fft_convolve(dry, ir) if cfg.use_room else dry
         fl = None
         if cfg.use_room and (cfg.use_floor if floor is None else floor):
             fl = self.room.floor_noise(cond, n_samples, generator)
             audio = audio + fl
         out["audio"] = audio
         if "residual_out" in extras and "noise_res" in out:
-            r = out["noise_res"][:, None].expand(-1, tonal.shape[1], -1)
-            out["noise_res_out"] = fft_convolve(r, ir.detach()) if cfg.use_room else r
+            r = out["noise_res"][:, None].expand(-1, cfg.channels, -1)
+            ir_v = ir[:, 0] if coupled and cfg.use_room else ir
+            out["noise_res_out"] = fft_convolve(r, ir_v.detach()) if cfg.use_room else r
+        if "texture_view" in extras and coupled:
+            raise NotImplementedError("texture_view (the GAN's view) is not built for the coupled strings")
         if "texture_view" in extras:
             view = (tonal + out["impulse"]).detach() if "impulse" in out else tonal.detach()
             if cfg.use_noise:
@@ -1004,7 +1306,7 @@ class NeuralPhysicalPiano(nn.Module):
             c_on = sample_keyed(C, ki, onset.clamp(min=-t_hist) + t_hist, sr, hop)
             t_k = torch.arange(Fr, device=pitch.device, dtype=onset.dtype) * hop / sr
             S = ((t_k[None, None, None] - onset[..., None, None] - rs_delay[..., None]) / RESTRIKE_RAMP).clamp(0, 1).sum(2)
-        out["partials"] = {"freq": modes["freq"][..., 0].detach(), "amp": modes["amp"].detach(),
+        out["partials"] = {"freq": modes.get("partial_freq", modes["freq"][..., 0]).detach(), "amp": modes["amp"].detach(),
                            "alpha": modes["alpha"].detach(), "onset": onset.detach(), "mask": mask,
                            "alpha_damp": modes["alpha_damp"].detach(), "damp": (c_key - c_on[..., None]).clamp(min=0),
                            "restrike": modes["restrike"].detach()[..., None] * S, "ctrl_hop": hop / sr}

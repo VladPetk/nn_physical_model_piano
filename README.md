@@ -305,6 +305,25 @@ In short, on one year (RTX 3090):
   code stays the reference and the fallback), the score reading the render once for both of the energy score's
   comparisons. Audio and gradients agree with the reference to float precision (`tests/test_cuda.py`). Also fixed:
   after running out of memory once, `train.py` kept the failed step's graph and skipped every later batch.
+- **Physics revamp** (branch `physics_revamp`, [`docs/physics_revamp.md`](docs/physics_revamp.md), 2026-10-03; in
+  progress, uncommitted): the loss fixes (real context instead of mirrored edges, sound onsets, the A0 fundamental;
+  `docs/composite_score.md` 13); a literature review of the piano's physics; a coupled string model behind
+  `string_model=coupled` (the unison's strings and both polarisations coupled through a complex bridge admittance per
+  key, two radiation paths with a level and delay per key between the microphones, the longitudinal force as the
+  square of the bridge slope with the free longitudinal modes, the knock's structural resonances, the pitch glide),
+  with CUDA kernels (step +30 % against the mode model) and a start fitted to B_comp's partial envelopes (composite
+  0.65–0.67 against B_comp's 0.62 on 16 validation excerpts, physics only). The activity threshold is now 70 dB
+  (inaudible against 90 on listening). Interaction tables built. After a first run and taking stock (section 12:
+  paired evaluation with intervals, ablations, the residual, the beats), the main run's physics beats B_comp's on
+  held-out pieces by 0.047 [0.026, 0.070] (test pieces 0.564 against 0.605) and on every term; with a fresh
+  residual 0.540 against B_comp-with-residual 0.575. Open: the unison still beats about half as much as the
+  recordings (a per-excerpt draw of its tuning is proposed), stage 2's partial gains fit the training pieces, the
+  knock resonances and free longitudinal modes stay off, M1–M6 not measured.
+  The owner's unreal mid-soft tenor notes (section 13): every single-note feature measured falls inside the real range
+  except the stereo image. Stereo (section 14): the measures in `pianonn/stereo.py`, checked against known answers;
+  `shared_board` (one board for both microphones, so the direct sound arrives in phase), `hall_mic_d` (a diffuse hall
+  with the right low-frequency coherence) and a coherence training term (`--stereo-weight`). After a 30-min check run
+  the image is inside the recordings' range; the per-channel score costs +0.028 [+0.017, +0.045] held-out against main.
 
 The prior is calibrated against the literature (the KTH *Five Lectures on the Acoustics of the Piano*,
 arXiv and Zenodo papers) and against 260 recorded notes of a Steinway B, analysed with the same code as the

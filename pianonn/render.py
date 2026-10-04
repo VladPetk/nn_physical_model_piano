@@ -23,6 +23,9 @@ def load_weights(model, state_dict, log=print):
     if missing or unexpected:
         log(f"checkpoint: {len(missing)} new parameter(s) at their defaults {missing[:6]}, "
             f"{len(unexpected)} unknown ignored {unexpected[:6]}")
+    if any(k.startswith(("physics.coupled.", "room.body_h", "room.raw_pan_bus")) for k in missing):
+        model.init_coupled()  # a mode model's weights: the coupled strings start from them (docs/physics_revamp.md)
+        log("checkpoint: a mode model; the coupled strings and their room start from its parameters")
     return model
 
 

@@ -178,3 +178,32 @@ def group_weights(freq, centers):
     w[..., 0, :] = torch.where(lf[..., 0, :] < c[0], torch.ones_like(w[..., 0, :]), w[..., 0, :])
     w[..., -1, :] = torch.where(lf[..., 0, :] > c[-1], torch.ones_like(w[..., -1, :]), w[..., -1, :])
     return w
+
+
+def bus_bank(freq, alpha, amp, adamp, tc, c_note, c_onset, rs_nats, onset, rs_delay, t0, sr, glide=None, W=None, m=None,
+             c_start=0, c_hop=None):
+    """The coupled model's bank (docs/physics_revamp.md 1-6): each oscillator feeds several buses, each with its own
+    sine and cosine part, ``amp[P, Q, NB, 2]`` = (A_s, A_c), so that bus b gets ``ramp * sum_q E_q (A_s sin phi_q + A_c
+    cos phi_q)`` (a complex amplitude per bus: the coupled modes' vertical and horizontal shares and the longitudinal
+    sums). ``glide = (e[P], beta[P])``: the note's frequencies follow f (1 + e exp(-beta tau)), so the phase gains
+    2 pi f e (1 - exp(-beta tau)) / beta. Everything else as ``osc_bank``. Returns ``y[P, NB, L]``.
+
+    The reference (plain autograd, memory ~ a dozen [P, Q, L] tensors): the fused CUDA kernel is the fast path, and
+    tests/test_cuda.py compares the two."""
+    L = c_note.shape[-1]
+    tau64, tau, x, ramp, Draw, D, S = _common(t0, sr, L, onset, tc, c_note, c_onset, rs_delay, freq.dtype)
+    cyc = freq.double()[:, :, None] * (tau64 - 0.5 * tc.double()[:, None])[:, None, :]
+    frac = (cyc - cyc.floor()).to(freq.dtype)
+    if glide is not None:
+        e, beta = glide
+        g = -torch.expm1(-beta[:, None] * tau) / beta[:, None]  # [P, L]
+        frac = frac + freq[:, :, None] * (e[:, None] * g)[:, None, :]
+    phi = 2 * math.pi * frac
+    E = torch.exp(-(alpha[:, :, None] * tau[:, None, :] + adamp[:, :, None] * D[:, None, :]) - (rs_nats[:, None] * S)[:, None, :])
+    sn, cs = E * torch.sin(phi), E * torch.cos(phi)  # [P, Q, L]
+    if m is not None:
+        g = _gains(m, c_start, c_hop, L)  # [P, G, L]
+        wq = torch.einsum("pgq,pgl->pql", W, g)
+        sn, cs = sn * wq, cs * wq
+    y = torch.einsum("pqb,pql->pbl", amp[..., 0], sn) + torch.einsum("pqb,pql->pbl", amp[..., 1], cs)
+    return y * ramp[:, None, :]

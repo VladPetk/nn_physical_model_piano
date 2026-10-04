@@ -13,6 +13,37 @@ def _mag(x, n_fft, hop=None):
     return torch.stft(x, n_fft, hop or n_fft // 4, window=window, return_complex=True).abs()
 
 
+# The scored window's spectra (CompositeLoss): centred frames over the scored samples only, but each frame's window
+# reads the real audio around it instead of a mirror of the slice's own edge. ``extend_scored`` keeps SCORE_CONTEXT
+# samples of the rendered warm-up before the first scored sample (35 hops of 240: more than half the longest window,
+# 8192, with room for the high-pass's ringing) and appends SCORE_TAIL zeros after the last (the recording beyond the
+# window is not rendered, so both sides see silence there rather than a reflected attack); ``crop_frames`` keeps the
+# frames centred on the scored samples, the same count as a centred STFT of the slice alone. Reflect padding of the
+# 2 s slice put mirrored audio into 17 of the 201 frames at each end at 8192 points (an attack near an edge counted
+# twice); the circular high-pass wrapped the slice's end into its start.
+SCORE_CONTEXT = 8400
+SCORE_TAIL = 4320
+
+
+def extend_scored(full, s):
+    """``(x, crop)``: ``full[..., s - SCORE_CONTEXT:]`` with SCORE_TAIL zeros appended, and ``crop = (context, scored
+    length)`` for ``crop_frames``; ``(full[..., s:], None)`` when the window has less than SCORE_CONTEXT before ``s``."""
+    if s < SCORE_CONTEXT:
+        return full[..., s:], None
+    x = torch.nn.functional.pad(full[..., s - SCORE_CONTEXT:], (0, SCORE_TAIL))
+    return x, (SCORE_CONTEXT, full.shape[-1] - s)
+
+
+def crop_frames(S, hop, crop):
+    """The frames ``S[..., frames]`` of a centred STFT of an ``extend_scored`` signal that are centred on the scored
+    samples (all of them when ``crop`` is None)."""
+    if crop is None:
+        return S
+    c, L = crop
+    assert c % hop == 0, "SCORE_CONTEXT must be a multiple of the hop"
+    return S[..., c // hop: c // hop + L // hop + 1]
+
+
 def highpass(x, sr, fc=20.0, width=10.0):
     """Zero-phase high-pass of ``x[..., T]`` (FFT domain, raised-cosine edge from ``fc - width/2`` to
     ``fc + width/2``). MAESTRO's recordings carry infrasonic rumble (0-20 Hz, ~5 % of their energy, the
@@ -130,17 +161,18 @@ class PianoLoss(nn.Module):
     def _eps(self, n, mask):
         return 10 ** (self.floor_db / 10) * 0.375 * n * mask.sum(-1)[:, None]  # white floor in each band
 
-    def _bands(self, x, n, mask, n_bins, hop):
+    def _bands(self, x, n, mask, n_bins, hop, crop=None):
         """Band energies per frame ``[N, bands, frames]``."""
-        return torch.einsum("kf,nft->nkt", mask, _mag(x, n, hop)[:, :n_bins] ** 2)
+        return torch.einsum("kf,nft->nkt", mask, crop_frames(_mag(x, n, hop)[:, :n_bins], hop, crop) ** 2)
 
     def _log_bands(self, x, n, mask, n_bins, hop):
         return torch.log10(self._bands(x, n, mask, n_bins, hop) + self._eps(n, mask))
 
-    def band_list(self, x):
-        """The band term's band energies of ``x[B, ch, T]`` (high-passed): one ``[B * ch, bands, frames]`` per group."""
+    def band_list(self, x, crop=None):
+        """The band term's band energies of ``x[B, ch, T]`` (high-passed): one ``[B * ch, bands, frames]`` per group.
+        ``crop``: ``x`` is an ``extend_scored`` signal, and only the scored frames are kept."""
         x = highpass(x, self.sr, self.hp_hz).reshape(-1, x.shape[-1])
-        return [self._bands(x, n, getattr(self, f"mask{gi}"), n_bins, self.hop) for gi, n, n_bins in self.groups]
+        return [self._bands(x, n, getattr(self, f"mask{gi}"), n_bins, self.hop, crop) for gi, n, n_bins in self.groups]
 
     def band_from(self, Ep, Et, B):
         """The band term per example ``[B]`` from ``band_list``'s energies of the prediction and the target (the

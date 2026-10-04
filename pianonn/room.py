@@ -19,6 +19,11 @@ Everything is per microphone channel: MAESTRO is a spaced stereo pair, and its t
 channels correlate at only 0.2-0.4. There are two body FIRs and two decorrelated hall
 tails per condition, a gain per channel, a per-key channel balance, and a learned
 stationary noise floor at the microphones.
+
+``cfg.shared_board`` (docs/physics_revamp.md 14): both microphones hear one board, the left body FIR (and its ring-up
+kernel), each through its own zero-phase gain per octave band (``mic_eq_db``), so the direct sound reaches the two
+channels in phase, as in the recordings. ``cfg.hall_mic_d`` > 0: the two hall tails are a diffuse field seen by
+microphones that far apart (m), coherent by sinc(2 f d / c): in phase at low frequencies, independent above.
 """
 
 import math
@@ -145,12 +150,30 @@ def ring_taus(cfg):
     return t if bool((t > 0).any()) else None
 
 
-def band_carriers(sr, seconds, seed=1):
-    """White noise split into octave bands (raised-cosine crossovers, bands sum to the original)."""
-    g = torch.Generator().manual_seed(seed)
+def band_carriers(sr, seconds, seed=1, X=None):
+    """White noise (or the spectrum ``X``) split into octave bands (raised-cosine crossovers, bands sum to the
+    original)."""
     L = int(seconds * sr)
-    X = torch.fft.rfft(torch.randn(L, generator=g, dtype=torch.float64))
+    if X is None:
+        g = torch.Generator().manual_seed(seed)
+        X = torch.fft.rfft(torch.randn(L, generator=g, dtype=torch.float64))
     return torch.stack([torch.fft.irfft(X * m, L) for m in octave_masks(L, sr, HALL_BANDS)]).float()
+
+
+SPEED_OF_SOUND = 343.0
+
+
+def diffuse_carriers(sr, seconds, ch, d=0.0):
+    """Per channel the hall's band carriers ``[ch, bands, L]``: independent white noise (``d`` = 0; the seeds of the
+    earlier models), or for two microphones ``d`` m apart in a diffuse field the right one's noise mixed with the
+    left's so that their coherence is sinc(2 f d / c) (real: in phase where coherent)."""
+    L = int(seconds * sr)
+    X = [torch.fft.rfft(torch.randn(L, generator=torch.Generator().manual_seed(1 + c), dtype=torch.float64))
+         for c in range(ch)]
+    if d > 0 and ch == 2:
+        gam = torch.special.sinc(2 * torch.fft.rfftfreq(L, 1 / sr).to(torch.float64) * d / SPEED_OF_SOUND)
+        X[1] = gam * X[0] + (1 - gam ** 2).clamp(min=0).sqrt() * X[1]
+    return torch.stack([band_carriers(sr, seconds, X=x) for x in X])
 
 
 class Room(nn.Module):
@@ -164,8 +187,9 @@ class Room(nn.Module):
         bodies = torch.stack([soundboard_body(sr, cfg.body_seconds, seed=c) for c in range(ch)])
         self.body = nn.Parameter(bodies.repeat(C, 1, 1))  # [C, ch, L]
         L = int(cfg.hall_seconds * sr)
-        # decorrelated tails per channel (a diffuse field), same T60s and band levels
-        self.register_buffer("carriers", torch.stack([band_carriers(sr, cfg.hall_seconds, seed=1 + c) for c in range(ch)]))
+        # tails per channel (a diffuse field: independent, or seen by microphones hall_mic_d m apart), same T60s and
+        # band levels
+        self.register_buffer("carriers", diffuse_carriers(sr, cfg.hall_seconds, ch, cfg.hall_mic_d))
         t = torch.arange(L) / sr
         self.register_buffer("t", t)
         # tail builds up between 10 and 40 ms after the direct sound
@@ -182,6 +206,13 @@ class Room(nn.Module):
         self.mic_gain_db = nn.Parameter(torch.zeros(C, ch))
         # per-key level difference between the channels (dB, +-6): where along the bridge each key radiates
         self.raw_pan = nn.Parameter(torch.zeros(C, 88))
+        # the coupled strings' two radiation paths (docs/physics_revamp.md 2): the in-plane bus's body per microphone,
+        # and per bus and key a level difference (dB, +-6) and a delay (ms, +-1.5) between the microphones
+        self.buses = cfg.string_model == "coupled"
+        if self.buses:
+            self.body_h = nn.Parameter(self.body.detach().clone())
+            self.raw_pan_bus = nn.Parameter(torch.zeros(C, 2, 88))
+            self.raw_delay = nn.Parameter(torch.zeros(C, 2, 88))
         # stationary noise floor at the microphones (hall, audience, preamps), white-equivalent dBFS per band:
         # a model that renders digital silence is otherwise scored against the recordings' floor in every
         # quiet bin (review 3, F1). The reference is measured on the recordings' leading silence
@@ -194,6 +225,12 @@ class Room(nn.Module):
         self.register_buffer("hum_ref_db", torch.full((C, ch, HUM_LINES), -200.0))
         self.raw_hum = nn.Parameter(torch.zeros(C, ch, HUM_LINES))
         self._ring_setup(cfg)
+        # one board for both microphones (docs/physics_revamp.md 14): the left body FIR (and ring-up kernel) through a
+        # zero-phase gain per octave band of Q_BANDS, per bus and microphone (dB)
+        self.shared = bool(cfg.shared_board) and ch == 2
+        if self.shared:
+            self.mic_eq_db = nn.Parameter(torch.zeros(C, 2, ch, len(Q_BANDS)))
+            self.register_buffer("eq_masks", octave_masks(2 * self.body.shape[-1], sr, Q_BANDS).float(), persistent=False)
         q = band_values(cfg.body_q_max, "body_q_max")
         self.q_on = bool((q > 0).any())
         if self.q_on:
@@ -230,6 +267,8 @@ class Room(nn.Module):
         k = torch.stack(kernels)
         n = 1 << 19
         self.ring_df = sr / n
+        # the mean over the channels' kernels, also with shared_board (where both ring through the left one): one
+        # kernel's power has deep dips, and dividing a partial by one blows it up (val 0.75 -> 1.40 on 8 excerpts)
         power = (torch.fft.rfft(k, n).abs() ** 2).mean(0)
         self.register_buffer("ring_kernel", k.float(), persistent=False)
         self.register_buffer("ring_power", power.float(), persistent=False)
@@ -243,6 +282,8 @@ class Room(nn.Module):
         return self.ring_power[i] * (1 - w) + self.ring_power[i + 1] * w
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        if self.cfg.hall_mic_d > 0:  # the carriers follow the config, not a checkpoint written with independent tails
+            state_dict[prefix + "carriers"] = self.carriers.clone()
         old = prefix + "floor_db"  # checkpoints before round 2: an unbounded learned floor
         if old in state_dict and prefix + "floor_ref_db" not in state_dict:
             v = state_dict.pop(old)
@@ -281,17 +322,51 @@ class Room(nn.Module):
         g = (parts.pow(2).sum(-1) / cut.pow(2).sum(-1).clamp(min=1e-30)).sqrt()
         return (cut * g[..., None]).sum(-2)[..., :L]
 
-    def forward(self, cond):
-        """Impulse responses ``[B, ch, L]`` for conditions ``cond[B]``: mic gain x body * (delta + hall)."""
-        hall = self._hall(cond)
-        hall = torch.cat([hall[..., :1] + 1.0, hall[..., 1:]], -1)  # + delta: the direct sound
-        body = self.body[cond]
+    @torch.no_grad()
+    def init_buses(self):
+        """Start the coupled model's room from the mode model's: the in-plane body a copy of the vertical one, each
+        bus's level difference the present pan, no delay."""
+        if self.buses:
+            self.body_h.copy_(self.body)
+            self.raw_pan_bus.copy_(self.raw_pan[:, None].expand_as(self.raw_pan_bus))
+            self.raw_delay.zero_()
+
+    def direct(self, body, cond, bus=0):
+        """The direct path per microphone ``[B, ch, Lb]`` from the body FIRs ``[B, ch, Lb]``: the Q cap, the ring-up,
+        with ``shared_board`` the left FIR through each microphone's band gains (of bus ``bus``), the mic gains."""
+        if self.shared:
+            body = body[:, :1]
         if self.q_on:
             body = self.limit_q(body)
-        if self.ring_on:  # the board's ring-up: each channel's body through its own kernel
-            body = fft_convolve(body, self.ring_kernel[None].expand(body.shape[0], -1, -1))[..., : body.shape[-1]]
-        body = body * torch.pow(10.0, self.mic_gain_db[cond] / 20)[..., None]
+        if self.ring_on:  # the board's ring-up: each channel's body through its own kernel (shared: the left one's)
+            k = self.ring_kernel[:1] if self.shared else self.ring_kernel
+            body = fft_convolve(body, k[None].expand(body.shape[0], -1, -1))[..., : body.shape[-1]]
+        if self.shared:
+            Lb = body.shape[-1]
+            gain = torch.einsum("bcn,nf->bcf", torch.pow(10.0, self.mic_eq_db[cond, bus] / 20), self.eq_masks)
+            body = torch.fft.irfft(torch.fft.rfft(body, 2 * Lb) * gain, 2 * Lb)[..., :Lb]
+        return body * torch.pow(10.0, self.mic_gain_db[cond] / 20)[..., None]
+
+    def _ir(self, body, cond, hall, bus=0):
+        body = self.direct(body, cond, bus)
         return fft_convolve(torch.cat([body, body.new_zeros(*body.shape[:2], hall.shape[-1])], -1), hall)
+
+    def forward(self, cond):
+        """Impulse responses ``[B, ch, L]`` for conditions ``cond[B]``: mic gain x body * (delta + hall); with the coupled
+        strings' two buses ``[B, 2, ch, L]`` (vertical, in-plane)."""
+        hall = self._hall(cond)
+        hall = torch.cat([hall[..., :1] + 1.0, hall[..., 1:]], -1)  # + delta: the direct sound
+        if not self.buses:
+            return self._ir(self.body[cond], cond, hall)
+        return torch.stack([self._ir(self.body[cond], cond, hall), self._ir(self.body_h[cond], cond, hall, 1)], 1)
+
+    def bus_image(self, ki, cond):
+        """The coupled model's image per note: gains ``[B, N, 2, ch]`` (equal-power around 0 dB) and delays ``[B, N, 2,
+        ch]`` (s; +-half the inter-microphone delay each) per bus (vertical, in-plane)."""
+        p = bounded(self.raw_pan_bus[cond[:, None], :, ki], 6.0)  # [B, N, 2]
+        d = 0.0015 * torch.tanh(self.raw_delay[cond[:, None], :, ki])
+        gains = torch.stack([torch.pow(10.0, p / 40), torch.pow(10.0, -p / 40)], -1)
+        return gains, torch.stack([0.5 * d, -0.5 * d], -1)
 
     def pan_gains(self, ki, cond):
         """Per-note channel gains ``[B, N, ch]`` (equal-power around 0 dB)."""

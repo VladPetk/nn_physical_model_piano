@@ -70,7 +70,7 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from torch.utils.data import DataLoader  # noqa: E402
 
-from .composite import CompositeLoss  # noqa: E402
+from .composite import CompositeLoss, scored_notes  # noqa: E402
 from .config import PianoConfig  # noqa: E402
 from .data import MaestroSegments, SyntheticPerformances, collate
 from .dsp import bounded
@@ -82,11 +82,16 @@ from .synth import ContextNet, NeuralPhysicalPiano
 
 STAGE2_ONLY = ("context.", "noise.att", "physics.partial_gain", "physics.color")
 DB_PARAMS = ("physics.gain_db", "physics.cond_gain_db", "physics.cond_vel_slope", "physics.cond_vel_curve", "physics.soft_gain_db",
-             "physics.raw_phantom_db", "physics.raw_impulse_db", "physics.raw_impulse_vel", "room.mic_gain_db",
-             "room.raw_pan")  # the floor and hum (bounded +-3 dB around a measurement) learn at the base rate
+             "physics.raw_phantom_db", "physics.raw_impulse_db", "physics.raw_impulse_vel", "room.mic_gain_db", "room.mic_eq_db",
+             "room.raw_pan",  # the floor and hum (bounded +-3 dB around a measurement) learn at the base rate
+             # the coupled strings' levels in dB: the in-plane share, the longitudinal level and its vertical share, the
+             # free longitudinal modes, the knock's resonances (docs/physics_revamp.md 12: at the base rate they moved
+             # < 0.1 dB in a 50-min run)
+             "physics.coupled.raw_sh", "physics.coupled.raw_long_db", "physics.coupled.raw_long_v",
+             "physics.coupled.lm_gain_db", "physics.coupled.kr_db")
 GAN_PARAMS = ("noise.", "context.")  # what the critic may change (the texture view, or a backward into these alone)
 MODULES = ("physics", "room", "noise", "context")
-CENTS_PARAMS = ("physics.raw_cents", "physics.cond_cents")
+CENTS_PARAMS = ("physics.raw_cents", "physics.cond_cents", "physics.coupled.raw_cents", "physics.coupled.raw_dh")
 ENV_PARAMS = ("physics.raw_prompt", "physics.raw_log_b1", "physics.raw_log_b3", "physics.raw_bridge_g",
               "physics.raw_decay_p", "physics.raw_after")  # the strings' decay and the aftersound's level
 
@@ -163,7 +168,7 @@ def lr_scale(name, residual=0.5):
     """Per-parameter learning-rate multiplier by unit: Adam moves every parameter by ~lr per step, so dB and
     cents need larger steps than nats, and thousands of FIR taps must move slower than the physics. ``residual``: the
     learned residual's (``context.``)."""
-    if name == "room.body":
+    if name in ("room.body", "room.body_h"):  # FIR taps (body_h learnt at the base rate before 2026-10-04)
         return 0.03
     if name == "piece_gain":
         return 50.0  # each of 2018's 70 training pieces is in ~1 batch in 9 (batch 8): it must reach ~2 dB within a 30-min run
@@ -180,7 +185,7 @@ def param_groups(model, lr, fir_lr_scale=None, residual_lr=0.5):
     """One group per parameter, so stages can rescale learning rates by name."""
     groups = []
     for name, p in model.named_parameters():
-        s = fir_lr_scale if (fir_lr_scale is not None and name == "room.body") else lr_scale(name, residual_lr)
+        s = fir_lr_scale if (fir_lr_scale is not None and name in ("room.body", "room.body_h")) else lr_scale(name, residual_lr)
         groups.append({"params": [p], "lr": lr * s, "name": name, "base_lr": lr * s})
     return groups
 
@@ -308,19 +313,19 @@ def validate_composite(model, batches, comp, residual, energy, old, level_match=
         g = torch.as_tensor(10 ** (gains[i0: i0 + len(full)] / 20), dtype=full.dtype, device=full.device)[:, None, None]
         i0 += len(full)
         full = full * g
-        p, t = full[..., s:], b["audio"][..., s:].float()
-        notes = dict(partials, onset=partials["onset"] - s / sr, t_ref=-s / sr)
+        (p, crop), (t, _) = comp.scored(full, s), comp.scored(b["audio"], s)
+        notes = scored_notes(partials, b, s, sr)
         cache = {}  # the render's side, shared by the two comparisons
-        terms, sums = comp.read(p, t, notes, cache=cache)
+        terms, sums = comp.read(p, t, notes, cache=cache, crop=crop)
         terms["onset"] = comp.onset(full, b["audio"].float(), b, s / sr, cache=cache)
         if energy:
             second = second * g
-            own, own_sums = comp.read(p, second[..., s:], notes, cache=cache)
+            own, own_sums = comp.read(p, comp.scored(second, s)[0], notes, cache=cache, crop=crop)
             own["onset"] = comp.self_onset(full, second, b, s / sr, cache=cache)
             terms.update({k + "_self": v for k, v in own.items()})
             for k, c in own_sums.items():
                 cells.setdefault(k + "_self", []).append(c)
-        terms["old"] = old(p, t, *onsets_of(b, s, sr))[0]
+        terms["old"] = old(full[..., s:], b["audio"][..., s:].float(), *onsets_of(b, s, sr))[0]
         for k, v in terms.items():
             per[k] = per.get(k, 0.0) + float(v) / len(batches)
         for k, c in sums.items():
@@ -427,10 +432,15 @@ def main(argv=None):
                     help="the residual's learning rate re --lr (phase 6: 0.5)")
     ap.add_argument("--fresh-residual", action="store_true",
                     help="with --init-from: the residual starts from its initialisation, not the checkpoint's")
+    ap.add_argument("--stereo-weight", type=float, default=0.0,
+                    help="weight of the inter-channel coherence term (pianonn.stereo.CoherenceLoss; 0 = off)")
     ap.add_argument("--piece-gain", action="store_true",
                     help="fit a free gain (dB, averaging zero) per training piece, applied to the rendered audio before "
                          "every loss term; validation and evaluation render without it")
     ap.add_argument("--freeze", nargs="*", default=[], help="parameter-name prefixes kept frozen in every stage")
+    ap.add_argument("--distill-steps", type=int, default=1000,
+                    help="coupled strings from a mode model's checkpoint: steps fitting them to its partials' envelopes "
+                         "(condition of the first --years); 0 = off")
     ap.add_argument("--cfg", nargs="*", default=[], metavar="KEY=VALUE",
                     help="model config overrides, e.g. bridge_end_comb=1 body_q_max=50 (pianonn.config.PianoConfig)")
     ap.add_argument("--stage2-at", type=float, default=0.6,
@@ -527,6 +537,14 @@ def main(argv=None):
             sd = {k: v for k, v in sd.items() if not k.startswith("context.")}
         load_weights(model, sd, log=log)
         log(f"weights from {args.init_from}" + (", the residual fresh" if args.fresh_residual else ""))
+        if cfg.string_model == "coupled" and base_cfg.get("string_model", "modes") != "coupled" and args.distill_steps:
+            # a mode model's weights: the coupled strings fitted to its partials' envelopes (fit_init.distill_coupled)
+            from .config import year_to_condition
+            from .fit_init import distill_coupled
+            mode_model = NeuralPhysicalPiano(PianoConfig.from_dict({**base_cfg, "sample_rate": args.sr})).to(device)
+            load_weights(mode_model, sd, log=lambda *_: None)
+            distill_coupled(model, mode_model, year_to_condition(args.years[0]), steps=args.distill_steps, log=log)
+            del mode_model
     has_strike = model.strike_on
     model.strike_on = has_strike and args.strike_train
     if has_strike:
@@ -564,6 +582,11 @@ def main(argv=None):
     assert not args.energy or comp is not None, "--energy needs --score composite"
     old_loss = MultiResolutionSTFTLoss()  # the trial's loss, reported for continuity
     mel_loss = LogMelLoss(cfg.sample_rate).to(device) if args.mel_weight > 0 else None
+    stereo_loss = None
+    if args.stereo_weight > 0:
+        from .stereo import CoherenceLoss
+        stereo_loss = CoherenceLoss(cfg.sample_rate)
+        log(f"stereo term: inter-channel coherence per band, weight {args.stereo_weight}")
     onset_loss = (OnsetLoss(cfg.sample_rate, relative=args.onset_relative, pool_decay=args.onset_pool).to(device)
                   if args.onset_weight > 0 else None)
     onset_val = (onset_loss, args.onset_weight) if onset_loss is not None else None
@@ -828,12 +851,14 @@ def main(argv=None):
                 score_phys = score_phys.detach()
                 out_p = audio_p = second_p = reg_p = None
             second = None
-            if args.energy:  # the energy score's second draw: every random draw afresh, no gradient
-                with torch.no_grad(), amp_ctx():
-                    second = model(batch, n, residual=residual)["audio"].float()
-                second = second * gain.detach() if gain is not None else second
-            with amp_ctx():
-                out = model(batch, n, residual=residual, extras=extras)
+            # the coupled strings' decomposition once for both renders (the same parameters; physics.shared_core)
+            with model.physics.shared_core(batch["condition"]) if not split else contextlib.nullcontext():
+                if args.energy:  # the energy score's second draw: every random draw afresh, no gradient
+                    with torch.no_grad(), amp_ctx():
+                        second = model(batch, n, residual=residual)["audio"].float()
+                    second = second * gain.detach() if gain is not None else second
+                with amp_ctx():
+                    out = model(batch, n, residual=residual, extras=extras)
             if gain is not None:  # the recording's level for this piece: a nuisance, discarded at evaluation
                 out["audio"] = out["audio"] * gain
             pred, tgt = out["audio"][..., s:].float(), target[..., s:].float()
@@ -849,6 +874,10 @@ def main(argv=None):
                 loss = logs["recon"]
             logs["reg"] = model.physics.regularizer(batch["condition"]) + pan_smoothness(model, batch["condition"])
             loss = loss + args.reg * logs["reg"]
+            if stereo_loss is not None:  # the stereo image, which the per-channel terms cannot see
+                logs["stereo"], d = stereo_loss(pred, tgt)
+                logs.update({f"stereo_{lo}": v for (lo, _), v in zip(stereo_loss.bands, d)})
+                loss = loss + args.stereo_weight * logs["stereo"]
             if mel_loss is not None:
                 logs["mel"] = mel_loss(pred, tgt)
                 loss = loss + args.mel_weight * logs["mel"]

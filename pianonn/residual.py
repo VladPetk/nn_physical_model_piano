@@ -165,6 +165,8 @@ class AwareResidual(nn.Module):
 
         x = torch.cat([onset_roll, key_down, pedals], 1).transpose(1, 2)
         hm, _ = self.midi_gru(torch.tanh(self.midi_in(x)))  # [B, F, Hd]
+        if not cfg.res_history:
+            hm = torch.zeros_like(hm)
         f_idx = (H + torch.arange(Cn, device=ki.device) * K).clamp(max=hm.shape[1] - 1)
         h_ctrl = hm[:, f_idx]  # [B, C, Hd]
 

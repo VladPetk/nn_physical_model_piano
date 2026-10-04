@@ -55,7 +55,7 @@ Returns ``(total, terms)``, scalars; ``terms[k]`` is ``d(X, Y)``, ``terms[k + "_
 import torch
 from torch import nn
 
-from .losses import OnsetLoss, PianoLoss, highpass
+from .losses import ONSET_DELAY_MS, OnsetLoss, PianoLoss, extend_scored, highpass
 from .partial_view import POOL_MIN, PartialView, example_weights
 
 WEIGHTS = {"band": 0.4, "partials": 0.4, "between": 0.7, "pooled_exposed": 1.0, "between_pooled": 0.9, "level": 0.8,
@@ -64,13 +64,29 @@ READ_BY_READ = ("band", "partials", "between")
 POOLED = ("pooled_exposed", "between_pooled", "level")
 
 
-def level_sums(piano, pred, target, Ep=None, Et=None):
+def sound_onsets(batch, onset):
+    """Each note's expected sound onset ``[B, N]`` (s): ``onset`` (the model's note onsets, MIDI plus the strike's
+    jitter) plus the recordings' delay from the MIDI onset to the sound (``ONSET_DELAY_MS``: ~7 ms at middle C, ~15 ms
+    in the bass, ~0 at the top; the render follows the same law, docs/tone_measures.md 12.6), as the onset term's
+    anchors. The partial view reads each note from here on and counts its age from here."""
+    a, b, c = ONSET_DELAY_MS
+    d = a + b * (batch["pitch"].to(onset.dtype) - 60) + c * (batch["velocity"].to(onset.dtype) - 64)
+    return onset + 1e-3 * d.clamp(min=0)
+
+
+def scored_notes(partials, batch, s, sr):
+    """The model's note list (``out["partials"]``) for the scored window from sample ``s``: sound onsets in s re ``s``,
+    the control curves' origin ``t_ref``."""
+    return dict(partials, onset=sound_onsets(batch, partials["onset"]) - s / sr, t_ref=-s / sr)
+
+
+def level_sums(piano, pred, target, Ep=None, Et=None, crop=None):
     """PianoLoss's level term as pooled cells: per example, each band's energy summed over the excerpt ``(P, T: [B, ch,
     bands], count: [B, bands] frames, eps: [bands] per frame)``. ``Ep``, ``Et``: ``piano.band_list`` of ``pred`` and
     ``target`` when already computed."""
     B, ch = pred.shape[:2]
-    Ep = piano.band_list(pred) if Ep is None else Ep
-    Et = piano.band_list(target) if Et is None else Et
+    Ep = piano.band_list(pred, crop) if Ep is None else Ep
+    Et = piano.band_list(target, crop) if Et is None else Et
     eps = [piano._eps(n, getattr(piano, f"mask{gi}"))[:, 0] for gi, n, _ in piano.groups]
     P, T = torch.cat([e.sum(-1) for e in Ep], 1).reshape(B, ch, -1), torch.cat([e.sum(-1) for e in Et], 1).reshape(B, ch, -1)
     frames = Ep[-1].shape[-1]
@@ -119,26 +135,34 @@ class CompositeLoss(nn.Module):
         self.self_onset = OnsetLoss(sr, pool_decay=pool_decay)
         self.self_pools = nn.ModuleDict({k: RunningPool(pool_decay, POOL_MIN.get(k, 1)) for k in POOLED})
 
-    def read(self, p, t, notes, sums=True, cache=None):
+    def read(self, p, t, notes, sums=True, cache=None, crop=None):
         """The read-by-read terms of the scored windows ``p``, ``t`` (means over the batch) and, with ``sums``, the
-        pooled terms' cells ``{name: (P, T, count, eps)}``; ``notes`` with onsets re the scored window. ``cache``: a
+        pooled terms' cells ``{name: (P, T, count, eps)}``; ``notes`` with onsets re the scored window (``scored_notes``).
+        ``crop``: ``p`` and ``t`` come from ``losses.extend_scored`` (see ``scored``). ``cache``: a
         dict shared by calls with the same ``p`` and ``notes`` (the energy score reads one render against the recording
         and against a second draw): ``p``'s spectra and readings are computed once, and its gradient flows through
         them once."""
         cache = {} if cache is None else cache
         if "bands" not in cache:
-            cache["bands"] = self.piano.band_list(p)
-        Ep, Et = cache["bands"], self.piano.band_list(t)
+            cache["bands"] = self.piano.band_list(p, crop)
+        Ep, Et = cache["bands"], self.piano.band_list(t, crop)
         terms = {"band": self.piano.band_from(Ep, Et, p.shape[0]).mean()}
-        v = self.view(p, t, notes, cache=cache)
+        v = self.view(p, t, notes, cache=cache, crop=crop)
         terms["partials"], terms["between"] = v["partials"].mean(), v["between"].mean()
         if not sums:
             return terms, None
-        cells = dict(v["sums"], level=level_sums(self.piano, p, t, Ep, Et))
+        cells = dict(v["sums"], level=level_sums(self.piano, p, t, Ep, Et, crop))
         return terms, {k: cells[k] for k in POOLED}
 
-    def _terms(self, full, target_full, p, t, batch, notes, pools, onset, t_lo, cache):
-        terms, sums = self.read(p, t, notes, cache=cache)
+    @staticmethod
+    def scored(x, s):
+        """What the read-by-read and pooled terms read of a whole rendered window ``x[B, ch, T]`` scored from sample
+        ``s``: ``(x', crop)`` from ``losses.extend_scored`` (the scored samples with the warm-up's real audio before
+        them, so no spectrum frame reads a mirror of the slice's edge)."""
+        return extend_scored(x.float(), s)
+
+    def _terms(self, full, target_full, p, t, batch, notes, pools, onset, t_lo, cache, crop):
+        terms, sums = self.read(p, t, notes, cache=cache, crop=crop)
         for k in POOLED:
             P, T, cnt, eps = sums[k]
             terms[k] = pools[k](P, T, cnt, eps.amin(0) if eps.dim() == 2 else eps)
@@ -148,15 +172,15 @@ class CompositeLoss(nn.Module):
 
     def forward(self, full, target_full, batch, s, notes, second=None):
         sr = self.sr
-        p, t = full[..., s:].float(), target_full[..., s:].float()
-        notes = dict(notes, onset=notes["onset"] - s / sr, t_ref=-s / sr)
+        (p, crop), (t, _) = self.scored(full, s), self.scored(target_full, s)
+        notes = scored_notes(notes, batch, s, sr)
         cache = {}  # the render's side of every term, shared by the two comparisons
-        terms = self._terms(full, target_full, p, t, batch, notes, self.pools, self.onset, s / sr, cache)
+        terms = self._terms(full, target_full, p, t, batch, notes, self.pools, self.onset, s / sr, cache, crop)
         scored = dict(terms)
         if second is not None:
             second = second.float().detach()
-            own = self._terms(full, second, p, second[..., s:], batch, notes, self.self_pools, self.self_onset, s / sr,
-                              cache)
+            own = self._terms(full, second, p, self.scored(second, s)[0], batch, notes, self.self_pools, self.self_onset,
+                              s / sr, cache, crop)
             for k, d in own.items():
                 terms[k + "_self"] = d
                 scored[k] = terms[k] - d + 0.5 * d.detach()  # the value d(X, Y) - d(X, X') / 2, the gradient's form

@@ -20,3 +20,6 @@ runs/*
 # local agent files
 .claude/
 CLAUDE.md
+
+# literature PDFs (the owner's, not for publication)
+lit/
